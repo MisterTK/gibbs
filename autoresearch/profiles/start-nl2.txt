@@ -1,0 +1,1845 @@
+Compiled GraphProgram: 1 segments, primary device: Metal
+Compiled GraphProgram: 1 segments, primary device: Metal
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  GemmBatchedPacked        28      6470     4.9    1.7%
+  Attention                 6       573     6.9    2.3%
+  Copy                     30       270    58.3   19.9%
+  RmsNorm                  13       114    30.2   10.3%
+  Unary                     6        62   101.8   34.8%
+  Binary                    1        16    16.2    5.5%
+  RelPosBias                1        13    10.0    3.4%
+  Embed                     1        11  1016.9  347.4%
+enc0.ffn.mlp.up      | GemmBatchedPacked { x: Va |    690.0 |  1376256 |      2.0 |     0.7%
+enc2.ffn.mlp.up      | GemmBatchedPacked { x: Va |    668.9 |  1376256 |      2.1 |     0.7%
+enc1.ffn.mlp.up      | GemmBatchedPacked { x: Va |    666.7 |  1376256 |      2.1 |     0.7%
+enc1.attn.q.fused_qkv | GemmBatchedPacked { x: Va |    485.7 |  1064960 |      2.2 |     0.7%
+enc2.attn.q.fused_qkv | GemmBatchedPacked { x: Va |    485.1 |  1064960 |      2.2 |     0.7%
+enc0.attn.q.fused_qkv | GemmBatchedPacked { x: Va |    483.7 |  1064960 |      2.2 |     0.8%
+enc0.attn.o          | GemmBatchedPacked { x: Va |    300.9 |   573440 |      1.9 |     0.7%
+enc2.attn.o          | GemmBatchedPacked { x: Va |    299.9 |   573440 |      1.9 |     0.7%
+enc1.attn.o          | GemmBatchedPacked { x: Va |    294.5 |   573440 |      1.9 |     0.7%
+enc1.ffn.mlp.down    | GemmBatchedPacked { x: Va |    226.0 |  1507328 |      6.7 |     2.3%
+enc0.ffn.mlp.down    | GemmBatchedPacked { x: Va |    225.4 |  1507328 |      6.7 |     2.3%
+enc0.attn.attn       | Ext(Attn(Attention { q: V |    157.1 |   655360 |      4.2 |     1.4%
+enc2.attn.attn       | Ext(Attn(Attention { q: V |    157.0 |   655360 |      4.2 |     1.4%
+enc1.attn.attn       | Ext(Attn(Attention { q: V |    156.5 |   655360 |      4.2 |     1.4%
+enc5.ffn.mlp.up      | GemmBatchedPacked { x: Va |    149.4 |  1376256 |      9.2 |     3.1%
+enc3.ffn.mlp.up      | GemmBatchedPacked { x: Va |    149.0 |  1376256 |      9.2 |     3.2%
+enc4.ffn.mlp.up      | GemmBatchedPacked { x: Va |    146.6 |  1376256 |      9.4 |     3.2%
+enc3.attn.q.fused_qkv | GemmBatchedPacked { x: Va |    111.7 |  1064960 |      9.5 |     3.3%
+xk.3.fused_qkv       | GemmBatchedPacked { x: Va |    111.0 |  1064960 |      9.6 |     3.3%
+enc5.attn.q.fused_qkv | GemmBatchedPacked { x: Va |    109.8 |  1064960 |      9.7 |     3.3%
+enc4.attn.q.fused_qkv | GemmBatchedPacked { x: Va |    109.5 |  1064960 |      9.7 |     3.3%
+xv.1.fused_qkv       | GemmBatchedPacked { x: Va |    108.3 |  1064960 |      9.8 |     3.4%
+xk.0.fused_qkv       | GemmBatchedPacked { x: Va |    107.9 |  1064960 |      9.9 |     3.4%
+xv.4.fused_qkv       | GemmBatchedPacked { x: Va |    106.1 |  1064960 |     10.0 |     3.4%
+enc5.attn.o          | GemmBatchedPacked { x: Va |     77.1 |   573440 |      7.4 |     2.5%
+enc3.attn.o          | GemmBatchedPacked { x: Va |     77.0 |   573440 |      7.4 |     2.5%
+enc4.attn.o          | GemmBatchedPacked { x: Va |     76.7 |   573440 |      7.5 |     2.6%
+enc3.ffn.mlp.down    | GemmBatchedPacked { x: Va |     50.9 |  1507328 |     29.6 |    10.1%
+enc2.ffn.mlp.down    | GemmBatchedPacked { x: Va |     50.8 |  1507328 |     29.7 |    10.1%
+enc4.ffn.mlp.down    | GemmBatchedPacked { x: Va |     50.8 |  1507328 |     29.7 |    10.1%
+enc5.ffn.mlp.down    | GemmBatchedPacked { x: Va |     50.8 |  1507328 |     29.7 |    10.1%
+enc4.attn.attn       | Ext(Attn(Attention { q: V |     34.4 |   655360 |     19.1 |     6.5%
+enc3.attn.attn       | Ext(Attn(Attention { q: V |     34.3 |   655360 |     19.1 |     6.5%
+enc5.attn.attn       | Ext(Attn(Attention { q: V |     34.0 |   655360 |     19.3 |     6.6%
+enc0.attn.v.v_slice  | Ext(Movement(Copy { fill: |     19.6 |   524288 |     26.8 |     9.1%
+enc2.attn.q.q_slice  | Ext(Movement(Copy { fill: |     19.5 |   524288 |     26.9 |     9.2%
+enc0.attn.q.q_slice  | Ext(Movement(Copy { fill: |     19.4 |   524288 |     27.1 |     9.2%
+enc1.attn.v.v_slice  | Ext(Movement(Copy { fill: |     18.9 |   524288 |     27.8 |     9.5%
+enc2.attn.k.k_slice  | Ext(Movement(Copy { fill: |     18.9 |   524288 |     27.8 |     9.5%
+enc2.attn.v.v_slice  | Ext(Movement(Copy { fill: |     18.8 |   524288 |     28.0 |     9.6%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  Attention                12      1895    13.4    4.6%
+  GemvPacked               37       234   114.8   39.2%
+  RmsNorm                  19        64     1.8    0.6%
+  CachedAttention           6        31   411.4  140.5%
+  Unary                     7        18     5.7    1.9%
+  RelPosBias                1         3     5.8    2.0%
+  Embed                     1         3  3770.3 1288.0%
+  Binary                    1         3    12.3    4.2%
+dec1.cross           | Ext(Attn(Attention { q: V |    158.2 |  2103296 |     13.3 |     4.5%
+dec2.cross           | Ext(Attn(Attention { q: V |    158.2 |  2103296 |     13.3 |     4.5%
+dec0.cross           | Ext(Attn(Attention { q: V |    158.1 |  2103296 |     13.3 |     4.5%
+dec3.cross           | Ext(Attn(Attention { q: V |    158.1 |  2103296 |     13.3 |     4.5%
+dec0.self            | Ext(Attn(Attention { q: V |    158.0 |  2117632 |     13.4 |     4.6%
+dec2.self            | Ext(Attn(Attention { q: V |    158.0 |  2117632 |     13.4 |     4.6%
+dec5.cross           | Ext(Attn(Attention { q: V |    158.0 |  2103296 |     13.3 |     4.5%
+dec4.cross           | Ext(Attn(Attention { q: V |    157.9 |  2103296 |     13.3 |     4.6%
+dec3.self            | Ext(Attn(Attention { q: V |    157.7 |  2117632 |     13.4 |     4.6%
+dec5.self            | Ext(Attn(Attention { q: V |    157.6 |  2117632 |     13.4 |     4.6%
+dec1.self            | Ext(Attn(Attention { q: V |    157.5 |  2117632 |     13.4 |     4.6%
+dec4.self            | Ext(Attn(Attention { q: V |    157.5 |  2117632 |     13.4 |     4.6%
+lm_head              | GemvPacked { x: ValueId(2 |     54.0 | 11439616 |    211.7 |    72.3%
+dec4.ffn.mlp.up      | GemvPacked { x: ValueId(1 |      6.7 |   731136 |    109.0 |    37.2%
+dec1.ffn.mlp.up      | GemvPacked { x: ValueId(6 |      6.6 |   731136 |    110.4 |    37.7%
+dec0.ffn.mlp.down    | GemvPacked { x: ValueId(3 |      6.5 |   733184 |    112.8 |    38.5%
+dec1.ffn.mlp.down    | GemvPacked { x: ValueId(7 |      6.5 |   733184 |    112.8 |    38.5%
+dec3.ffn.mlp.down    | GemvPacked { x: ValueId(1 |      6.5 |   733184 |    113.5 |    38.8%
+dec4.ffn.mlp.down    | GemvPacked { x: ValueId(1 |      6.4 |   733184 |    114.3 |    39.0%
+dec2.ffn.mlp.up      | GemvPacked { x: ValueId(1 |      6.4 |   731136 |    113.9 |    38.9%
+dec0.ffn.mlp.up      | GemvPacked { x: ValueId(3 |      6.4 |   731136 |    114.7 |    39.2%
+dec3.ffn.mlp.up      | GemvPacked { x: ValueId(1 |      6.4 |   731136 |    114.7 |    39.2%
+dec5.ffn.mlp.up      | GemvPacked { x: ValueId(2 |      6.4 |   731136 |    114.7 |    39.2%
+dec5.ffn.mlp.down    | GemvPacked { x: ValueId(2 |      6.3 |   733184 |    116.5 |    39.8%
+dec2.ffn.mlp.down    | GemvPacked { x: ValueId(1 |      6.1 |   733184 |    119.7 |    40.9%
+dec3.q.fused_qkv     | GemvPacked { x: ValueId(1 |      5.7 |   548864 |     95.5 |    32.6%
+dec4.q.fused_qkv     | GemvPacked { x: ValueId(1 |      5.7 |   548864 |     95.5 |    32.6%
+dec1.q.fused_qkv     | GemvPacked { x: ValueId(4 |      5.7 |   548864 |     96.2 |    32.8%
+dec0.q.fused_qkv     | GemvPacked { x: ValueId(7 |      5.7 |   548864 |     96.9 |    33.1%
+dec5.q.fused_qkv     | GemvPacked { x: ValueId(1 |      5.6 |   548864 |     98.3 |    33.6%
+dec2.q.fused_qkv     | GemvPacked { x: ValueId(7 |      5.5 |   548864 |     99.0 |    33.8%
+dec0.kv_write        | CachedAttention { q: Valu |      5.2 |  2105348 |    404.2 |   138.1%
+dec2.kv_write        | CachedAttention { q: Valu |      5.1 |  2105348 |    410.8 |   140.3%
+dec5.kv_write        | CachedAttention { q: Valu |      5.1 |  2105348 |    410.8 |   140.3%
+dec1.kv_write        | CachedAttention { q: Valu |      5.1 |  2105348 |    410.8 |   140.3%
+dec3.kv_write        | CachedAttention { q: Valu |      5.1 |  2105348 |    414.2 |   141.5%
+dec4.kv_write        | CachedAttention { q: Valu |      5.0 |  2105348 |    417.6 |   142.7%
+dec1.xo              | GemvPacked { x: ValueId(6 |      4.0 |   186368 |     46.6 |    15.9%
+dec0.o               | GemvPacked { x: ValueId(2 |      4.0 |   186368 |     47.1 |    16.1%
+dec0.xo              | GemvPacked { x: ValueId(3 |      3.9 |   186368 |     48.1 |    16.4%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  Attention                12      1895    13.4    4.6%
+  GemvPacked               37       234   114.7   39.2%
+  RmsNorm                  19        63     1.9    0.6%
+  CachedAttention           6        29   429.4  146.7%
+  Unary                     7        17     5.9    2.0%
+  Embed                     1         3  3351.6 1145.0%
+  RelPosBias                1         3     5.8    2.0%
+  Binary                    1         3    12.3    4.2%
+dec4.cross           | Ext(Attn(Attention { q: V |    158.2 |  2103296 |     13.3 |     4.5%
+dec0.cross           | Ext(Attn(Attention { q: V |    158.1 |  2103296 |     13.3 |     4.5%
+dec5.cross           | Ext(Attn(Attention { q: V |    158.1 |  2103296 |     13.3 |     4.5%
+dec2.cross           | Ext(Attn(Attention { q: V |    158.0 |  2103296 |     13.3 |     4.5%
+dec1.cross           | Ext(Attn(Attention { q: V |    158.0 |  2103296 |     13.3 |     4.5%
+dec3.cross           | Ext(Attn(Attention { q: V |    158.0 |  2103296 |     13.3 |     4.5%
+dec2.self            | Ext(Attn(Attention { q: V |    157.9 |  2117632 |     13.4 |     4.6%
+dec1.self            | Ext(Attn(Attention { q: V |    157.9 |  2117632 |     13.4 |     4.6%
+dec4.self            | Ext(Attn(Attention { q: V |    157.8 |  2117632 |     13.4 |     4.6%
+dec0.self            | Ext(Attn(Attention { q: V |    157.6 |  2117632 |     13.4 |     4.6%
+dec5.self            | Ext(Attn(Attention { q: V |    157.5 |  2117632 |     13.4 |     4.6%
+dec3.self            | Ext(Attn(Attention { q: V |    157.5 |  2117632 |     13.4 |     4.6%
+lm_head              | GemvPacked { x: ValueId(2 |     54.1 | 11439616 |    211.4 |    72.2%
+dec0.ffn.mlp.up      | GemvPacked { x: ValueId(3 |      6.5 |   731136 |    112.5 |    38.4%
+dec1.ffn.mlp.down    | GemvPacked { x: ValueId(7 |      6.5 |   733184 |    112.8 |    38.5%
+dec2.ffn.mlp.up      | GemvPacked { x: ValueId(1 |      6.5 |   731136 |    112.5 |    38.4%
+dec4.ffn.mlp.up      | GemvPacked { x: ValueId(1 |      6.5 |   731136 |    112.5 |    38.4%
+dec5.ffn.mlp.up      | GemvPacked { x: ValueId(2 |      6.5 |   731136 |    112.5 |    38.4%
+dec5.ffn.mlp.down    | GemvPacked { x: ValueId(2 |      6.5 |   733184 |    112.8 |    38.5%
+dec3.ffn.mlp.down    | GemvPacked { x: ValueId(1 |      6.5 |   733184 |    113.5 |    38.8%
+dec1.ffn.mlp.up      | GemvPacked { x: ValueId(6 |      6.4 |   731136 |    113.9 |    38.9%
+dec2.ffn.mlp.down    | GemvPacked { x: ValueId(1 |      6.4 |   733184 |    114.3 |    39.0%
+dec3.ffn.mlp.up      | GemvPacked { x: ValueId(1 |      6.4 |   731136 |    113.9 |    38.9%
+dec0.ffn.mlp.down    | GemvPacked { x: ValueId(3 |      6.4 |   733184 |    115.0 |    39.3%
+dec4.ffn.mlp.down    | GemvPacked { x: ValueId(1 |      6.3 |   733184 |    116.5 |    39.8%
+dec0.q.fused_qkv     | GemvPacked { x: ValueId(7 |      5.7 |   548864 |     95.5 |    32.6%
+dec4.q.fused_qkv     | GemvPacked { x: ValueId(1 |      5.7 |   548864 |     96.2 |    32.8%
+dec2.q.fused_qkv     | GemvPacked { x: ValueId(7 |      5.7 |   548864 |     96.9 |    33.1%
+dec1.q.fused_qkv     | GemvPacked { x: ValueId(4 |      5.7 |   548864 |     96.9 |    33.1%
+dec5.q.fused_qkv     | GemvPacked { x: ValueId(1 |      5.7 |   548864 |     96.9 |    33.1%
+dec3.q.fused_qkv     | GemvPacked { x: ValueId(1 |      5.5 |   548864 |     99.0 |    33.8%
+dec2.kv_write        | CachedAttention { q: Valu |      5.0 |  2105348 |    421.1 |   143.9%
+dec0.kv_write        | CachedAttention { q: Valu |      5.0 |  2105348 |    424.6 |   145.1%
+dec1.kv_write        | CachedAttention { q: Valu |      4.9 |  2105348 |    431.9 |   147.5%
+dec4.kv_write        | CachedAttention { q: Valu |      4.9 |  2105348 |    431.9 |   147.5%
+dec5.kv_write        | CachedAttention { q: Valu |      4.9 |  2105348 |    431.9 |   147.5%
+dec3.kv_write        | CachedAttention { q: Valu |      4.8 |  2105348 |    435.6 |   148.8%
+dec1.o               | GemvPacked { x: ValueId(5 |      4.0 |   186368 |     47.1 |    16.1%
+dec0.o               | GemvPacked { x: ValueId(2 |      3.9 |   186368 |     47.6 |    16.3%
+dec4.xo              | GemvPacked { x: ValueId(1 |      3.9 |   186368 |     47.6 |    16.3%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  Attention                12      1893    13.4    4.6%
+  GemvPacked               37       233   115.4   39.4%
+  RmsNorm                  19        62     1.9    0.6%
+  CachedAttention           6        28   445.8  152.3%
+  Unary                     7        17     6.0    2.0%
+  RelPosBias                1         3     5.9    2.0%
+  Embed                     1         3  3770.3 1288.0%
+  Binary                    1         3    12.9    4.4%
+dec2.self            | Ext(Attn(Attention { q: V |    158.1 |  2117632 |     13.4 |     4.6%
+dec1.cross           | Ext(Attn(Attention { q: V |    158.0 |  2103296 |     13.3 |     4.5%
+dec0.cross           | Ext(Attn(Attention { q: V |    158.0 |  2103296 |     13.3 |     4.5%
+dec3.cross           | Ext(Attn(Attention { q: V |    157.9 |  2103296 |     13.3 |     4.6%
+dec2.cross           | Ext(Attn(Attention { q: V |    157.8 |  2103296 |     13.3 |     4.6%
+dec4.cross           | Ext(Attn(Attention { q: V |    157.8 |  2103296 |     13.3 |     4.6%
+dec5.cross           | Ext(Attn(Attention { q: V |    157.8 |  2103296 |     13.3 |     4.6%
+dec0.self            | Ext(Attn(Attention { q: V |    157.7 |  2117632 |     13.4 |     4.6%
+dec3.self            | Ext(Attn(Attention { q: V |    157.7 |  2117632 |     13.4 |     4.6%
+dec4.self            | Ext(Attn(Attention { q: V |    157.6 |  2117632 |     13.4 |     4.6%
+dec1.self            | Ext(Attn(Attention { q: V |    157.5 |  2117632 |     13.4 |     4.6%
+dec5.self            | Ext(Attn(Attention { q: V |    157.5 |  2117632 |     13.4 |     4.6%
+lm_head              | GemvPacked { x: ValueId(2 |     54.3 | 11439616 |    210.9 |    72.0%
+dec5.ffn.mlp.up      | GemvPacked { x: ValueId(2 |      6.5 |   731136 |    112.5 |    38.4%
+dec0.ffn.mlp.up      | GemvPacked { x: ValueId(3 |      6.5 |   731136 |    112.5 |    38.4%
+dec1.ffn.mlp.up      | GemvPacked { x: ValueId(6 |      6.5 |   731136 |    112.5 |    38.4%
+dec2.ffn.mlp.up      | GemvPacked { x: ValueId(1 |      6.5 |   731136 |    112.5 |    38.4%
+dec4.ffn.mlp.down    | GemvPacked { x: ValueId(1 |      6.4 |   733184 |    114.3 |    39.0%
+dec1.ffn.mlp.down    | GemvPacked { x: ValueId(7 |      6.4 |   733184 |    115.0 |    39.3%
+dec2.ffn.mlp.down    | GemvPacked { x: ValueId(1 |      6.4 |   733184 |    115.0 |    39.3%
+dec5.ffn.mlp.down    | GemvPacked { x: ValueId(2 |      6.3 |   733184 |    115.8 |    39.5%
+dec3.ffn.mlp.up      | GemvPacked { x: ValueId(1 |      6.3 |   731136 |    116.2 |    39.7%
+dec0.ffn.mlp.down    | GemvPacked { x: ValueId(3 |      6.2 |   733184 |    117.3 |    40.1%
+dec3.ffn.mlp.down    | GemvPacked { x: ValueId(1 |      6.2 |   733184 |    117.3 |    40.1%
+dec4.ffn.mlp.up      | GemvPacked { x: ValueId(1 |      6.2 |   731136 |    117.0 |    40.0%
+dec0.q.fused_qkv     | GemvPacked { x: ValueId(7 |      5.7 |   548864 |     95.5 |    32.6%
+dec2.q.fused_qkv     | GemvPacked { x: ValueId(7 |      5.7 |   548864 |     95.5 |    32.6%
+dec3.q.fused_qkv     | GemvPacked { x: ValueId(1 |      5.7 |   548864 |     95.5 |    32.6%
+dec4.q.fused_qkv     | GemvPacked { x: ValueId(1 |      5.7 |   548864 |     96.2 |    32.8%
+dec1.q.fused_qkv     | GemvPacked { x: ValueId(4 |      5.7 |   548864 |     96.9 |    33.1%
+dec5.q.fused_qkv     | GemvPacked { x: ValueId(1 |      5.5 |   548864 |     99.8 |    34.1%
+dec0.kv_write        | CachedAttention { q: Valu |      4.8 |  2105348 |    439.4 |   150.1%
+dec1.kv_write        | CachedAttention { q: Valu |      4.8 |  2105348 |    439.4 |   150.1%
+dec2.kv_write        | CachedAttention { q: Valu |      4.7 |  2105348 |    443.2 |   151.4%
+dec4.kv_write        | CachedAttention { q: Valu |      4.7 |  2105348 |    447.2 |   152.8%
+dec3.kv_write        | CachedAttention { q: Valu |      4.7 |  2105348 |    451.1 |   154.1%
+dec5.kv_write        | CachedAttention { q: Valu |      4.6 |  2105348 |    455.2 |   155.5%
+dec0.xo              | GemvPacked { x: ValueId(3 |      3.9 |   186368 |     48.1 |    16.4%
+dec1.o               | GemvPacked { x: ValueId(5 |      3.9 |   186368 |     48.1 |    16.4%
+dec1.xo              | GemvPacked { x: ValueId(6 |      3.9 |   186368 |     48.1 |    16.4%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  Attention                12      1895    13.4    4.6%
+  GemvPacked               37       235   114.5   39.1%
+  RmsNorm                  19        64     1.8    0.6%
+  CachedAttention           6        30   425.2  145.3%
+  Unary                     7        18     5.7    2.0%
+  RelPosBias                1         3     5.8    2.0%
+  Embed                     1         3  3619.5 1236.5%
+  Binary                    1         3    12.7    4.3%
+dec4.cross           | Ext(Attn(Attention { q: V |    158.3 |  2103296 |     13.3 |     4.5%
+dec3.cross           | Ext(Attn(Attention { q: V |    158.2 |  2103296 |     13.3 |     4.5%
+dec0.cross           | Ext(Attn(Attention { q: V |    158.1 |  2103296 |     13.3 |     4.5%
+dec5.cross           | Ext(Attn(Attention { q: V |    158.1 |  2103296 |     13.3 |     4.5%
+dec2.cross           | Ext(Attn(Attention { q: V |    158.1 |  2103296 |     13.3 |     4.5%
+dec1.cross           | Ext(Attn(Attention { q: V |    158.0 |  2103296 |     13.3 |     4.5%
+dec2.self            | Ext(Attn(Attention { q: V |    158.0 |  2117632 |     13.4 |     4.6%
+dec4.self            | Ext(Attn(Attention { q: V |    157.8 |  2117632 |     13.4 |     4.6%
+dec5.self            | Ext(Attn(Attention { q: V |    157.7 |  2117632 |     13.4 |     4.6%
+dec0.self            | Ext(Attn(Attention { q: V |    157.6 |  2117632 |     13.4 |     4.6%
+dec1.self            | Ext(Attn(Attention { q: V |    157.6 |  2117632 |     13.4 |     4.6%
+dec3.self            | Ext(Attn(Attention { q: V |    157.6 |  2117632 |     13.4 |     4.6%
+lm_head              | GemvPacked { x: ValueId(2 |     54.3 | 11439616 |    210.9 |    72.0%
+dec0.ffn.mlp.up      | GemvPacked { x: ValueId(3 |      6.6 |   731136 |    111.1 |    37.9%
+dec5.ffn.mlp.up      | GemvPacked { x: ValueId(2 |      6.6 |   731136 |    111.1 |    37.9%
+dec2.ffn.mlp.up      | GemvPacked { x: ValueId(1 |      6.5 |   731136 |    112.5 |    38.4%
+dec3.ffn.mlp.down    | GemvPacked { x: ValueId(1 |      6.5 |   733184 |    112.8 |    38.5%
+dec4.ffn.mlp.up      | GemvPacked { x: ValueId(1 |      6.5 |   731136 |    113.2 |    38.7%
+dec5.ffn.mlp.down    | GemvPacked { x: ValueId(2 |      6.5 |   733184 |    113.5 |    38.8%
+dec1.ffn.mlp.down    | GemvPacked { x: ValueId(7 |      6.4 |   733184 |    115.0 |    39.3%
+dec2.ffn.mlp.down    | GemvPacked { x: ValueId(1 |      6.4 |   733184 |    115.0 |    39.3%
+dec3.ffn.mlp.up      | GemvPacked { x: ValueId(1 |      6.4 |   731136 |    114.7 |    39.2%
+dec4.ffn.mlp.down    | GemvPacked { x: ValueId(1 |      6.4 |   733184 |    115.0 |    39.3%
+dec1.ffn.mlp.up      | GemvPacked { x: ValueId(6 |      6.4 |   731136 |    114.7 |    39.2%
+dec0.ffn.mlp.down    | GemvPacked { x: ValueId(3 |      6.3 |   733184 |    117.3 |    40.1%
+dec3.q.fused_qkv     | GemvPacked { x: ValueId(1 |      5.7 |   548864 |     96.1 |    32.8%
+dec2.q.fused_qkv     | GemvPacked { x: ValueId(7 |      5.7 |   548864 |     96.2 |    32.8%
+dec0.q.fused_qkv     | GemvPacked { x: ValueId(7 |      5.7 |   548864 |     96.9 |    33.1%
+dec4.q.fused_qkv     | GemvPacked { x: ValueId(1 |      5.6 |   548864 |     97.6 |    33.3%
+dec5.q.fused_qkv     | GemvPacked { x: ValueId(1 |      5.5 |   548864 |     99.0 |    33.8%
+dec1.q.fused_qkv     | GemvPacked { x: ValueId(4 |      5.5 |   548864 |     99.8 |    34.1%
+dec2.kv_write        | CachedAttention { q: Valu |      5.0 |  2105348 |    421.1 |   143.8%
+dec4.kv_write        | CachedAttention { q: Valu |      5.0 |  2105348 |    421.1 |   143.8%
+dec5.kv_write        | CachedAttention { q: Valu |      5.0 |  2105348 |    421.1 |   143.9%
+dec0.kv_write        | CachedAttention { q: Valu |      5.0 |  2105348 |    424.6 |   145.1%
+dec1.kv_write        | CachedAttention { q: Valu |      4.9 |  2105348 |    431.9 |   147.5%
+dec3.kv_write        | CachedAttention { q: Valu |      4.9 |  2105348 |    431.9 |   147.5%
+dec2.xo              | GemvPacked { x: ValueId(9 |      4.0 |   186368 |     46.6 |    15.9%
+dec4.o               | GemvPacked { x: ValueId(1 |      4.0 |   186368 |     46.6 |    15.9%
+dec4.xo              | GemvPacked { x: ValueId(1 |      4.0 |   186368 |     46.6 |    15.9%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  Attention                12      1894    13.4    4.6%
+  GemvPacked               37       234   114.9   39.3%
+  RmsNorm                  19        63     1.8    0.6%
+  CachedAttention           6        32   400.5  136.8%
+  Unary                     7        17     5.9    2.0%
+  RelPosBias                1         3     5.6    1.9%
+  Embed                     1         3  3525.7 1204.5%
+  Binary                    1         3    13.1    4.5%
+dec2.cross           | Ext(Attn(Attention { q: V |    158.1 |  2103296 |     13.3 |     4.5%
+dec1.cross           | Ext(Attn(Attention { q: V |    158.1 |  2103296 |     13.3 |     4.5%
+dec0.cross           | Ext(Attn(Attention { q: V |    158.1 |  2103296 |     13.3 |     4.5%
+dec3.cross           | Ext(Attn(Attention { q: V |    158.0 |  2103296 |     13.3 |     4.5%
+dec5.cross           | Ext(Attn(Attention { q: V |    158.0 |  2103296 |     13.3 |     4.5%
+dec4.cross           | Ext(Attn(Attention { q: V |    158.0 |  2103296 |     13.3 |     4.5%
+dec0.self            | Ext(Attn(Attention { q: V |    157.7 |  2117632 |     13.4 |     4.6%
+dec1.self            | Ext(Attn(Attention { q: V |    157.7 |  2117632 |     13.4 |     4.6%
+dec2.self            | Ext(Attn(Attention { q: V |    157.7 |  2117632 |     13.4 |     4.6%
+dec4.self            | Ext(Attn(Attention { q: V |    157.7 |  2117632 |     13.4 |     4.6%
+dec3.self            | Ext(Attn(Attention { q: V |    157.6 |  2117632 |     13.4 |     4.6%
+dec5.self            | Ext(Attn(Attention { q: V |    157.6 |  2117632 |     13.4 |     4.6%
+lm_head              | GemvPacked { x: ValueId(2 |     54.5 | 11439616 |    209.9 |    71.7%
+dec0.ffn.mlp.up      | GemvPacked { x: ValueId(3 |      6.6 |   731136 |    111.1 |    37.9%
+dec5.ffn.mlp.down    | GemvPacked { x: ValueId(2 |      6.6 |   733184 |    111.4 |    38.0%
+dec4.ffn.mlp.up      | GemvPacked { x: ValueId(1 |      6.5 |   731136 |    112.5 |    38.4%
+dec5.ffn.mlp.up      | GemvPacked { x: ValueId(2 |      6.5 |   731136 |    112.5 |    38.4%
+dec2.ffn.mlp.up      | GemvPacked { x: ValueId(1 |      6.5 |   731136 |    113.2 |    38.7%
+dec1.ffn.mlp.up      | GemvPacked { x: ValueId(6 |      6.4 |   731136 |    113.9 |    38.9%
+dec4.ffn.mlp.down    | GemvPacked { x: ValueId(1 |      6.4 |   733184 |    114.3 |    39.0%
+dec3.ffn.mlp.down    | GemvPacked { x: ValueId(1 |      6.4 |   733184 |    115.0 |    39.3%
+dec1.ffn.mlp.down    | GemvPacked { x: ValueId(7 |      6.4 |   733184 |    115.0 |    39.3%
+dec2.ffn.mlp.down    | GemvPacked { x: ValueId(1 |      6.4 |   733184 |    115.0 |    39.3%
+dec0.ffn.mlp.down    | GemvPacked { x: ValueId(3 |      6.3 |   733184 |    115.8 |    39.5%
+dec3.ffn.mlp.up      | GemvPacked { x: ValueId(1 |      6.3 |   731136 |    117.0 |    40.0%
+dec5.q.fused_qkv     | GemvPacked { x: ValueId(1 |      5.8 |   548864 |     94.1 |    32.1%
+dec1.q.fused_qkv     | GemvPacked { x: ValueId(4 |      5.7 |   548864 |     95.5 |    32.6%
+dec3.q.fused_qkv     | GemvPacked { x: ValueId(1 |      5.7 |   548864 |     95.5 |    32.6%
+dec0.q.fused_qkv     | GemvPacked { x: ValueId(7 |      5.7 |   548864 |     96.2 |    32.8%
+dec4.q.fused_qkv     | GemvPacked { x: ValueId(1 |      5.6 |   548864 |     97.6 |    33.3%
+dec2.q.fused_qkv     | GemvPacked { x: ValueId(7 |      5.5 |   548864 |     99.8 |    34.1%
+dec1.kv_write        | CachedAttention { q: Valu |      5.4 |  2105348 |    388.7 |   132.8%
+dec0.kv_write        | CachedAttention { q: Valu |      5.4 |  2105348 |    391.7 |   133.8%
+dec4.kv_write        | CachedAttention { q: Valu |      5.2 |  2105348 |    404.2 |   138.1%
+dec5.kv_write        | CachedAttention { q: Valu |      5.2 |  2105348 |    404.2 |   138.1%
+dec2.kv_write        | CachedAttention { q: Valu |      5.2 |  2105348 |    407.5 |   139.2%
+dec3.kv_write        | CachedAttention { q: Valu |      5.2 |  2105348 |    407.5 |   139.2%
+dec0.o               | GemvPacked { x: ValueId(2 |      4.0 |   186368 |     47.1 |    16.1%
+dec0.xo              | GemvPacked { x: ValueId(3 |      3.9 |   186368 |     48.1 |    16.4%
+dec5.xo              | GemvPacked { x: ValueId(1 |      3.9 |   186368 |     48.1 |    16.4%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  Attention                12      1896    13.4    4.6%
+  GemvPacked               37       234   114.7   39.2%
+  RmsNorm                  19        64     1.8    0.6%
+  CachedAttention           6        31   407.5  139.2%
+  Unary                     7        18     5.8    2.0%
+  Embed                     1         3  3351.3 1144.9%
+  RelPosBias                1         3     5.8    2.0%
+  Binary                    1         3    12.7    4.3%
+dec1.cross           | Ext(Attn(Attention { q: V |    158.4 |  2103296 |     13.3 |     4.5%
+dec4.cross           | Ext(Attn(Attention { q: V |    158.2 |  2103296 |     13.3 |     4.5%
+dec5.cross           | Ext(Attn(Attention { q: V |    158.2 |  2103296 |     13.3 |     4.5%
+dec3.cross           | Ext(Attn(Attention { q: V |    158.1 |  2103296 |     13.3 |     4.5%
+dec0.self            | Ext(Attn(Attention { q: V |    158.0 |  2117632 |     13.4 |     4.6%
+dec0.cross           | Ext(Attn(Attention { q: V |    158.0 |  2103296 |     13.3 |     4.5%
+dec2.self            | Ext(Attn(Attention { q: V |    158.0 |  2117632 |     13.4 |     4.6%
+dec2.cross           | Ext(Attn(Attention { q: V |    158.0 |  2103296 |     13.3 |     4.5%
+dec1.self            | Ext(Attn(Attention { q: V |    158.0 |  2117632 |     13.4 |     4.6%
+dec5.self            | Ext(Attn(Attention { q: V |    157.9 |  2117632 |     13.4 |     4.6%
+dec4.self            | Ext(Attn(Attention { q: V |    157.7 |  2117632 |     13.4 |     4.6%
+dec3.self            | Ext(Attn(Attention { q: V |    157.6 |  2117632 |     13.4 |     4.6%
+lm_head              | GemvPacked { x: ValueId(2 |     54.1 | 11439616 |    211.4 |    72.2%
+dec1.ffn.mlp.up      | GemvPacked { x: ValueId(6 |      6.6 |   731136 |    110.4 |    37.7%
+dec4.ffn.mlp.up      | GemvPacked { x: ValueId(1 |      6.6 |   731136 |    111.1 |    37.9%
+dec5.ffn.mlp.up      | GemvPacked { x: ValueId(2 |      6.6 |   731136 |    111.1 |    37.9%
+dec0.ffn.mlp.down    | GemvPacked { x: ValueId(3 |      6.5 |   733184 |    112.8 |    38.5%
+dec3.ffn.mlp.up      | GemvPacked { x: ValueId(1 |      6.5 |   731136 |    112.5 |    38.4%
+dec2.ffn.mlp.up      | GemvPacked { x: ValueId(1 |      6.5 |   731136 |    113.2 |    38.7%
+dec1.ffn.mlp.down    | GemvPacked { x: ValueId(7 |      6.4 |   733184 |    115.0 |    39.3%
+dec3.ffn.mlp.down    | GemvPacked { x: ValueId(1 |      6.4 |   733184 |    115.0 |    39.3%
+dec5.ffn.mlp.down    | GemvPacked { x: ValueId(2 |      6.4 |   733184 |    115.0 |    39.3%
+dec4.ffn.mlp.down    | GemvPacked { x: ValueId(1 |      6.3 |   733184 |    117.3 |    40.1%
+dec0.ffn.mlp.up      | GemvPacked { x: ValueId(3 |      6.2 |   731136 |    117.0 |    40.0%
+dec2.ffn.mlp.down    | GemvPacked { x: ValueId(1 |      6.2 |   733184 |    117.3 |    40.1%
+dec0.q.fused_qkv     | GemvPacked { x: ValueId(7 |      5.9 |   548864 |     93.4 |    31.9%
+dec1.q.fused_qkv     | GemvPacked { x: ValueId(4 |      5.7 |   548864 |     95.5 |    32.6%
+dec4.q.fused_qkv     | GemvPacked { x: ValueId(1 |      5.6 |   548864 |     97.6 |    33.3%
+dec3.q.fused_qkv     | GemvPacked { x: ValueId(1 |      5.6 |   548864 |     97.6 |    33.3%
+dec5.q.fused_qkv     | GemvPacked { x: ValueId(1 |      5.5 |   548864 |     99.0 |    33.8%
+dec2.q.fused_qkv     | GemvPacked { x: ValueId(7 |      5.5 |   548864 |     99.8 |    34.1%
+dec0.kv_write        | CachedAttention { q: Valu |      5.2 |  2105348 |    401.0 |   137.0%
+dec1.kv_write        | CachedAttention { q: Valu |      5.2 |  2105348 |    404.2 |   138.1%
+dec5.kv_write        | CachedAttention { q: Valu |      5.2 |  2105348 |    407.5 |   139.2%
+dec2.kv_write        | CachedAttention { q: Valu |      5.1 |  2105348 |    410.8 |   140.3%
+dec3.kv_write        | CachedAttention { q: Valu |      5.1 |  2105348 |    410.8 |   140.3%
+dec4.kv_write        | CachedAttention { q: Valu |      5.1 |  2105348 |    410.8 |   140.3%
+dec0.xo              | GemvPacked { x: ValueId(3 |      4.0 |   186368 |     46.6 |    15.9%
+dec5.o               | GemvPacked { x: ValueId(1 |      4.0 |   186368 |     47.1 |    16.1%
+dec1.o               | GemvPacked { x: ValueId(5 |      3.9 |   186368 |     47.6 |    16.3%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  Attention                12      1896    13.4    4.6%
+  GemvPacked               37       235   114.3   39.0%
+  RmsNorm                  19        63     1.9    0.6%
+  CachedAttention           6        31   410.8  140.3%
+  Unary                     7        18     5.8    2.0%
+  Embed                     1         3  3310.7 1131.0%
+  RelPosBias                1         3     5.8    2.0%
+  Binary                    1         3    12.5    4.3%
+dec2.self            | Ext(Attn(Attention { q: V |    158.4 |  2117632 |     13.4 |     4.6%
+dec0.cross           | Ext(Attn(Attention { q: V |    158.3 |  2103296 |     13.3 |     4.5%
+dec1.cross           | Ext(Attn(Attention { q: V |    158.3 |  2103296 |     13.3 |     4.5%
+dec4.cross           | Ext(Attn(Attention { q: V |    158.2 |  2103296 |     13.3 |     4.5%
+dec2.cross           | Ext(Attn(Attention { q: V |    158.0 |  2103296 |     13.3 |     4.5%
+dec5.cross           | Ext(Attn(Attention { q: V |    158.0 |  2103296 |     13.3 |     4.5%
+dec3.cross           | Ext(Attn(Attention { q: V |    157.9 |  2103296 |     13.3 |     4.6%
+dec1.self            | Ext(Attn(Attention { q: V |    157.9 |  2117632 |     13.4 |     4.6%
+dec4.self            | Ext(Attn(Attention { q: V |    157.9 |  2117632 |     13.4 |     4.6%
+dec5.self            | Ext(Attn(Attention { q: V |    157.8 |  2117632 |     13.4 |     4.6%
+dec0.self            | Ext(Attn(Attention { q: V |    157.8 |  2117632 |     13.4 |     4.6%
+dec3.self            | Ext(Attn(Attention { q: V |    157.6 |  2117632 |     13.4 |     4.6%
+lm_head              | GemvPacked { x: ValueId(2 |     54.1 | 11439616 |    211.5 |    72.3%
+dec5.ffn.mlp.up      | GemvPacked { x: ValueId(2 |      6.6 |   731136 |    110.4 |    37.7%
+dec4.ffn.mlp.up      | GemvPacked { x: ValueId(1 |      6.5 |   731136 |    112.5 |    38.4%
+dec0.ffn.mlp.up      | GemvPacked { x: ValueId(3 |      6.5 |   731136 |    112.5 |    38.4%
+dec2.ffn.mlp.up      | GemvPacked { x: ValueId(1 |      6.5 |   731136 |    112.5 |    38.4%
+dec3.ffn.mlp.up      | GemvPacked { x: ValueId(1 |      6.5 |   731136 |    112.5 |    38.4%
+dec0.ffn.mlp.down    | GemvPacked { x: ValueId(3 |      6.5 |   733184 |    113.5 |    38.8%
+dec5.ffn.mlp.down    | GemvPacked { x: ValueId(2 |      6.4 |   733184 |    114.3 |    39.0%
+dec2.ffn.mlp.down    | GemvPacked { x: ValueId(1 |      6.4 |   733184 |    115.0 |    39.3%
+dec3.ffn.mlp.down    | GemvPacked { x: ValueId(1 |      6.4 |   733184 |    115.0 |    39.3%
+dec1.ffn.mlp.up      | GemvPacked { x: ValueId(6 |      6.3 |   731136 |    115.4 |    39.4%
+dec1.ffn.mlp.down    | GemvPacked { x: ValueId(7 |      6.3 |   733184 |    115.8 |    39.5%
+dec4.ffn.mlp.down    | GemvPacked { x: ValueId(1 |      6.2 |   733184 |    117.3 |    40.1%
+dec4.q.fused_qkv     | GemvPacked { x: ValueId(1 |      5.8 |   548864 |     94.1 |    32.1%
+dec0.q.fused_qkv     | GemvPacked { x: ValueId(7 |      5.8 |   548864 |     94.8 |    32.4%
+dec1.q.fused_qkv     | GemvPacked { x: ValueId(4 |      5.7 |   548864 |     96.9 |    33.1%
+dec3.q.fused_qkv     | GemvPacked { x: ValueId(1 |      5.6 |   548864 |     97.6 |    33.3%
+dec5.q.fused_qkv     | GemvPacked { x: ValueId(1 |      5.6 |   548864 |     97.6 |    33.3%
+dec2.q.fused_qkv     | GemvPacked { x: ValueId(7 |      5.6 |   548864 |     98.3 |    33.6%
+dec3.kv_write        | CachedAttention { q: Valu |      5.2 |  2105348 |    404.2 |   138.1%
+dec1.kv_write        | CachedAttention { q: Valu |      5.2 |  2105348 |    404.2 |   138.1%
+dec2.kv_write        | CachedAttention { q: Valu |      5.2 |  2105348 |    404.2 |   138.1%
+dec0.kv_write        | CachedAttention { q: Valu |      5.2 |  2105348 |    407.5 |   139.2%
+dec4.kv_write        | CachedAttention { q: Valu |      5.0 |  2105348 |    417.6 |   142.7%
+dec5.kv_write        | CachedAttention { q: Valu |      4.9 |  2105348 |    428.2 |   146.3%
+dec3.o               | GemvPacked { x: ValueId(1 |      4.0 |   186368 |     46.6 |    15.9%
+dec3.xo              | GemvPacked { x: ValueId(1 |      4.0 |   186368 |     46.6 |    15.9%
+dec5.xo              | GemvPacked { x: ValueId(1 |      4.0 |   186368 |     46.6 |    15.9%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  Attention                12      1896    13.4    4.6%
+  GemvPacked               37       234   114.8   39.2%
+  RmsNorm                  19        64     1.8    0.6%
+  CachedAttention           6        32   394.8  134.9%
+  Unary                     7        18     5.8    2.0%
+  RelPosBias                1         3     5.8    2.0%
+  Embed                     1         3  3480.3 1188.9%
+  Binary                    1         3    13.3    4.5%
+dec4.cross           | Ext(Attn(Attention { q: V |    158.4 |  2103296 |     13.3 |     4.5%
+dec3.cross           | Ext(Attn(Attention { q: V |    158.3 |  2103296 |     13.3 |     4.5%
+dec0.cross           | Ext(Attn(Attention { q: V |    158.2 |  2103296 |     13.3 |     4.5%
+dec2.cross           | Ext(Attn(Attention { q: V |    158.2 |  2103296 |     13.3 |     4.5%
+dec1.cross           | Ext(Attn(Attention { q: V |    158.1 |  2103296 |     13.3 |     4.5%
+dec5.cross           | Ext(Attn(Attention { q: V |    158.0 |  2103296 |     13.3 |     4.5%
+dec0.self            | Ext(Attn(Attention { q: V |    158.0 |  2117632 |     13.4 |     4.6%
+dec2.self            | Ext(Attn(Attention { q: V |    158.0 |  2117632 |     13.4 |     4.6%
+dec1.self            | Ext(Attn(Attention { q: V |    157.8 |  2117632 |     13.4 |     4.6%
+dec4.self            | Ext(Attn(Attention { q: V |    157.8 |  2117632 |     13.4 |     4.6%
+dec3.self            | Ext(Attn(Attention { q: V |    157.7 |  2117632 |     13.4 |     4.6%
+dec5.self            | Ext(Attn(Attention { q: V |    157.6 |  2117632 |     13.4 |     4.6%
+lm_head              | GemvPacked { x: ValueId(2 |     54.2 | 11439616 |    211.0 |    72.1%
+dec5.ffn.mlp.up      | GemvPacked { x: ValueId(2 |      6.5 |   731136 |    112.5 |    38.4%
+dec5.ffn.mlp.down    | GemvPacked { x: ValueId(2 |      6.5 |   733184 |    112.8 |    38.5%
+dec1.ffn.mlp.up      | GemvPacked { x: ValueId(6 |      6.5 |   731136 |    113.2 |    38.7%
+dec2.ffn.mlp.up      | GemvPacked { x: ValueId(1 |      6.4 |   731136 |    114.7 |    39.2%
+dec0.ffn.mlp.up      | GemvPacked { x: ValueId(3 |      6.4 |   731136 |    114.7 |    39.2%
+dec1.ffn.mlp.down    | GemvPacked { x: ValueId(7 |      6.4 |   733184 |    115.0 |    39.3%
+dec4.ffn.mlp.up      | GemvPacked { x: ValueId(1 |      6.4 |   731136 |    114.7 |    39.2%
+dec4.ffn.mlp.down    | GemvPacked { x: ValueId(1 |      6.3 |   733184 |    115.8 |    39.5%
+dec3.ffn.mlp.up      | GemvPacked { x: ValueId(1 |      6.3 |   731136 |    116.2 |    39.7%
+dec0.ffn.mlp.down    | GemvPacked { x: ValueId(3 |      6.3 |   733184 |    117.3 |    40.1%
+dec3.ffn.mlp.down    | GemvPacked { x: ValueId(1 |      6.2 |   733184 |    117.3 |    40.1%
+dec2.ffn.mlp.down    | GemvPacked { x: ValueId(1 |      6.1 |   733184 |    119.7 |    40.9%
+dec1.q.fused_qkv     | GemvPacked { x: ValueId(4 |      5.8 |   548864 |     94.8 |    32.4%
+dec2.q.fused_qkv     | GemvPacked { x: ValueId(7 |      5.7 |   548864 |     95.5 |    32.6%
+dec5.q.fused_qkv     | GemvPacked { x: ValueId(1 |      5.7 |   548864 |     96.2 |    32.8%
+dec0.q.fused_qkv     | GemvPacked { x: ValueId(7 |      5.7 |   548864 |     96.9 |    33.1%
+dec3.q.fused_qkv     | GemvPacked { x: ValueId(1 |      5.6 |   548864 |     97.6 |    33.3%
+dec4.q.fused_qkv     | GemvPacked { x: ValueId(1 |      5.6 |   548864 |     97.6 |    33.3%
+dec0.kv_write        | CachedAttention { q: Valu |      5.4 |  2105348 |    391.7 |   133.8%
+dec2.kv_write        | CachedAttention { q: Valu |      5.4 |  2105348 |    391.7 |   133.8%
+dec1.kv_write        | CachedAttention { q: Valu |      5.4 |  2105348 |    391.7 |   133.8%
+dec5.kv_write        | CachedAttention { q: Valu |      5.4 |  2105348 |    391.7 |   133.8%
+dec4.kv_write        | CachedAttention { q: Valu |      5.3 |  2105348 |    401.0 |   137.0%
+dec3.kv_write        | CachedAttention { q: Valu |      5.2 |  2105348 |    401.0 |   137.0%
+dec2.o               | GemvPacked { x: ValueId(8 |      4.0 |   186368 |     46.6 |    15.9%
+dec2.xo              | GemvPacked { x: ValueId(9 |      4.0 |   186368 |     47.1 |    16.1%
+dec3.o               | GemvPacked { x: ValueId(1 |      4.0 |   186368 |     47.1 |    16.1%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  Attention                12      1895    13.4    4.6%
+  GemvPacked               37       234   114.9   39.2%
+  RmsNorm                  19        64     1.8    0.6%
+  CachedAttention           6        33   382.8  130.8%
+  Unary                     7        18     5.6    1.9%
+  RelPosBias                1         3     5.8    2.0%
+  Embed                     1         3  3480.3 1188.9%
+  Binary                    1         3    12.7    4.3%
+dec0.cross           | Ext(Attn(Attention { q: V |    158.3 |  2103296 |     13.3 |     4.5%
+dec1.cross           | Ext(Attn(Attention { q: V |    158.2 |  2103296 |     13.3 |     4.5%
+dec2.cross           | Ext(Attn(Attention { q: V |    158.2 |  2103296 |     13.3 |     4.5%
+dec3.cross           | Ext(Attn(Attention { q: V |    158.1 |  2103296 |     13.3 |     4.5%
+dec2.self            | Ext(Attn(Attention { q: V |    158.0 |  2117632 |     13.4 |     4.6%
+dec5.cross           | Ext(Attn(Attention { q: V |    158.0 |  2103296 |     13.3 |     4.5%
+dec1.self            | Ext(Attn(Attention { q: V |    157.9 |  2117632 |     13.4 |     4.6%
+dec4.cross           | Ext(Attn(Attention { q: V |    157.7 |  2103296 |     13.3 |     4.6%
+dec4.self            | Ext(Attn(Attention { q: V |    157.7 |  2117632 |     13.4 |     4.6%
+dec0.self            | Ext(Attn(Attention { q: V |    157.7 |  2117632 |     13.4 |     4.6%
+dec5.self            | Ext(Attn(Attention { q: V |    157.5 |  2117632 |     13.4 |     4.6%
+dec3.self            | Ext(Attn(Attention { q: V |    157.4 |  2117632 |     13.5 |     4.6%
+lm_head              | GemvPacked { x: ValueId(2 |     54.1 | 11439616 |    211.5 |    72.3%
+dec0.ffn.mlp.up      | GemvPacked { x: ValueId(3 |      6.6 |   731136 |    111.1 |    37.9%
+dec0.ffn.mlp.down    | GemvPacked { x: ValueId(3 |      6.5 |   733184 |    112.8 |    38.5%
+dec3.ffn.mlp.up      | GemvPacked { x: ValueId(1 |      6.5 |   731136 |    112.5 |    38.4%
+dec1.ffn.mlp.up      | GemvPacked { x: ValueId(6 |      6.4 |   731136 |    113.9 |    38.9%
+dec3.ffn.mlp.down    | GemvPacked { x: ValueId(1 |      6.4 |   733184 |    114.3 |    39.0%
+dec4.ffn.mlp.up      | GemvPacked { x: ValueId(1 |      6.4 |   731136 |    113.9 |    38.9%
+dec2.ffn.mlp.up      | GemvPacked { x: ValueId(1 |      6.4 |   731136 |    114.7 |    39.2%
+dec1.ffn.mlp.down    | GemvPacked { x: ValueId(7 |      6.4 |   733184 |    115.0 |    39.3%
+dec5.ffn.mlp.up      | GemvPacked { x: ValueId(2 |      6.4 |   731136 |    114.7 |    39.2%
+dec2.ffn.mlp.down    | GemvPacked { x: ValueId(1 |      6.3 |   733184 |    115.8 |    39.5%
+dec4.ffn.mlp.down    | GemvPacked { x: ValueId(1 |      6.3 |   733184 |    115.8 |    39.5%
+dec5.ffn.mlp.down    | GemvPacked { x: ValueId(2 |      6.3 |   733184 |    116.5 |    39.8%
+dec0.q.fused_qkv     | GemvPacked { x: ValueId(7 |      5.7 |   548864 |     95.5 |    32.6%
+dec3.q.fused_qkv     | GemvPacked { x: ValueId(1 |      5.7 |   548864 |     96.9 |    33.1%
+dec5.q.fused_qkv     | GemvPacked { x: ValueId(1 |      5.7 |   548864 |     96.9 |    33.1%
+dec0.kv_write        | CachedAttention { q: Valu |      5.6 |  2105348 |    374.3 |   127.9%
+dec2.q.fused_qkv     | GemvPacked { x: ValueId(7 |      5.6 |   548864 |     97.6 |    33.3%
+dec4.q.fused_qkv     | GemvPacked { x: ValueId(1 |      5.6 |   548864 |     97.6 |    33.3%
+dec1.q.fused_qkv     | GemvPacked { x: ValueId(4 |      5.6 |   548864 |     98.3 |    33.6%
+dec4.kv_write        | CachedAttention { q: Valu |      5.5 |  2105348 |    382.8 |   130.8%
+dec5.kv_write        | CachedAttention { q: Valu |      5.5 |  2105348 |    382.8 |   130.8%
+dec2.kv_write        | CachedAttention { q: Valu |      5.5 |  2105348 |    382.8 |   130.8%
+dec3.kv_write        | CachedAttention { q: Valu |      5.5 |  2105348 |    382.8 |   130.8%
+dec1.kv_write        | CachedAttention { q: Valu |      5.4 |  2105348 |    391.7 |   133.8%
+dec0.xo              | GemvPacked { x: ValueId(3 |      4.0 |   186368 |     47.1 |    16.1%
+dec5.xo              | GemvPacked { x: ValueId(1 |      3.9 |   186368 |     47.6 |    16.3%
+dec1.xo              | GemvPacked { x: ValueId(6 |      3.9 |   186368 |     48.1 |    16.4%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  Attention                12      1896    13.4    4.6%
+  GemvPacked               37       235   114.3   39.1%
+  RmsNorm                  19        63     1.8    0.6%
+  CachedAttention           6        33   379.0  129.5%
+  Unary                     7        18     5.7    1.9%
+  RelPosBias                1         3     5.9    2.0%
+  Embed                     1         3  3770.3 1288.0%
+  Binary                    1         3    12.1    4.1%
+dec0.cross           | Ext(Attn(Attention { q: V |    158.2 |  2103296 |     13.3 |     4.5%
+dec1.cross           | Ext(Attn(Attention { q: V |    158.2 |  2103296 |     13.3 |     4.5%
+dec3.cross           | Ext(Attn(Attention { q: V |    158.2 |  2103296 |     13.3 |     4.5%
+dec5.cross           | Ext(Attn(Attention { q: V |    158.1 |  2103296 |     13.3 |     4.5%
+dec2.cross           | Ext(Attn(Attention { q: V |    158.1 |  2103296 |     13.3 |     4.5%
+dec1.self            | Ext(Attn(Attention { q: V |    158.0 |  2117632 |     13.4 |     4.6%
+dec4.cross           | Ext(Attn(Attention { q: V |    158.0 |  2103296 |     13.3 |     4.5%
+dec2.self            | Ext(Attn(Attention { q: V |    157.9 |  2117632 |     13.4 |     4.6%
+dec4.self            | Ext(Attn(Attention { q: V |    157.8 |  2117632 |     13.4 |     4.6%
+dec0.self            | Ext(Attn(Attention { q: V |    157.7 |  2117632 |     13.4 |     4.6%
+dec3.self            | Ext(Attn(Attention { q: V |    157.7 |  2117632 |     13.4 |     4.6%
+dec5.self            | Ext(Attn(Attention { q: V |    157.7 |  2117632 |     13.4 |     4.6%
+lm_head              | GemvPacked { x: ValueId(2 |     54.6 | 11439616 |    209.4 |    71.5%
+dec0.ffn.mlp.down    | GemvPacked { x: ValueId(3 |      6.5 |   733184 |    112.8 |    38.5%
+dec2.ffn.mlp.up      | GemvPacked { x: ValueId(1 |      6.5 |   731136 |    112.5 |    38.4%
+dec2.ffn.mlp.down    | GemvPacked { x: ValueId(1 |      6.5 |   733184 |    112.8 |    38.5%
+dec3.ffn.mlp.up      | GemvPacked { x: ValueId(1 |      6.5 |   731136 |    112.5 |    38.4%
+dec5.ffn.mlp.up      | GemvPacked { x: ValueId(2 |      6.5 |   731136 |    112.5 |    38.4%
+dec0.ffn.mlp.up      | GemvPacked { x: ValueId(3 |      6.4 |   731136 |    113.9 |    38.9%
+dec3.ffn.mlp.down    | GemvPacked { x: ValueId(1 |      6.4 |   733184 |    114.3 |    39.0%
+dec1.ffn.mlp.down    | GemvPacked { x: ValueId(7 |      6.4 |   733184 |    115.0 |    39.3%
+dec1.ffn.mlp.up      | GemvPacked { x: ValueId(6 |      6.4 |   731136 |    114.7 |    39.2%
+dec4.ffn.mlp.up      | GemvPacked { x: ValueId(1 |      6.4 |   731136 |    114.7 |    39.2%
+dec4.ffn.mlp.down    | GemvPacked { x: ValueId(1 |      6.3 |   733184 |    115.8 |    39.5%
+dec5.ffn.mlp.down    | GemvPacked { x: ValueId(2 |      6.3 |   733184 |    115.8 |    39.5%
+dec1.q.fused_qkv     | GemvPacked { x: ValueId(4 |      5.8 |   548864 |     94.8 |    32.4%
+dec0.q.fused_qkv     | GemvPacked { x: ValueId(7 |      5.7 |   548864 |     95.5 |    32.6%
+dec4.q.fused_qkv     | GemvPacked { x: ValueId(1 |      5.7 |   548864 |     95.5 |    32.6%
+dec2.q.fused_qkv     | GemvPacked { x: ValueId(7 |      5.7 |   548864 |     96.9 |    33.1%
+dec3.q.fused_qkv     | GemvPacked { x: ValueId(1 |      5.7 |   548864 |     96.9 |    33.1%
+dec5.q.fused_qkv     | GemvPacked { x: ValueId(1 |      5.7 |   548864 |     96.9 |    33.1%
+dec4.kv_write        | CachedAttention { q: Valu |      5.6 |  2105348 |    374.3 |   127.9%
+dec0.kv_write        | CachedAttention { q: Valu |      5.6 |  2105348 |    377.1 |   128.8%
+dec2.kv_write        | CachedAttention { q: Valu |      5.6 |  2105348 |    377.1 |   128.8%
+dec3.kv_write        | CachedAttention { q: Valu |      5.6 |  2105348 |    377.1 |   128.8%
+dec1.kv_write        | CachedAttention { q: Valu |      5.5 |  2105348 |    382.8 |   130.8%
+dec5.kv_write        | CachedAttention { q: Valu |      5.5 |  2105348 |    385.7 |   131.8%
+dec1.o               | GemvPacked { x: ValueId(5 |      4.0 |   186368 |     46.6 |    15.9%
+dec3.o               | GemvPacked { x: ValueId(1 |      4.0 |   186368 |     46.6 |    15.9%
+dec4.o               | GemvPacked { x: ValueId(1 |      3.9 |   186368 |     47.6 |    16.3%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  Attention                12      1895    13.4    4.6%
+  GemvPacked               37       234   114.6   39.2%
+  RmsNorm                  19        64     1.8    0.6%
+  CachedAttention           6        33   382.8  130.8%
+  Unary                     7        18     5.7    1.9%
+  RelPosBias                1         3     5.7    1.9%
+  Embed                     1         3  3525.5 1204.4%
+  Binary                    1         3    12.5    4.3%
+dec2.cross           | Ext(Attn(Attention { q: V |    158.3 |  2103296 |     13.3 |     4.5%
+dec0.cross           | Ext(Attn(Attention { q: V |    158.3 |  2103296 |     13.3 |     4.5%
+dec3.cross           | Ext(Attn(Attention { q: V |    158.2 |  2103296 |     13.3 |     4.5%
+dec1.cross           | Ext(Attn(Attention { q: V |    158.2 |  2103296 |     13.3 |     4.5%
+dec5.cross           | Ext(Attn(Attention { q: V |    158.0 |  2103296 |     13.3 |     4.5%
+dec4.cross           | Ext(Attn(Attention { q: V |    157.9 |  2103296 |     13.3 |     4.6%
+dec0.self            | Ext(Attn(Attention { q: V |    157.8 |  2117632 |     13.4 |     4.6%
+dec5.self            | Ext(Attn(Attention { q: V |    157.8 |  2117632 |     13.4 |     4.6%
+dec2.self            | Ext(Attn(Attention { q: V |    157.8 |  2117632 |     13.4 |     4.6%
+dec3.self            | Ext(Attn(Attention { q: V |    157.6 |  2117632 |     13.4 |     4.6%
+dec4.self            | Ext(Attn(Attention { q: V |    157.6 |  2117632 |     13.4 |     4.6%
+dec1.self            | Ext(Attn(Attention { q: V |    157.5 |  2117632 |     13.4 |     4.6%
+lm_head              | GemvPacked { x: ValueId(2 |     54.2 | 11439616 |    211.2 |    72.1%
+dec0.ffn.mlp.down    | GemvPacked { x: ValueId(3 |      6.6 |   733184 |    111.4 |    38.0%
+dec3.ffn.mlp.up      | GemvPacked { x: ValueId(1 |      6.5 |   731136 |    112.5 |    38.4%
+dec5.ffn.mlp.up      | GemvPacked { x: ValueId(2 |      6.5 |   731136 |    112.5 |    38.4%
+dec3.ffn.mlp.down    | GemvPacked { x: ValueId(1 |      6.5 |   733184 |    113.5 |    38.8%
+dec0.ffn.mlp.up      | GemvPacked { x: ValueId(3 |      6.5 |   731136 |    113.2 |    38.7%
+dec4.ffn.mlp.up      | GemvPacked { x: ValueId(1 |      6.5 |   731136 |    113.2 |    38.7%
+dec1.ffn.mlp.up      | GemvPacked { x: ValueId(6 |      6.4 |   731136 |    114.7 |    39.2%
+dec1.ffn.mlp.down    | GemvPacked { x: ValueId(7 |      6.4 |   733184 |    115.0 |    39.3%
+dec2.ffn.mlp.up      | GemvPacked { x: ValueId(1 |      6.4 |   731136 |    114.7 |    39.2%
+dec5.ffn.mlp.down    | GemvPacked { x: ValueId(2 |      6.3 |   733184 |    116.5 |    39.8%
+dec4.ffn.mlp.down    | GemvPacked { x: ValueId(1 |      6.3 |   733184 |    117.3 |    40.1%
+dec2.ffn.mlp.down    | GemvPacked { x: ValueId(1 |      6.2 |   733184 |    117.3 |    40.1%
+dec0.q.fused_qkv     | GemvPacked { x: ValueId(7 |      5.7 |   548864 |     95.5 |    32.6%
+dec1.q.fused_qkv     | GemvPacked { x: ValueId(4 |      5.7 |   548864 |     95.5 |    32.6%
+dec4.q.fused_qkv     | GemvPacked { x: ValueId(1 |      5.7 |   548864 |     96.2 |    32.8%
+dec5.kv_write        | CachedAttention { q: Valu |      5.6 |  2105348 |    374.3 |   127.9%
+dec3.q.fused_qkv     | GemvPacked { x: ValueId(1 |      5.6 |   548864 |     97.6 |    33.3%
+dec1.kv_write        | CachedAttention { q: Valu |      5.5 |  2105348 |    379.9 |   129.8%
+dec2.q.fused_qkv     | GemvPacked { x: ValueId(7 |      5.5 |   548864 |     99.0 |    33.8%
+dec4.kv_write        | CachedAttention { q: Valu |      5.5 |  2105348 |    379.9 |   129.8%
+dec3.kv_write        | CachedAttention { q: Valu |      5.5 |  2105348 |    382.8 |   130.8%
+dec5.q.fused_qkv     | GemvPacked { x: ValueId(1 |      5.5 |   548864 |     99.8 |    34.1%
+dec0.kv_write        | CachedAttention { q: Valu |      5.4 |  2105348 |    388.7 |   132.8%
+dec2.kv_write        | CachedAttention { q: Valu |      5.4 |  2105348 |    391.7 |   133.8%
+dec0.xo              | GemvPacked { x: ValueId(3 |      4.0 |   186368 |     46.6 |    15.9%
+dec5.xo              | GemvPacked { x: ValueId(1 |      4.0 |   186368 |     47.1 |    16.1%
+dec2.xo              | GemvPacked { x: ValueId(9 |      3.9 |   186368 |     47.6 |    16.3%
+⚡ Prefill: 1 tokens in 35.75ms (28.0 tok/s)
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  GemmBatchedPacked        28      2748    11.4    3.9%
+  Attention                 6       205    19.2    6.6%
+  Copy                     30       139   112.9   38.6%
+  RmsNorm                  13        49    69.6   23.8%
+  Unary                     6        25   253.3   86.5%
+  Binary                    1         4    60.6   20.7%
+  RelPosBias                1         3    39.3   13.4%
+  Embed                     1         3  3475.5 1187.3%
+enc1.ffn.mlp.up      | GemmBatchedPacked { x: Va |    153.9 |  1376256 |      8.9 |     3.1%
+enc0.ffn.mlp.up      | GemmBatchedPacked { x: Va |    150.6 |  1376256 |      9.1 |     3.1%
+enc5.ffn.mlp.up      | GemmBatchedPacked { x: Va |    149.8 |  1376256 |      9.2 |     3.1%
+enc4.ffn.mlp.up      | GemmBatchedPacked { x: Va |    149.2 |  1376256 |      9.2 |     3.2%
+enc2.ffn.mlp.up      | GemmBatchedPacked { x: Va |    148.7 |  1376256 |      9.3 |     3.2%
+enc3.ffn.mlp.up      | GemmBatchedPacked { x: Va |    146.6 |  1376256 |      9.4 |     3.2%
+xv.4.fused_qkv       | GemmBatchedPacked { x: Va |    111.1 |  1064960 |      9.6 |     3.3%
+enc1.attn.q.fused_qkv | GemmBatchedPacked { x: Va |    110.0 |  1064960 |      9.7 |     3.3%
+enc2.attn.q.fused_qkv | GemmBatchedPacked { x: Va |    109.5 |  1064960 |      9.7 |     3.3%
+enc5.attn.q.fused_qkv | GemmBatchedPacked { x: Va |    108.9 |  1064960 |      9.8 |     3.3%
+enc4.attn.q.fused_qkv | GemmBatchedPacked { x: Va |    108.8 |  1064960 |      9.8 |     3.3%
+xk.3.fused_qkv       | GemmBatchedPacked { x: Va |    108.2 |  1064960 |      9.8 |     3.4%
+xv.1.fused_qkv       | GemmBatchedPacked { x: Va |    107.5 |  1064960 |      9.9 |     3.4%
+xk.0.fused_qkv       | GemmBatchedPacked { x: Va |    106.9 |  1064960 |     10.0 |     3.4%
+enc0.attn.q.fused_qkv | GemmBatchedPacked { x: Va |    106.7 |  1064960 |     10.0 |     3.4%
+enc3.attn.q.fused_qkv | GemmBatchedPacked { x: Va |    106.6 |  1064960 |     10.0 |     3.4%
+enc1.attn.o          | GemmBatchedPacked { x: Va |     76.9 |   573440 |      7.5 |     2.5%
+enc2.attn.o          | GemmBatchedPacked { x: Va |     76.9 |   573440 |      7.5 |     2.5%
+enc3.attn.o          | GemmBatchedPacked { x: Va |     76.9 |   573440 |      7.5 |     2.5%
+enc4.attn.o          | GemmBatchedPacked { x: Va |     76.6 |   573440 |      7.5 |     2.6%
+enc0.attn.o          | GemmBatchedPacked { x: Va |     76.5 |   573440 |      7.5 |     2.6%
+enc5.attn.o          | GemmBatchedPacked { x: Va |     76.3 |   573440 |      7.5 |     2.6%
+enc3.ffn.mlp.down    | GemmBatchedPacked { x: Va |     51.0 |  1507328 |     29.6 |    10.1%
+enc4.ffn.mlp.down    | GemmBatchedPacked { x: Va |     50.9 |  1507328 |     29.6 |    10.1%
+enc5.ffn.mlp.down    | GemmBatchedPacked { x: Va |     50.9 |  1507328 |     29.6 |    10.1%
+enc0.ffn.mlp.down    | GemmBatchedPacked { x: Va |     50.9 |  1507328 |     29.6 |    10.1%
+enc2.ffn.mlp.down    | GemmBatchedPacked { x: Va |     50.9 |  1507328 |     29.6 |    10.1%
+enc1.ffn.mlp.down    | GemmBatchedPacked { x: Va |     50.7 |  1507328 |     29.7 |    10.2%
+enc4.attn.attn       | Ext(Attn(Attention { q: V |     34.3 |   655360 |     19.1 |     6.5%
+enc5.attn.attn       | Ext(Attn(Attention { q: V |     34.3 |   655360 |     19.1 |     6.5%
+enc0.attn.attn       | Ext(Attn(Attention { q: V |     34.2 |   655360 |     19.2 |     6.6%
+enc1.attn.attn       | Ext(Attn(Attention { q: V |     34.2 |   655360 |     19.2 |     6.6%
+enc2.attn.attn       | Ext(Attn(Attention { q: V |     34.2 |   655360 |     19.2 |     6.6%
+enc3.attn.attn       | Ext(Attn(Attention { q: V |     34.0 |   655360 |     19.3 |     6.6%
+enc0.attn.q.q_slice  | Ext(Movement(Copy { fill: |      4.8 |   524288 |    110.4 |    37.7%
+enc2.attn.q.q_slice  | Ext(Movement(Copy { fill: |      4.7 |   524288 |    110.4 |    37.7%
+enc2.attn.k.k_slice  | Ext(Movement(Copy { fill: |      4.7 |   524288 |    110.4 |    37.7%
+xk.4.v_slice         | Ext(Movement(Copy { fill: |      4.7 |   524288 |    110.4 |    37.7%
+enc1.attn.k.k_slice  | Ext(Movement(Copy { fill: |      4.7 |   524288 |    111.4 |    38.0%
+enc2.attn.v.v_slice  | Ext(Movement(Copy { fill: |      4.7 |   524288 |    111.4 |    38.0%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  Attention                12      1895    13.4    4.6%
+  GemvPacked               37       235   114.2   39.0%
+  RmsNorm                  19        64     1.8    0.6%
+  CachedAttention           6        31   413.0  141.1%
+  Unary                     7        18     5.8    2.0%
+  RelPosBias                1         3     5.8    2.0%
+  Embed                     1         3  3571.9 1220.2%
+  Binary                    1         3    12.3    4.2%
+dec3.cross           | Ext(Attn(Attention { q: V |    158.2 |  2103296 |     13.3 |     4.5%
+dec4.cross           | Ext(Attn(Attention { q: V |    158.1 |  2103296 |     13.3 |     4.5%
+dec0.cross           | Ext(Attn(Attention { q: V |    158.1 |  2103296 |     13.3 |     4.5%
+dec2.self            | Ext(Attn(Attention { q: V |    158.0 |  2117632 |     13.4 |     4.6%
+dec5.cross           | Ext(Attn(Attention { q: V |    158.0 |  2103296 |     13.3 |     4.5%
+dec1.cross           | Ext(Attn(Attention { q: V |    158.0 |  2103296 |     13.3 |     4.5%
+dec0.self            | Ext(Attn(Attention { q: V |    158.0 |  2117632 |     13.4 |     4.6%
+dec2.cross           | Ext(Attn(Attention { q: V |    157.9 |  2103296 |     13.3 |     4.6%
+dec3.self            | Ext(Attn(Attention { q: V |    157.9 |  2117632 |     13.4 |     4.6%
+dec4.self            | Ext(Attn(Attention { q: V |    157.9 |  2117632 |     13.4 |     4.6%
+dec1.self            | Ext(Attn(Attention { q: V |    157.6 |  2117632 |     13.4 |     4.6%
+dec5.self            | Ext(Attn(Attention { q: V |    157.6 |  2117632 |     13.4 |     4.6%
+lm_head              | GemvPacked { x: ValueId(2 |     54.3 | 11439616 |    210.9 |    72.0%
+dec1.ffn.mlp.up      | GemvPacked { x: ValueId(6 |      6.6 |   731136 |    110.4 |    37.7%
+dec3.ffn.mlp.up      | GemvPacked { x: ValueId(1 |      6.6 |   731136 |    110.4 |    37.7%
+dec5.ffn.mlp.up      | GemvPacked { x: ValueId(2 |      6.6 |   731136 |    111.1 |    37.9%
+dec2.ffn.mlp.up      | GemvPacked { x: ValueId(1 |      6.5 |   731136 |    111.8 |    38.2%
+dec0.ffn.mlp.up      | GemvPacked { x: ValueId(3 |      6.5 |   731136 |    112.5 |    38.4%
+dec1.ffn.mlp.down    | GemvPacked { x: ValueId(7 |      6.5 |   733184 |    113.5 |    38.8%
+dec0.ffn.mlp.down    | GemvPacked { x: ValueId(3 |      6.4 |   733184 |    114.3 |    39.0%
+dec3.ffn.mlp.down    | GemvPacked { x: ValueId(1 |      6.4 |   733184 |    114.3 |    39.0%
+dec4.ffn.mlp.up      | GemvPacked { x: ValueId(1 |      6.4 |   731136 |    113.9 |    38.9%
+dec5.ffn.mlp.down    | GemvPacked { x: ValueId(2 |      6.4 |   733184 |    114.3 |    39.0%
+dec4.ffn.mlp.down    | GemvPacked { x: ValueId(1 |      6.4 |   733184 |    115.0 |    39.3%
+dec2.ffn.mlp.down    | GemvPacked { x: ValueId(1 |      6.3 |   733184 |    115.8 |    39.5%
+dec2.q.fused_qkv     | GemvPacked { x: ValueId(7 |      5.7 |   548864 |     95.5 |    32.6%
+dec4.q.fused_qkv     | GemvPacked { x: ValueId(1 |      5.7 |   548864 |     95.5 |    32.6%
+dec3.q.fused_qkv     | GemvPacked { x: ValueId(1 |      5.7 |   548864 |     96.1 |    32.8%
+dec0.q.fused_qkv     | GemvPacked { x: ValueId(7 |      5.7 |   548864 |     96.2 |    32.8%
+dec5.q.fused_qkv     | GemvPacked { x: ValueId(1 |      5.7 |   548864 |     96.2 |    32.8%
+dec1.q.fused_qkv     | GemvPacked { x: ValueId(4 |      5.7 |   548864 |     96.9 |    33.1%
+dec2.kv_write        | CachedAttention { q: Valu |      5.2 |  2105348 |    404.2 |   138.1%
+dec3.kv_write        | CachedAttention { q: Valu |      5.2 |  2105348 |    404.2 |   138.1%
+dec4.kv_write        | CachedAttention { q: Valu |      5.1 |  2105348 |    410.8 |   140.3%
+dec1.kv_write        | CachedAttention { q: Valu |      5.1 |  2105348 |    414.2 |   141.5%
+dec0.kv_write        | CachedAttention { q: Valu |      5.0 |  2105348 |    421.1 |   143.8%
+dec5.kv_write        | CachedAttention { q: Valu |      5.0 |  2105348 |    424.6 |   145.1%
+dec0.o               | GemvPacked { x: ValueId(2 |      4.0 |   186368 |     47.1 |    16.1%
+dec1.o               | GemvPacked { x: ValueId(5 |      4.0 |   186368 |     47.1 |    16.1%
+dec0.xo              | GemvPacked { x: ValueId(3 |      3.9 |   186368 |     47.6 |    16.3%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  Attention                12      1896    13.4    4.6%
+  GemvPacked               37       234   114.6   39.1%
+  RmsNorm                  19        64     1.8    0.6%
+  CachedAttention           6        30   428.2  146.3%
+  Unary                     7        18     5.6    1.9%
+  RelPosBias                1         3     5.7    1.9%
+  Embed                     1         3  3436.4 1174.0%
+  Binary                    1         3    13.1    4.5%
+dec4.cross           | Ext(Attn(Attention { q: V |    158.3 |  2103296 |     13.3 |     4.5%
+dec0.cross           | Ext(Attn(Attention { q: V |    158.3 |  2103296 |     13.3 |     4.5%
+dec2.cross           | Ext(Attn(Attention { q: V |    158.3 |  2103296 |     13.3 |     4.5%
+dec3.cross           | Ext(Attn(Attention { q: V |    158.1 |  2103296 |     13.3 |     4.5%
+dec1.cross           | Ext(Attn(Attention { q: V |    158.1 |  2103296 |     13.3 |     4.5%
+dec5.cross           | Ext(Attn(Attention { q: V |    158.0 |  2103296 |     13.3 |     4.5%
+dec1.self            | Ext(Attn(Attention { q: V |    157.9 |  2117632 |     13.4 |     4.6%
+dec2.self            | Ext(Attn(Attention { q: V |    157.9 |  2117632 |     13.4 |     4.6%
+dec0.self            | Ext(Attn(Attention { q: V |    157.8 |  2117632 |     13.4 |     4.6%
+dec5.self            | Ext(Attn(Attention { q: V |    157.7 |  2117632 |     13.4 |     4.6%
+dec4.self            | Ext(Attn(Attention { q: V |    157.7 |  2117632 |     13.4 |     4.6%
+dec3.self            | Ext(Attn(Attention { q: V |    157.7 |  2117632 |     13.4 |     4.6%
+lm_head              | GemvPacked { x: ValueId(2 |     54.3 | 11439616 |    210.9 |    72.0%
+dec5.ffn.mlp.up      | GemvPacked { x: ValueId(2 |      6.6 |   731136 |    110.4 |    37.7%
+dec2.ffn.mlp.up      | GemvPacked { x: ValueId(1 |      6.5 |   731136 |    112.5 |    38.4%
+dec3.ffn.mlp.up      | GemvPacked { x: ValueId(1 |      6.5 |   731136 |    112.5 |    38.4%
+dec4.ffn.mlp.down    | GemvPacked { x: ValueId(1 |      6.5 |   733184 |    112.8 |    38.5%
+dec0.ffn.mlp.up      | GemvPacked { x: ValueId(3 |      6.5 |   731136 |    113.2 |    38.7%
+dec1.ffn.mlp.up      | GemvPacked { x: ValueId(6 |      6.5 |   731136 |    113.2 |    38.7%
+dec4.ffn.mlp.up      | GemvPacked { x: ValueId(1 |      6.5 |   731136 |    113.2 |    38.7%
+dec5.ffn.mlp.down    | GemvPacked { x: ValueId(2 |      6.4 |   733184 |    114.3 |    39.0%
+dec2.ffn.mlp.down    | GemvPacked { x: ValueId(1 |      6.4 |   733184 |    115.0 |    39.3%
+dec3.ffn.mlp.down    | GemvPacked { x: ValueId(1 |      6.3 |   733184 |    117.3 |    40.1%
+dec0.ffn.mlp.down    | GemvPacked { x: ValueId(3 |      6.2 |   733184 |    117.3 |    40.1%
+dec1.ffn.mlp.down    | GemvPacked { x: ValueId(7 |      6.2 |   733184 |    117.3 |    40.1%
+dec1.q.fused_qkv     | GemvPacked { x: ValueId(4 |      5.7 |   548864 |     95.5 |    32.6%
+dec4.q.fused_qkv     | GemvPacked { x: ValueId(1 |      5.7 |   548864 |     96.2 |    32.8%
+dec5.q.fused_qkv     | GemvPacked { x: ValueId(1 |      5.7 |   548864 |     96.9 |    33.1%
+dec0.q.fused_qkv     | GemvPacked { x: ValueId(7 |      5.7 |   548864 |     96.9 |    33.1%
+dec2.q.fused_qkv     | GemvPacked { x: ValueId(7 |      5.6 |   548864 |     97.6 |    33.3%
+dec3.q.fused_qkv     | GemvPacked { x: ValueId(1 |      5.6 |   548864 |     97.6 |    33.3%
+dec0.kv_write        | CachedAttention { q: Valu |      5.0 |  2105348 |    421.1 |   143.8%
+dec4.kv_write        | CachedAttention { q: Valu |      5.0 |  2105348 |    421.1 |   143.8%
+dec2.kv_write        | CachedAttention { q: Valu |      4.9 |  2105348 |    428.2 |   146.3%
+dec1.kv_write        | CachedAttention { q: Valu |      4.9 |  2105348 |    431.9 |   147.5%
+dec5.kv_write        | CachedAttention { q: Valu |      4.9 |  2105348 |    431.9 |   147.5%
+dec3.kv_write        | CachedAttention { q: Valu |      4.8 |  2105348 |    435.6 |   148.8%
+dec0.xo              | GemvPacked { x: ValueId(3 |      4.0 |   186368 |     46.6 |    15.9%
+dec2.xo              | GemvPacked { x: ValueId(9 |      4.0 |   186368 |     47.1 |    16.1%
+dec0.o               | GemvPacked { x: ValueId(2 |      3.9 |   186368 |     47.6 |    16.3%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  Attention                12      1895    13.4    4.6%
+  GemvPacked               37       235   114.3   39.0%
+  RmsNorm                  19        63     1.8    0.6%
+  CachedAttention           6        29   438.1  149.7%
+  Unary                     7        18     5.7    1.9%
+  RelPosBias                1         3     5.8    2.0%
+  Embed                     1         3  3436.2 1173.9%
+  Binary                    1         3    12.3    4.2%
+dec5.cross           | Ext(Attn(Attention { q: V |    158.2 |  2103296 |     13.3 |     4.5%
+dec0.cross           | Ext(Attn(Attention { q: V |    158.1 |  2103296 |     13.3 |     4.5%
+dec3.cross           | Ext(Attn(Attention { q: V |    158.1 |  2103296 |     13.3 |     4.5%
+dec1.cross           | Ext(Attn(Attention { q: V |    158.0 |  2103296 |     13.3 |     4.5%
+dec1.self            | Ext(Attn(Attention { q: V |    157.9 |  2117632 |     13.4 |     4.6%
+dec4.cross           | Ext(Attn(Attention { q: V |    157.9 |  2103296 |     13.3 |     4.6%
+dec3.self            | Ext(Attn(Attention { q: V |    157.9 |  2117632 |     13.4 |     4.6%
+dec2.self            | Ext(Attn(Attention { q: V |    157.8 |  2117632 |     13.4 |     4.6%
+dec2.cross           | Ext(Attn(Attention { q: V |    157.8 |  2103296 |     13.3 |     4.6%
+dec0.self            | Ext(Attn(Attention { q: V |    157.7 |  2117632 |     13.4 |     4.6%
+dec5.self            | Ext(Attn(Attention { q: V |    157.7 |  2117632 |     13.4 |     4.6%
+dec4.self            | Ext(Attn(Attention { q: V |    157.6 |  2117632 |     13.4 |     4.6%
+lm_head              | GemvPacked { x: ValueId(2 |     54.2 | 11439616 |    211.0 |    72.1%
+dec3.ffn.mlp.up      | GemvPacked { x: ValueId(1 |      6.7 |   731136 |    108.3 |    37.0%
+dec5.ffn.mlp.up      | GemvPacked { x: ValueId(2 |      6.6 |   731136 |    110.4 |    37.7%
+dec1.ffn.mlp.down    | GemvPacked { x: ValueId(7 |      6.5 |   733184 |    112.1 |    38.3%
+dec2.ffn.mlp.up      | GemvPacked { x: ValueId(1 |      6.5 |   731136 |    112.5 |    38.4%
+dec0.ffn.mlp.up      | GemvPacked { x: ValueId(3 |      6.5 |   731136 |    112.5 |    38.4%
+dec1.ffn.mlp.up      | GemvPacked { x: ValueId(6 |      6.5 |   731136 |    112.5 |    38.4%
+dec4.ffn.mlp.up      | GemvPacked { x: ValueId(1 |      6.5 |   731136 |    113.2 |    38.7%
+dec5.ffn.mlp.down    | GemvPacked { x: ValueId(2 |      6.4 |   733184 |    114.3 |    39.0%
+dec0.ffn.mlp.down    | GemvPacked { x: ValueId(3 |      6.3 |   733184 |    115.8 |    39.5%
+dec3.ffn.mlp.down    | GemvPacked { x: ValueId(1 |      6.3 |   733184 |    115.8 |    39.5%
+dec2.ffn.mlp.down    | GemvPacked { x: ValueId(1 |      6.3 |   733184 |    115.8 |    39.5%
+dec4.ffn.mlp.down    | GemvPacked { x: ValueId(1 |      6.3 |   733184 |    115.8 |    39.5%
+dec1.q.fused_qkv     | GemvPacked { x: ValueId(4 |      5.7 |   548864 |     95.5 |    32.6%
+dec4.q.fused_qkv     | GemvPacked { x: ValueId(1 |      5.7 |   548864 |     95.5 |    32.6%
+dec5.q.fused_qkv     | GemvPacked { x: ValueId(1 |      5.7 |   548864 |     96.2 |    32.8%
+dec0.q.fused_qkv     | GemvPacked { x: ValueId(7 |      5.7 |   548864 |     96.9 |    33.1%
+dec2.q.fused_qkv     | GemvPacked { x: ValueId(7 |      5.6 |   548864 |     97.6 |    33.3%
+dec3.q.fused_qkv     | GemvPacked { x: ValueId(1 |      5.6 |   548864 |     97.6 |    33.3%
+dec2.kv_write        | CachedAttention { q: Valu |      4.9 |  2105348 |    431.9 |   147.5%
+dec1.kv_write        | CachedAttention { q: Valu |      4.8 |  2105348 |    435.6 |   148.8%
+dec3.kv_write        | CachedAttention { q: Valu |      4.8 |  2105348 |    435.6 |   148.8%
+dec4.kv_write        | CachedAttention { q: Valu |      4.8 |  2105348 |    435.6 |   148.8%
+dec0.kv_write        | CachedAttention { q: Valu |      4.7 |  2105348 |    443.2 |   151.4%
+dec5.kv_write        | CachedAttention { q: Valu |      4.7 |  2105348 |    447.1 |   152.8%
+dec5.xo              | GemvPacked { x: ValueId(1 |      4.0 |   186368 |     47.1 |    16.1%
+dec1.o               | GemvPacked { x: ValueId(5 |      3.9 |   186368 |     47.6 |    16.3%
+dec3.o               | GemvPacked { x: ValueId(1 |      3.9 |   186368 |     47.6 |    16.3%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  Attention                12      1896    13.4    4.6%
+  GemvPacked               37       234   114.8   39.2%
+  RmsNorm                  19        64     1.8    0.6%
+  CachedAttention           6        30   423.4  144.7%
+  Unary                     7        18     5.7    1.9%
+  RelPosBias                1         3     5.8    2.0%
+  Embed                     1         3  3619.5 1236.5%
+  Binary                    1         3    12.9    4.4%
+dec2.cross           | Ext(Attn(Attention { q: V |    158.3 |  2103296 |     13.3 |     4.5%
+dec3.cross           | Ext(Attn(Attention { q: V |    158.3 |  2103296 |     13.3 |     4.5%
+dec5.cross           | Ext(Attn(Attention { q: V |    158.3 |  2103296 |     13.3 |     4.5%
+dec0.cross           | Ext(Attn(Attention { q: V |    158.2 |  2103296 |     13.3 |     4.5%
+dec1.cross           | Ext(Attn(Attention { q: V |    158.2 |  2103296 |     13.3 |     4.5%
+dec0.self            | Ext(Attn(Attention { q: V |    158.1 |  2117632 |     13.4 |     4.6%
+dec2.self            | Ext(Attn(Attention { q: V |    158.0 |  2117632 |     13.4 |     4.6%
+dec4.cross           | Ext(Attn(Attention { q: V |    158.0 |  2103296 |     13.3 |     4.5%
+dec1.self            | Ext(Attn(Attention { q: V |    157.7 |  2117632 |     13.4 |     4.6%
+dec3.self            | Ext(Attn(Attention { q: V |    157.7 |  2117632 |     13.4 |     4.6%
+dec4.self            | Ext(Attn(Attention { q: V |    157.6 |  2117632 |     13.4 |     4.6%
+dec5.self            | Ext(Attn(Attention { q: V |    157.6 |  2117632 |     13.4 |     4.6%
+lm_head              | GemvPacked { x: ValueId(2 |     54.0 | 11439616 |    211.8 |    72.4%
+dec4.ffn.mlp.up      | GemvPacked { x: ValueId(1 |      6.6 |   731136 |    111.1 |    37.9%
+dec2.ffn.mlp.up      | GemvPacked { x: ValueId(1 |      6.5 |   731136 |    112.5 |    38.4%
+dec3.ffn.mlp.up      | GemvPacked { x: ValueId(1 |      6.5 |   731136 |    112.5 |    38.4%
+dec3.ffn.mlp.down    | GemvPacked { x: ValueId(1 |      6.5 |   733184 |    113.5 |    38.8%
+dec5.ffn.mlp.up      | GemvPacked { x: ValueId(2 |      6.5 |   731136 |    113.2 |    38.7%
+dec1.ffn.mlp.up      | GemvPacked { x: ValueId(6 |      6.4 |   731136 |    113.9 |    38.9%
+dec0.ffn.mlp.down    | GemvPacked { x: ValueId(3 |      6.4 |   733184 |    115.0 |    39.3%
+dec0.ffn.mlp.up      | GemvPacked { x: ValueId(3 |      6.3 |   731136 |    115.4 |    39.4%
+dec4.ffn.mlp.down    | GemvPacked { x: ValueId(1 |      6.3 |   733184 |    115.8 |    39.5%
+dec1.ffn.mlp.down    | GemvPacked { x: ValueId(7 |      6.3 |   733184 |    116.5 |    39.8%
+dec5.ffn.mlp.down    | GemvPacked { x: ValueId(2 |      6.3 |   733184 |    117.3 |    40.1%
+dec2.ffn.mlp.down    | GemvPacked { x: ValueId(1 |      6.2 |   733184 |    117.3 |    40.1%
+dec3.q.fused_qkv     | GemvPacked { x: ValueId(1 |      5.7 |   548864 |     95.5 |    32.6%
+dec5.q.fused_qkv     | GemvPacked { x: ValueId(1 |      5.7 |   548864 |     95.5 |    32.6%
+dec1.q.fused_qkv     | GemvPacked { x: ValueId(4 |      5.7 |   548864 |     96.9 |    33.1%
+dec2.q.fused_qkv     | GemvPacked { x: ValueId(7 |      5.6 |   548864 |     97.6 |    33.3%
+dec0.q.fused_qkv     | GemvPacked { x: ValueId(7 |      5.5 |   548864 |     99.8 |    34.1%
+dec4.q.fused_qkv     | GemvPacked { x: ValueId(1 |      5.5 |   548864 |     99.8 |    34.1%
+dec1.kv_write        | CachedAttention { q: Valu |      5.0 |  2105348 |    421.1 |   143.8%
+dec2.kv_write        | CachedAttention { q: Valu |      5.0 |  2105348 |    421.1 |   143.8%
+dec4.kv_write        | CachedAttention { q: Valu |      5.0 |  2105348 |    421.1 |   143.8%
+dec0.kv_write        | CachedAttention { q: Valu |      5.0 |  2105348 |    424.6 |   145.1%
+dec5.kv_write        | CachedAttention { q: Valu |      5.0 |  2105348 |    424.6 |   145.1%
+dec3.kv_write        | CachedAttention { q: Valu |      4.9 |  2105348 |    428.2 |   146.3%
+dec0.xo              | GemvPacked { x: ValueId(3 |      4.0 |   186368 |     46.6 |    15.9%
+dec3.o               | GemvPacked { x: ValueId(1 |      4.0 |   186368 |     46.6 |    15.9%
+dec5.o               | GemvPacked { x: ValueId(1 |      4.0 |   186368 |     47.1 |    16.1%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  Attention                12      1898    13.3    4.6%
+  GemvPacked               37       234   114.8   39.2%
+  RmsNorm                  19        63     1.8    0.6%
+  CachedAttention           6        32   396.8  135.6%
+  Unary                     7        18     5.8    2.0%
+  RelPosBias                1         3     5.8    2.0%
+  Embed                     1         3  3525.5 1204.4%
+  Binary                    1         3    12.3    4.2%
+dec4.self            | Ext(Attn(Attention { q: V |    159.9 |  2117632 |     13.2 |     4.5%
+dec5.cross           | Ext(Attn(Attention { q: V |    158.3 |  2103296 |     13.3 |     4.5%
+dec0.cross           | Ext(Attn(Attention { q: V |    158.2 |  2103296 |     13.3 |     4.5%
+dec1.cross           | Ext(Attn(Attention { q: V |    158.1 |  2103296 |     13.3 |     4.5%
+dec3.cross           | Ext(Attn(Attention { q: V |    158.0 |  2103296 |     13.3 |     4.5%
+dec4.cross           | Ext(Attn(Attention { q: V |    158.0 |  2103296 |     13.3 |     4.5%
+dec2.cross           | Ext(Attn(Attention { q: V |    158.0 |  2103296 |     13.3 |     4.5%
+dec1.self            | Ext(Attn(Attention { q: V |    157.9 |  2117632 |     13.4 |     4.6%
+dec2.self            | Ext(Attn(Attention { q: V |    157.9 |  2117632 |     13.4 |     4.6%
+dec5.self            | Ext(Attn(Attention { q: V |    157.9 |  2117632 |     13.4 |     4.6%
+dec0.self            | Ext(Attn(Attention { q: V |    157.8 |  2117632 |     13.4 |     4.6%
+dec3.self            | Ext(Attn(Attention { q: V |    157.7 |  2117632 |     13.4 |     4.6%
+lm_head              | GemvPacked { x: ValueId(2 |     54.0 | 11439616 |    211.7 |    72.3%
+dec4.ffn.mlp.up      | GemvPacked { x: ValueId(1 |      6.6 |   731136 |    110.4 |    37.7%
+dec4.ffn.mlp.down    | GemvPacked { x: ValueId(1 |      6.5 |   733184 |    112.1 |    38.3%
+dec0.ffn.mlp.up      | GemvPacked { x: ValueId(3 |      6.5 |   731136 |    112.5 |    38.4%
+dec1.ffn.mlp.down    | GemvPacked { x: ValueId(7 |      6.5 |   733184 |    112.8 |    38.5%
+dec5.ffn.mlp.up      | GemvPacked { x: ValueId(2 |      6.5 |   731136 |    112.5 |    38.4%
+dec2.ffn.mlp.up      | GemvPacked { x: ValueId(1 |      6.5 |   731136 |    113.2 |    38.7%
+dec1.ffn.mlp.up      | GemvPacked { x: ValueId(6 |      6.4 |   731136 |    113.9 |    38.9%
+dec3.ffn.mlp.up      | GemvPacked { x: ValueId(1 |      6.4 |   731136 |    113.9 |    38.9%
+dec0.ffn.mlp.down    | GemvPacked { x: ValueId(3 |      6.4 |   733184 |    115.0 |    39.3%
+dec5.ffn.mlp.down    | GemvPacked { x: ValueId(2 |      6.4 |   733184 |    115.0 |    39.3%
+dec3.ffn.mlp.down    | GemvPacked { x: ValueId(1 |      6.3 |   733184 |    115.8 |    39.5%
+dec2.ffn.mlp.down    | GemvPacked { x: ValueId(1 |      6.2 |   733184 |    118.9 |    40.6%
+dec4.q.fused_qkv     | GemvPacked { x: ValueId(1 |      5.8 |   548864 |     94.1 |    32.1%
+dec0.q.fused_qkv     | GemvPacked { x: ValueId(7 |      5.7 |   548864 |     95.5 |    32.6%
+dec1.q.fused_qkv     | GemvPacked { x: ValueId(4 |      5.7 |   548864 |     95.5 |    32.6%
+dec2.q.fused_qkv     | GemvPacked { x: ValueId(7 |      5.7 |   548864 |     95.5 |    32.6%
+dec3.q.fused_qkv     | GemvPacked { x: ValueId(1 |      5.6 |   548864 |     97.6 |    33.3%
+dec5.q.fused_qkv     | GemvPacked { x: ValueId(1 |      5.6 |   548864 |     97.6 |    33.3%
+dec4.kv_write        | CachedAttention { q: Valu |      5.4 |  2105348 |    391.7 |   133.8%
+dec5.kv_write        | CachedAttention { q: Valu |      5.3 |  2105348 |    394.7 |   134.9%
+dec3.kv_write        | CachedAttention { q: Valu |      5.3 |  2105348 |    394.8 |   134.9%
+dec1.kv_write        | CachedAttention { q: Valu |      5.3 |  2105348 |    397.9 |   135.9%
+dec2.kv_write        | CachedAttention { q: Valu |      5.3 |  2105348 |    397.9 |   135.9%
+dec0.kv_write        | CachedAttention { q: Valu |      5.2 |  2105348 |    404.2 |   138.1%
+dec3.o               | GemvPacked { x: ValueId(1 |      4.0 |   186368 |     47.1 |    16.1%
+dec3.xo              | GemvPacked { x: ValueId(1 |      4.0 |   186368 |     47.1 |    16.1%
+dec0.o               | GemvPacked { x: ValueId(2 |      3.9 |   186368 |     47.6 |    16.3%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  Attention                12      1895    13.4    4.6%
+  GemvPacked               37       235   114.4   39.1%
+  RmsNorm                  19        64     1.8    0.6%
+  CachedAttention           6        31   402.1  137.4%
+  Unary                     7        18     5.8    2.0%
+  Embed                     1        10  1170.1  399.7%
+  RelPosBias                1         3     5.7    1.9%
+  Binary                    1         3    12.7    4.3%
+dec3.cross           | Ext(Attn(Attention { q: V |    158.3 |  2103296 |     13.3 |     4.5%
+dec0.cross           | Ext(Attn(Attention { q: V |    158.2 |  2103296 |     13.3 |     4.5%
+dec5.cross           | Ext(Attn(Attention { q: V |    158.2 |  2103296 |     13.3 |     4.5%
+dec1.cross           | Ext(Attn(Attention { q: V |    158.1 |  2103296 |     13.3 |     4.5%
+dec2.cross           | Ext(Attn(Attention { q: V |    158.0 |  2103296 |     13.3 |     4.5%
+dec4.cross           | Ext(Attn(Attention { q: V |    158.0 |  2103296 |     13.3 |     4.5%
+dec4.self            | Ext(Attn(Attention { q: V |    158.0 |  2117632 |     13.4 |     4.6%
+dec0.self            | Ext(Attn(Attention { q: V |    157.8 |  2117632 |     13.4 |     4.6%
+dec2.self            | Ext(Attn(Attention { q: V |    157.7 |  2117632 |     13.4 |     4.6%
+dec5.self            | Ext(Attn(Attention { q: V |    157.7 |  2117632 |     13.4 |     4.6%
+dec3.self            | Ext(Attn(Attention { q: V |    157.7 |  2117632 |     13.4 |     4.6%
+dec1.self            | Ext(Attn(Attention { q: V |    157.6 |  2117632 |     13.4 |     4.6%
+lm_head              | GemvPacked { x: ValueId(2 |     53.9 | 11439616 |    212.2 |    72.5%
+embed                | Ext(Experts(Embed { table |      9.7 | 11311108 |   1170.1 |   399.7%
+dec0.ffn.mlp.up      | GemvPacked { x: ValueId(3 |      6.6 |   731136 |    110.4 |    37.7%
+dec4.ffn.mlp.up      | GemvPacked { x: ValueId(1 |      6.6 |   731136 |    111.1 |    37.9%
+dec5.ffn.mlp.down    | GemvPacked { x: ValueId(2 |      6.5 |   733184 |    112.8 |    38.5%
+dec0.ffn.mlp.down    | GemvPacked { x: ValueId(3 |      6.5 |   733184 |    112.8 |    38.5%
+dec3.ffn.mlp.down    | GemvPacked { x: ValueId(1 |      6.5 |   733184 |    113.5 |    38.8%
+dec5.ffn.mlp.up      | GemvPacked { x: ValueId(2 |      6.5 |   731136 |    113.2 |    38.7%
+dec4.ffn.mlp.down    | GemvPacked { x: ValueId(1 |      6.4 |   733184 |    114.3 |    39.0%
+dec1.ffn.mlp.down    | GemvPacked { x: ValueId(7 |      6.4 |   733184 |    115.0 |    39.3%
+dec2.ffn.mlp.down    | GemvPacked { x: ValueId(1 |      6.4 |   733184 |    115.0 |    39.3%
+dec3.ffn.mlp.up      | GemvPacked { x: ValueId(1 |      6.4 |   731136 |    114.7 |    39.2%
+dec2.ffn.mlp.up      | GemvPacked { x: ValueId(1 |      6.3 |   731136 |    115.4 |    39.4%
+dec1.ffn.mlp.up      | GemvPacked { x: ValueId(6 |      6.3 |   731136 |    116.2 |    39.7%
+dec0.q.fused_qkv     | GemvPacked { x: ValueId(7 |      5.7 |   548864 |     95.5 |    32.6%
+dec3.q.fused_qkv     | GemvPacked { x: ValueId(1 |      5.7 |   548864 |     96.2 |    32.8%
+dec1.q.fused_qkv     | GemvPacked { x: ValueId(4 |      5.7 |   548864 |     96.9 |    33.1%
+dec4.q.fused_qkv     | GemvPacked { x: ValueId(1 |      5.6 |   548864 |     97.6 |    33.3%
+dec5.q.fused_qkv     | GemvPacked { x: ValueId(1 |      5.6 |   548864 |     97.6 |    33.3%
+dec2.q.fused_qkv     | GemvPacked { x: ValueId(7 |      5.5 |   548864 |     99.8 |    34.1%
+dec4.kv_write        | CachedAttention { q: Valu |      5.4 |  2105348 |    388.7 |   132.8%
+dec0.kv_write        | CachedAttention { q: Valu |      5.3 |  2105348 |    401.0 |   137.0%
+dec5.kv_write        | CachedAttention { q: Valu |      5.2 |  2105348 |    401.0 |   137.0%
+dec2.kv_write        | CachedAttention { q: Valu |      5.2 |  2105348 |    404.2 |   138.1%
+dec3.kv_write        | CachedAttention { q: Valu |      5.2 |  2105348 |    407.5 |   139.2%
+dec1.kv_write        | CachedAttention { q: Valu |      5.1 |  2105348 |    410.8 |   140.3%
+dec1.o               | GemvPacked { x: ValueId(5 |      4.0 |   186368 |     47.1 |    16.1%
+dec1.xo              | GemvPacked { x: ValueId(6 |      4.0 |   186368 |     47.1 |    16.1%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  Attention                12      1895    13.4    4.6%
+  GemvPacked               37       234   114.7   39.2%
+  RmsNorm                  19        65     1.8    0.6%
+  CachedAttention           6        31   405.8  138.6%
+  Unary                     7        18     5.7    1.9%
+  Embed                     1         3  3436.2 1173.9%
+  RelPosBias                1         3     5.9    2.0%
+  Binary                    1         3    12.7    4.3%
+dec0.cross           | Ext(Attn(Attention { q: V |    158.1 |  2103296 |     13.3 |     4.5%
+dec1.self            | Ext(Attn(Attention { q: V |    158.1 |  2117632 |     13.4 |     4.6%
+dec2.cross           | Ext(Attn(Attention { q: V |    158.1 |  2103296 |     13.3 |     4.5%
+dec0.self            | Ext(Attn(Attention { q: V |    158.0 |  2117632 |     13.4 |     4.6%
+dec4.cross           | Ext(Attn(Attention { q: V |    158.0 |  2103296 |     13.3 |     4.5%
+dec5.cross           | Ext(Attn(Attention { q: V |    158.0 |  2103296 |     13.3 |     4.5%
+dec3.cross           | Ext(Attn(Attention { q: V |    157.9 |  2103296 |     13.3 |     4.6%
+dec1.cross           | Ext(Attn(Attention { q: V |    157.9 |  2103296 |     13.3 |     4.6%
+dec2.self            | Ext(Attn(Attention { q: V |    157.7 |  2117632 |     13.4 |     4.6%
+dec3.self            | Ext(Attn(Attention { q: V |    157.6 |  2117632 |     13.4 |     4.6%
+dec4.self            | Ext(Attn(Attention { q: V |    157.6 |  2117632 |     13.4 |     4.6%
+dec5.self            | Ext(Attn(Attention { q: V |    157.5 |  2117632 |     13.4 |     4.6%
+lm_head              | GemvPacked { x: ValueId(2 |     54.2 | 11439616 |    211.2 |    72.1%
+dec1.ffn.mlp.down    | GemvPacked { x: ValueId(7 |      6.5 |   733184 |    112.8 |    38.5%
+dec0.ffn.mlp.up      | GemvPacked { x: ValueId(3 |      6.5 |   731136 |    112.5 |    38.4%
+dec3.ffn.mlp.up      | GemvPacked { x: ValueId(1 |      6.5 |   731136 |    112.5 |    38.4%
+dec5.ffn.mlp.up      | GemvPacked { x: ValueId(2 |      6.5 |   731136 |    112.5 |    38.4%
+dec5.ffn.mlp.down    | GemvPacked { x: ValueId(2 |      6.5 |   733184 |    112.8 |    38.5%
+dec4.ffn.mlp.up      | GemvPacked { x: ValueId(1 |      6.5 |   731136 |    113.2 |    38.7%
+dec0.ffn.mlp.down    | GemvPacked { x: ValueId(3 |      6.4 |   733184 |    114.3 |    39.0%
+dec2.ffn.mlp.up      | GemvPacked { x: ValueId(1 |      6.4 |   731136 |    113.9 |    38.9%
+dec2.ffn.mlp.down    | GemvPacked { x: ValueId(1 |      6.4 |   733184 |    114.3 |    39.0%
+dec4.ffn.mlp.down    | GemvPacked { x: ValueId(1 |      6.4 |   733184 |    115.0 |    39.3%
+dec1.ffn.mlp.up      | GemvPacked { x: ValueId(6 |      6.3 |   731136 |    116.2 |    39.7%
+dec3.ffn.mlp.down    | GemvPacked { x: ValueId(1 |      6.3 |   733184 |    117.3 |    40.1%
+dec0.q.fused_qkv     | GemvPacked { x: ValueId(7 |      5.7 |   548864 |     95.5 |    32.6%
+dec4.q.fused_qkv     | GemvPacked { x: ValueId(1 |      5.7 |   548864 |     96.9 |    33.1%
+dec5.q.fused_qkv     | GemvPacked { x: ValueId(1 |      5.7 |   548864 |     96.9 |    33.1%
+dec1.q.fused_qkv     | GemvPacked { x: ValueId(4 |      5.6 |   548864 |     97.6 |    33.3%
+dec3.q.fused_qkv     | GemvPacked { x: ValueId(1 |      5.6 |   548864 |     97.6 |    33.3%
+dec2.q.fused_qkv     | GemvPacked { x: ValueId(7 |      5.6 |   548864 |     98.3 |    33.6%
+dec4.kv_write        | CachedAttention { q: Valu |      5.2 |  2105348 |    401.0 |   137.0%
+dec0.kv_write        | CachedAttention { q: Valu |      5.2 |  2105348 |    404.2 |   138.1%
+dec3.kv_write        | CachedAttention { q: Valu |      5.2 |  2105348 |    404.2 |   138.1%
+dec1.kv_write        | CachedAttention { q: Valu |      5.2 |  2105348 |    404.2 |   138.1%
+dec2.kv_write        | CachedAttention { q: Valu |      5.1 |  2105348 |    410.8 |   140.3%
+dec5.kv_write        | CachedAttention { q: Valu |      5.1 |  2105348 |    410.8 |   140.3%
+dec1.o               | GemvPacked { x: ValueId(5 |      3.9 |   186368 |     47.6 |    16.3%
+dec4.xo              | GemvPacked { x: ValueId(1 |      3.9 |   186368 |     47.6 |    16.3%
+dec0.xo              | GemvPacked { x: ValueId(3 |      3.9 |   186368 |     48.1 |    16.4%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  Attention                12      1897    13.3    4.6%
+  GemvPacked               37       235   114.4   39.1%
+  RmsNorm                  19        64     1.8    0.6%
+  CachedAttention           6        32   395.8  135.2%
+  Unary                     7        18     5.8    2.0%
+  RelPosBias                1         3     5.6    1.9%
+  Embed                     1         3  3393.2 1159.2%
+  Binary                    1         3    12.1    4.1%
+dec0.self            | Ext(Attn(Attention { q: V |    159.4 |  2117632 |     13.3 |     4.5%
+dec5.cross           | Ext(Attn(Attention { q: V |    158.4 |  2103296 |     13.3 |     4.5%
+dec1.cross           | Ext(Attn(Attention { q: V |    158.2 |  2103296 |     13.3 |     4.5%
+dec3.cross           | Ext(Attn(Attention { q: V |    158.1 |  2103296 |     13.3 |     4.5%
+dec2.cross           | Ext(Attn(Attention { q: V |    158.1 |  2103296 |     13.3 |     4.5%
+dec0.cross           | Ext(Attn(Attention { q: V |    158.0 |  2103296 |     13.3 |     4.5%
+dec4.cross           | Ext(Attn(Attention { q: V |    158.0 |  2103296 |     13.3 |     4.5%
+dec1.self            | Ext(Attn(Attention { q: V |    157.9 |  2117632 |     13.4 |     4.6%
+dec3.self            | Ext(Attn(Attention { q: V |    157.9 |  2117632 |     13.4 |     4.6%
+dec2.self            | Ext(Attn(Attention { q: V |    157.8 |  2117632 |     13.4 |     4.6%
+dec4.self            | Ext(Attn(Attention { q: V |    157.6 |  2117632 |     13.4 |     4.6%
+dec5.self            | Ext(Attn(Attention { q: V |    157.6 |  2117632 |     13.4 |     4.6%
+lm_head              | GemvPacked { x: ValueId(2 |     54.7 | 11439616 |    209.1 |    71.4%
+dec1.ffn.mlp.down    | GemvPacked { x: ValueId(7 |      6.5 |   733184 |    112.8 |    38.5%
+dec4.ffn.mlp.down    | GemvPacked { x: ValueId(1 |      6.5 |   733184 |    112.8 |    38.5%
+dec4.ffn.mlp.up      | GemvPacked { x: ValueId(1 |      6.5 |   731136 |    112.5 |    38.4%
+dec5.ffn.mlp.up      | GemvPacked { x: ValueId(2 |      6.5 |   731136 |    112.5 |    38.4%
+dec5.ffn.mlp.down    | GemvPacked { x: ValueId(2 |      6.5 |   733184 |    112.8 |    38.5%
+dec3.ffn.mlp.down    | GemvPacked { x: ValueId(1 |      6.5 |   733184 |    113.5 |    38.8%
+dec2.ffn.mlp.up      | GemvPacked { x: ValueId(1 |      6.5 |   731136 |    113.2 |    38.7%
+dec0.ffn.mlp.down    | GemvPacked { x: ValueId(3 |      6.4 |   733184 |    115.0 |    39.3%
+dec2.ffn.mlp.down    | GemvPacked { x: ValueId(1 |      6.4 |   733184 |    115.0 |    39.3%
+dec3.ffn.mlp.up      | GemvPacked { x: ValueId(1 |      6.4 |   731136 |    114.7 |    39.2%
+dec1.ffn.mlp.up      | GemvPacked { x: ValueId(6 |      6.4 |   731136 |    114.7 |    39.2%
+dec0.ffn.mlp.up      | GemvPacked { x: ValueId(3 |      6.3 |   731136 |    116.2 |    39.7%
+dec3.q.fused_qkv     | GemvPacked { x: ValueId(1 |      5.7 |   548864 |     96.2 |    32.8%
+dec5.q.fused_qkv     | GemvPacked { x: ValueId(1 |      5.7 |   548864 |     96.9 |    33.1%
+dec2.q.fused_qkv     | GemvPacked { x: ValueId(7 |      5.6 |   548864 |     97.6 |    33.3%
+dec0.q.fused_qkv     | GemvPacked { x: ValueId(7 |      5.6 |   548864 |     97.6 |    33.3%
+dec1.q.fused_qkv     | GemvPacked { x: ValueId(4 |      5.6 |   548864 |     97.6 |    33.3%
+dec4.q.fused_qkv     | GemvPacked { x: ValueId(1 |      5.5 |   548864 |     99.8 |    34.1%
+dec4.kv_write        | CachedAttention { q: Valu |      5.5 |  2105348 |    385.7 |   131.8%
+dec3.kv_write        | CachedAttention { q: Valu |      5.4 |  2105348 |    391.7 |   133.8%
+dec5.kv_write        | CachedAttention { q: Valu |      5.4 |  2105348 |    391.7 |   133.8%
+dec0.kv_write        | CachedAttention { q: Valu |      5.3 |  2105348 |    401.0 |   137.0%
+dec1.kv_write        | CachedAttention { q: Valu |      5.3 |  2105348 |    401.0 |   137.0%
+dec2.kv_write        | CachedAttention { q: Valu |      5.2 |  2105348 |    404.2 |   138.1%
+dec0.xo              | GemvPacked { x: ValueId(3 |      4.0 |   186368 |     46.6 |    15.9%
+dec1.xo              | GemvPacked { x: ValueId(6 |      4.0 |   186368 |     47.1 |    16.1%
+dec3.xo              | GemvPacked { x: ValueId(1 |      3.9 |   186368 |     47.6 |    16.3%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  Attention                12      1895    13.4    4.6%
+  GemvPacked               37       234   114.6   39.1%
+  RmsNorm                  19        64     1.8    0.6%
+  CachedAttention           6        33   384.7  131.4%
+  Unary                     7        18     5.6    1.9%
+  Embed                     1         3  3351.3 1144.9%
+  RelPosBias                1         3     5.8    2.0%
+  Binary                    1         3    12.7    4.3%
+dec1.self            | Ext(Attn(Attention { q: V |    158.3 |  2117632 |     13.4 |     4.6%
+dec4.cross           | Ext(Attn(Attention { q: V |    158.3 |  2103296 |     13.3 |     4.5%
+dec2.cross           | Ext(Attn(Attention { q: V |    158.1 |  2103296 |     13.3 |     4.5%
+dec1.cross           | Ext(Attn(Attention { q: V |    158.0 |  2103296 |     13.3 |     4.5%
+dec5.cross           | Ext(Attn(Attention { q: V |    158.0 |  2103296 |     13.3 |     4.5%
+dec0.cross           | Ext(Attn(Attention { q: V |    158.0 |  2103296 |     13.3 |     4.5%
+dec2.self            | Ext(Attn(Attention { q: V |    158.0 |  2117632 |     13.4 |     4.6%
+dec3.cross           | Ext(Attn(Attention { q: V |    158.0 |  2103296 |     13.3 |     4.5%
+dec0.self            | Ext(Attn(Attention { q: V |    157.9 |  2117632 |     13.4 |     4.6%
+dec3.self            | Ext(Attn(Attention { q: V |    157.7 |  2117632 |     13.4 |     4.6%
+dec4.self            | Ext(Attn(Attention { q: V |    157.7 |  2117632 |     13.4 |     4.6%
+dec5.self            | Ext(Attn(Attention { q: V |    157.5 |  2117632 |     13.4 |     4.6%
+lm_head              | GemvPacked { x: ValueId(2 |     54.3 | 11439616 |    210.9 |    72.0%
+dec0.ffn.mlp.up      | GemvPacked { x: ValueId(3 |      6.5 |   731136 |    112.5 |    38.4%
+dec5.ffn.mlp.up      | GemvPacked { x: ValueId(2 |      6.5 |   731136 |    112.5 |    38.4%
+dec4.ffn.mlp.up      | GemvPacked { x: ValueId(1 |      6.5 |   731136 |    113.2 |    38.7%
+dec3.ffn.mlp.down    | GemvPacked { x: ValueId(1 |      6.4 |   733184 |    114.3 |    39.0%
+dec1.ffn.mlp.up      | GemvPacked { x: ValueId(6 |      6.4 |   731136 |    114.7 |    39.2%
+dec2.ffn.mlp.down    | GemvPacked { x: ValueId(1 |      6.4 |   733184 |    115.0 |    39.3%
+dec3.ffn.mlp.up      | GemvPacked { x: ValueId(1 |      6.4 |   731136 |    114.7 |    39.2%
+dec0.ffn.mlp.down    | GemvPacked { x: ValueId(3 |      6.4 |   733184 |    115.0 |    39.3%
+dec1.ffn.mlp.down    | GemvPacked { x: ValueId(7 |      6.4 |   733184 |    115.0 |    39.3%
+dec4.ffn.mlp.down    | GemvPacked { x: ValueId(1 |      6.4 |   733184 |    115.0 |    39.3%
+dec5.ffn.mlp.down    | GemvPacked { x: ValueId(2 |      6.4 |   733184 |    115.0 |    39.3%
+dec2.ffn.mlp.up      | GemvPacked { x: ValueId(1 |      6.3 |   731136 |    116.2 |    39.7%
+dec5.q.fused_qkv     | GemvPacked { x: ValueId(1 |      5.8 |   548864 |     94.1 |    32.1%
+dec4.q.fused_qkv     | GemvPacked { x: ValueId(1 |      5.7 |   548864 |     95.5 |    32.6%
+dec3.q.fused_qkv     | GemvPacked { x: ValueId(1 |      5.7 |   548864 |     96.2 |    32.8%
+dec1.q.fused_qkv     | GemvPacked { x: ValueId(4 |      5.7 |   548864 |     96.9 |    33.1%
+dec0.q.fused_qkv     | GemvPacked { x: ValueId(7 |      5.6 |   548864 |     97.6 |    33.3%
+dec0.kv_write        | CachedAttention { q: Valu |      5.6 |  2105348 |    377.1 |   128.8%
+dec5.kv_write        | CachedAttention { q: Valu |      5.5 |  2105348 |    379.9 |   129.8%
+dec1.kv_write        | CachedAttention { q: Valu |      5.5 |  2105348 |    382.8 |   130.8%
+dec4.kv_write        | CachedAttention { q: Valu |      5.5 |  2105348 |    385.7 |   131.8%
+dec2.q.fused_qkv     | GemvPacked { x: ValueId(7 |      5.5 |   548864 |    100.6 |    34.4%
+dec2.kv_write        | CachedAttention { q: Valu |      5.4 |  2105348 |    391.7 |   133.8%
+dec3.kv_write        | CachedAttention { q: Valu |      5.4 |  2105348 |    391.7 |   133.8%
+dec2.o               | GemvPacked { x: ValueId(8 |      4.0 |   186368 |     46.6 |    15.9%
+dec4.xo              | GemvPacked { x: ValueId(1 |      4.0 |   186368 |     47.1 |    16.1%
+dec5.xo              | GemvPacked { x: ValueId(1 |      3.9 |   186368 |     47.6 |    16.3%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  Attention                12      1905    13.3    4.5%
+  GemvPacked               37       235   114.3   39.1%
+  RmsNorm                  19        63     1.8    0.6%
+  CachedAttention           6        33   380.4  129.9%
+  Unary                     7        17     5.9    2.0%
+  RelPosBias                1         3     5.8    2.0%
+  Embed                     1         3  3934.3 1344.1%
+  Binary                    1         3    12.9    4.4%
+dec2.self            | Ext(Attn(Attention { q: V |    163.0 |  2117632 |     13.0 |     4.4%
+dec3.self            | Ext(Attn(Attention { q: V |    161.6 |  2117632 |     13.1 |     4.5%
+dec0.cross           | Ext(Attn(Attention { q: V |    158.2 |  2103296 |     13.3 |     4.5%
+dec2.cross           | Ext(Attn(Attention { q: V |    158.2 |  2103296 |     13.3 |     4.5%
+dec5.cross           | Ext(Attn(Attention { q: V |    158.1 |  2103296 |     13.3 |     4.5%
+dec0.self            | Ext(Attn(Attention { q: V |    158.0 |  2117632 |     13.4 |     4.6%
+dec1.cross           | Ext(Attn(Attention { q: V |    158.0 |  2103296 |     13.3 |     4.5%
+dec3.cross           | Ext(Attn(Attention { q: V |    158.0 |  2103296 |     13.3 |     4.5%
+dec1.self            | Ext(Attn(Attention { q: V |    158.0 |  2117632 |     13.4 |     4.6%
+dec4.self            | Ext(Attn(Attention { q: V |    157.9 |  2117632 |     13.4 |     4.6%
+dec4.cross           | Ext(Attn(Attention { q: V |    157.9 |  2103296 |     13.3 |     4.6%
+dec5.self            | Ext(Attn(Attention { q: V |    157.9 |  2117632 |     13.4 |     4.6%
+lm_head              | GemvPacked { x: ValueId(2 |     54.4 | 11439616 |    210.4 |    71.9%
+dec0.ffn.mlp.up      | GemvPacked { x: ValueId(3 |      6.5 |   731136 |    111.8 |    38.2%
+dec1.ffn.mlp.up      | GemvPacked { x: ValueId(6 |      6.5 |   731136 |    112.5 |    38.4%
+dec1.ffn.mlp.down    | GemvPacked { x: ValueId(7 |      6.5 |   733184 |    112.8 |    38.5%
+dec2.ffn.mlp.up      | GemvPacked { x: ValueId(1 |      6.5 |   731136 |    112.5 |    38.4%
+dec3.ffn.mlp.up      | GemvPacked { x: ValueId(1 |      6.5 |   731136 |    112.5 |    38.4%
+dec5.ffn.mlp.up      | GemvPacked { x: ValueId(2 |      6.5 |   731136 |    112.5 |    38.4%
+dec5.ffn.mlp.down    | GemvPacked { x: ValueId(2 |      6.5 |   733184 |    112.8 |    38.5%
+dec4.ffn.mlp.down    | GemvPacked { x: ValueId(1 |      6.5 |   733184 |    113.5 |    38.8%
+dec4.ffn.mlp.up      | GemvPacked { x: ValueId(1 |      6.4 |   731136 |    113.9 |    38.9%
+dec2.ffn.mlp.down    | GemvPacked { x: ValueId(1 |      6.4 |   733184 |    115.0 |    39.3%
+dec3.ffn.mlp.down    | GemvPacked { x: ValueId(1 |      6.4 |   733184 |    115.0 |    39.3%
+dec0.ffn.mlp.down    | GemvPacked { x: ValueId(3 |      6.3 |   733184 |    116.5 |    39.8%
+dec1.q.fused_qkv     | GemvPacked { x: ValueId(4 |      5.7 |   548864 |     96.1 |    32.8%
+dec2.q.fused_qkv     | GemvPacked { x: ValueId(7 |      5.7 |   548864 |     96.1 |    32.8%
+dec0.q.fused_qkv     | GemvPacked { x: ValueId(7 |      5.7 |   548864 |     96.2 |    32.8%
+dec4.q.fused_qkv     | GemvPacked { x: ValueId(1 |      5.7 |   548864 |     96.2 |    32.8%
+dec5.q.fused_qkv     | GemvPacked { x: ValueId(1 |      5.7 |   548864 |     96.2 |    32.8%
+dec3.q.fused_qkv     | GemvPacked { x: ValueId(1 |      5.6 |   548864 |     97.6 |    33.3%
+dec0.kv_write        | CachedAttention { q: Valu |      5.6 |  2105348 |    377.1 |   128.8%
+dec4.kv_write        | CachedAttention { q: Valu |      5.6 |  2105348 |    377.1 |   128.8%
+dec1.kv_write        | CachedAttention { q: Valu |      5.6 |  2105348 |    377.1 |   128.8%
+dec3.kv_write        | CachedAttention { q: Valu |      5.6 |  2105348 |    377.1 |   128.8%
+dec5.kv_write        | CachedAttention { q: Valu |      5.5 |  2105348 |    382.8 |   130.8%
+dec2.kv_write        | CachedAttention { q: Valu |      5.4 |  2105348 |    391.7 |   133.8%
+dec0.o               | GemvPacked { x: ValueId(2 |      4.0 |   186368 |     47.1 |    16.1%
+dec1.o               | GemvPacked { x: ValueId(5 |      4.0 |   186368 |     47.1 |    16.1%
+dec4.xo              | GemvPacked { x: ValueId(1 |      4.0 |   186368 |     47.1 |    16.1%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  Attention                12      1895    13.4    4.6%
+  GemvPacked               37       234   114.6   39.1%
+  RmsNorm                  19        63     1.8    0.6%
+  CachedAttention           6        33   383.3  130.9%
+  Unary                     7        18     5.6    1.9%
+  RelPosBias                1         3     5.7    1.9%
+  Embed                     1         3  3668.4 1253.2%
+  Binary                    1         3    12.9    4.4%
+dec0.cross           | Ext(Attn(Attention { q: V |    158.3 |  2103296 |     13.3 |     4.5%
+dec1.cross           | Ext(Attn(Attention { q: V |    158.2 |  2103296 |     13.3 |     4.5%
+dec3.cross           | Ext(Attn(Attention { q: V |    158.1 |  2103296 |     13.3 |     4.5%
+dec4.cross           | Ext(Attn(Attention { q: V |    158.1 |  2103296 |     13.3 |     4.5%
+dec5.cross           | Ext(Attn(Attention { q: V |    158.0 |  2103296 |     13.3 |     4.5%
+dec2.self            | Ext(Attn(Attention { q: V |    158.0 |  2117632 |     13.4 |     4.6%
+dec2.cross           | Ext(Attn(Attention { q: V |    158.0 |  2103296 |     13.3 |     4.5%
+dec3.self            | Ext(Attn(Attention { q: V |    157.9 |  2117632 |     13.4 |     4.6%
+dec0.self            | Ext(Attn(Attention { q: V |    157.8 |  2117632 |     13.4 |     4.6%
+dec4.self            | Ext(Attn(Attention { q: V |    157.7 |  2117632 |     13.4 |     4.6%
+dec1.self            | Ext(Attn(Attention { q: V |    157.6 |  2117632 |     13.4 |     4.6%
+dec5.self            | Ext(Attn(Attention { q: V |    157.6 |  2117632 |     13.4 |     4.6%
+lm_head              | GemvPacked { x: ValueId(2 |     54.0 | 11439616 |    211.8 |    72.4%
+dec5.ffn.mlp.up      | GemvPacked { x: ValueId(2 |      6.6 |   731136 |    111.1 |    37.9%
+dec1.ffn.mlp.up      | GemvPacked { x: ValueId(6 |      6.5 |   731136 |    112.5 |    38.4%
+dec2.ffn.mlp.up      | GemvPacked { x: ValueId(1 |      6.5 |   731136 |    112.5 |    38.4%
+dec2.ffn.mlp.down    | GemvPacked { x: ValueId(1 |      6.5 |   733184 |    112.8 |    38.5%
+dec4.ffn.mlp.up      | GemvPacked { x: ValueId(1 |      6.5 |   731136 |    112.5 |    38.4%
+dec0.ffn.mlp.up      | GemvPacked { x: ValueId(3 |      6.4 |   731136 |    113.9 |    38.9%
+dec3.ffn.mlp.down    | GemvPacked { x: ValueId(1 |      6.4 |   733184 |    114.3 |    39.0%
+dec1.ffn.mlp.down    | GemvPacked { x: ValueId(7 |      6.4 |   733184 |    115.0 |    39.3%
+dec3.ffn.mlp.up      | GemvPacked { x: ValueId(1 |      6.3 |   731136 |    115.4 |    39.4%
+dec4.ffn.mlp.down    | GemvPacked { x: ValueId(1 |      6.3 |   733184 |    115.8 |    39.5%
+dec5.ffn.mlp.down    | GemvPacked { x: ValueId(2 |      6.3 |   733184 |    115.8 |    39.5%
+dec0.ffn.mlp.down    | GemvPacked { x: ValueId(3 |      6.3 |   733184 |    116.5 |    39.8%
+dec1.q.fused_qkv     | GemvPacked { x: ValueId(4 |      5.8 |   548864 |     94.8 |    32.4%
+dec5.q.fused_qkv     | GemvPacked { x: ValueId(1 |      5.8 |   548864 |     95.5 |    32.6%
+dec0.q.fused_qkv     | GemvPacked { x: ValueId(7 |      5.7 |   548864 |     95.5 |    32.6%
+dec2.q.fused_qkv     | GemvPacked { x: ValueId(7 |      5.6 |   548864 |     97.6 |    33.3%
+dec3.q.fused_qkv     | GemvPacked { x: ValueId(1 |      5.6 |   548864 |     97.6 |    33.3%
+dec4.q.fused_qkv     | GemvPacked { x: ValueId(1 |      5.6 |   548864 |     97.6 |    33.3%
+dec1.kv_write        | CachedAttention { q: Valu |      5.6 |  2105348 |    377.1 |   128.8%
+dec0.kv_write        | CachedAttention { q: Valu |      5.5 |  2105348 |    382.8 |   130.8%
+dec4.kv_write        | CachedAttention { q: Valu |      5.5 |  2105348 |    382.8 |   130.8%
+dec5.kv_write        | CachedAttention { q: Valu |      5.5 |  2105348 |    382.8 |   130.8%
+dec3.kv_write        | CachedAttention { q: Valu |      5.5 |  2105348 |    385.7 |   131.8%
+dec2.kv_write        | CachedAttention { q: Valu |      5.4 |  2105348 |    388.7 |   132.8%
+dec1.xo              | GemvPacked { x: ValueId(6 |      4.0 |   186368 |     46.6 |    15.9%
+dec3.xo              | GemvPacked { x: ValueId(1 |      4.0 |   186368 |     47.1 |    16.1%
+dec4.o               | GemvPacked { x: ValueId(1 |      4.0 |   186368 |     47.1 |    16.1%
+⚡ Prefill: 1 tokens in 35.36ms (28.3 tok/s)
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  GemmBatchedPacked        28      2754    11.4    3.9%
+  Attention                 6       205    19.2    6.6%
+  Copy                     30       141   111.7   38.2%
+  RmsNorm                  13        49    69.9   23.9%
+  Unary                     6        25   251.2   85.8%
+  Binary                    1         4    60.6   20.7%
+  RelPosBias                1         3    37.9   12.9%
+  Embed                     1         3  3475.7 1187.4%
+enc2.ffn.mlp.up      | GemmBatchedPacked { x: Va |    152.0 |  1376256 |      9.1 |     3.1%
+enc4.ffn.mlp.up      | GemmBatchedPacked { x: Va |    151.1 |  1376256 |      9.1 |     3.1%
+enc0.ffn.mlp.up      | GemmBatchedPacked { x: Va |    150.7 |  1376256 |      9.1 |     3.1%
+enc3.ffn.mlp.up      | GemmBatchedPacked { x: Va |    150.6 |  1376256 |      9.1 |     3.1%
+enc5.ffn.mlp.up      | GemmBatchedPacked { x: Va |    149.3 |  1376256 |      9.2 |     3.2%
+enc1.ffn.mlp.up      | GemmBatchedPacked { x: Va |    148.7 |  1376256 |      9.3 |     3.2%
+enc3.attn.q.fused_qkv | GemmBatchedPacked { x: Va |    110.1 |  1064960 |      9.7 |     3.3%
+xv.1.fused_qkv       | GemmBatchedPacked { x: Va |    109.6 |  1064960 |      9.7 |     3.3%
+xk.0.fused_qkv       | GemmBatchedPacked { x: Va |    109.2 |  1064960 |      9.7 |     3.3%
+enc5.attn.q.fused_qkv | GemmBatchedPacked { x: Va |    109.1 |  1064960 |      9.8 |     3.3%
+xk.3.fused_qkv       | GemmBatchedPacked { x: Va |    109.0 |  1064960 |      9.8 |     3.3%
+enc0.attn.q.fused_qkv | GemmBatchedPacked { x: Va |    107.8 |  1064960 |      9.9 |     3.4%
+enc1.attn.q.fused_qkv | GemmBatchedPacked { x: Va |    107.8 |  1064960 |      9.9 |     3.4%
+enc4.attn.q.fused_qkv | GemmBatchedPacked { x: Va |    107.8 |  1064960 |      9.9 |     3.4%
+xv.4.fused_qkv       | GemmBatchedPacked { x: Va |    107.0 |  1064960 |      9.9 |     3.4%
+enc2.attn.q.fused_qkv | GemmBatchedPacked { x: Va |    106.4 |  1064960 |     10.0 |     3.4%
+enc0.attn.o          | GemmBatchedPacked { x: Va |     77.8 |   573440 |      7.4 |     2.5%
+enc5.attn.o          | GemmBatchedPacked { x: Va |     77.1 |   573440 |      7.4 |     2.5%
+enc2.attn.o          | GemmBatchedPacked { x: Va |     77.1 |   573440 |      7.4 |     2.5%
+enc4.attn.o          | GemmBatchedPacked { x: Va |     77.1 |   573440 |      7.4 |     2.5%
+enc3.attn.o          | GemmBatchedPacked { x: Va |     76.7 |   573440 |      7.5 |     2.6%
+enc1.attn.o          | GemmBatchedPacked { x: Va |     76.4 |   573440 |      7.5 |     2.6%
+enc5.ffn.mlp.down    | GemmBatchedPacked { x: Va |     51.0 |  1507328 |     29.5 |    10.1%
+enc2.ffn.mlp.down    | GemmBatchedPacked { x: Va |     51.0 |  1507328 |     29.6 |    10.1%
+enc3.ffn.mlp.down    | GemmBatchedPacked { x: Va |     51.0 |  1507328 |     29.6 |    10.1%
+enc0.ffn.mlp.down    | GemmBatchedPacked { x: Va |     50.9 |  1507328 |     29.6 |    10.1%
+enc1.ffn.mlp.down    | GemmBatchedPacked { x: Va |     50.9 |  1507328 |     29.6 |    10.1%
+enc4.ffn.mlp.down    | GemmBatchedPacked { x: Va |     50.8 |  1507328 |     29.7 |    10.1%
+enc0.attn.attn       | Ext(Attn(Attention { q: V |     34.2 |   655360 |     19.1 |     6.5%
+enc4.attn.attn       | Ext(Attn(Attention { q: V |     34.2 |   655360 |     19.2 |     6.5%
+enc1.attn.attn       | Ext(Attn(Attention { q: V |     34.1 |   655360 |     19.2 |     6.6%
+enc3.attn.attn       | Ext(Attn(Attention { q: V |     34.1 |   655360 |     19.2 |     6.6%
+enc5.attn.attn       | Ext(Attn(Attention { q: V |     34.1 |   655360 |     19.2 |     6.6%
+enc2.attn.attn       | Ext(Attn(Attention { q: V |     34.1 |   655360 |     19.2 |     6.6%
+xk.3.q_slice         | Ext(Movement(Copy { fill: |      4.9 |   524288 |    107.5 |    36.7%
+xv.4.q_slice         | Ext(Movement(Copy { fill: |      4.8 |   524288 |    108.5 |    37.1%
+enc4.attn.q.q_slice  | Ext(Movement(Copy { fill: |      4.8 |   524288 |    109.4 |    37.4%
+xv.0.k_slice         | Ext(Movement(Copy { fill: |      4.8 |   524288 |    110.4 |    37.7%
+enc0.attn.v.v_slice  | Ext(Movement(Copy { fill: |      4.7 |   524288 |    110.4 |    37.7%
+enc1.attn.k.k_slice  | Ext(Movement(Copy { fill: |      4.7 |   524288 |    110.4 |    37.7%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  Attention                12      1896    13.4    4.6%
+  GemvPacked               37       234   114.6   39.2%
+  RmsNorm                  19        64     1.8    0.6%
+  CachedAttention           6        30   415.3  141.9%
+  Unary                     7        18     5.7    2.0%
+  RelPosBias                1         4     5.6    1.9%
+  Embed                     1         3  3310.7 1131.0%
+  Binary                    1         3    12.3    4.2%
+dec5.cross           | Ext(Attn(Attention { q: V |    158.4 |  2103296 |     13.3 |     4.5%
+dec1.cross           | Ext(Attn(Attention { q: V |    158.4 |  2103296 |     13.3 |     4.5%
+dec2.cross           | Ext(Attn(Attention { q: V |    158.3 |  2103296 |     13.3 |     4.5%
+dec3.cross           | Ext(Attn(Attention { q: V |    158.3 |  2103296 |     13.3 |     4.5%
+dec4.cross           | Ext(Attn(Attention { q: V |    158.2 |  2103296 |     13.3 |     4.5%
+dec2.self            | Ext(Attn(Attention { q: V |    158.0 |  2117632 |     13.4 |     4.6%
+dec0.cross           | Ext(Attn(Attention { q: V |    157.9 |  2103296 |     13.3 |     4.6%
+dec1.self            | Ext(Attn(Attention { q: V |    157.9 |  2117632 |     13.4 |     4.6%
+dec4.self            | Ext(Attn(Attention { q: V |    157.8 |  2117632 |     13.4 |     4.6%
+dec3.self            | Ext(Attn(Attention { q: V |    157.7 |  2117632 |     13.4 |     4.6%
+dec0.self            | Ext(Attn(Attention { q: V |    157.6 |  2117632 |     13.4 |     4.6%
+dec5.self            | Ext(Attn(Attention { q: V |    157.5 |  2117632 |     13.4 |     4.6%
+lm_head              | GemvPacked { x: ValueId(2 |     54.3 | 11439616 |    210.9 |    72.0%
+dec5.ffn.mlp.down    | GemvPacked { x: ValueId(2 |      6.5 |   733184 |    112.8 |    38.5%
+dec4.ffn.mlp.down    | GemvPacked { x: ValueId(1 |      6.5 |   733184 |    112.8 |    38.5%
+dec0.ffn.mlp.up      | GemvPacked { x: ValueId(3 |      6.5 |   731136 |    113.2 |    38.7%
+dec1.ffn.mlp.up      | GemvPacked { x: ValueId(6 |      6.4 |   731136 |    113.9 |    38.9%
+dec5.ffn.mlp.up      | GemvPacked { x: ValueId(2 |      6.4 |   731136 |    114.7 |    39.2%
+dec0.ffn.mlp.down    | GemvPacked { x: ValueId(3 |      6.4 |   733184 |    115.0 |    39.3%
+dec2.ffn.mlp.down    | GemvPacked { x: ValueId(1 |      6.4 |   733184 |    115.0 |    39.3%
+dec3.ffn.mlp.up      | GemvPacked { x: ValueId(1 |      6.4 |   731136 |    114.7 |    39.2%
+dec4.ffn.mlp.up      | GemvPacked { x: ValueId(1 |      6.4 |   731136 |    114.7 |    39.2%
+dec3.ffn.mlp.down    | GemvPacked { x: ValueId(1 |      6.3 |   733184 |    115.8 |    39.5%
+dec2.ffn.mlp.up      | GemvPacked { x: ValueId(1 |      6.3 |   731136 |    116.2 |    39.7%
+dec1.ffn.mlp.down    | GemvPacked { x: ValueId(7 |      6.3 |   733184 |    116.5 |    39.8%
+dec2.q.fused_qkv     | GemvPacked { x: ValueId(7 |      5.7 |   548864 |     95.5 |    32.6%
+dec4.q.fused_qkv     | GemvPacked { x: ValueId(1 |      5.7 |   548864 |     95.5 |    32.6%
+dec5.q.fused_qkv     | GemvPacked { x: ValueId(1 |      5.7 |   548864 |     95.5 |    32.6%
+dec0.q.fused_qkv     | GemvPacked { x: ValueId(7 |      5.7 |   548864 |     96.2 |    32.8%
+dec3.q.fused_qkv     | GemvPacked { x: ValueId(1 |      5.6 |   548864 |     97.6 |    33.3%
+dec1.q.fused_qkv     | GemvPacked { x: ValueId(4 |      5.4 |   548864 |    101.3 |    34.6%
+dec4.kv_write        | CachedAttention { q: Valu |      5.2 |  2105348 |    407.5 |   139.2%
+dec1.kv_write        | CachedAttention { q: Valu |      5.1 |  2105348 |    410.8 |   140.3%
+dec3.kv_write        | CachedAttention { q: Valu |      5.1 |  2105348 |    410.8 |   140.3%
+dec5.kv_write        | CachedAttention { q: Valu |      5.1 |  2105348 |    414.2 |   141.5%
+dec2.kv_write        | CachedAttention { q: Valu |      5.0 |  2105348 |    417.6 |   142.7%
+dec0.kv_write        | CachedAttention { q: Valu |      4.9 |  2105348 |    431.9 |   147.5%
+dec0.o               | GemvPacked { x: ValueId(2 |      4.0 |   186368 |     47.1 |    16.1%
+dec1.xo              | GemvPacked { x: ValueId(6 |      4.0 |   186368 |     47.1 |    16.1%
+dec4.o               | GemvPacked { x: ValueId(1 |      4.0 |   186368 |     47.1 |    16.1%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  Attention                12      1895    13.4    4.6%
+  GemvPacked               37       235   114.5   39.1%
+  RmsNorm                  19        64     1.8    0.6%
+  CachedAttention           6        29   429.4  146.7%
+  Unary                     7        18     5.7    2.0%
+  RelPosBias                1         3     5.7    1.9%
+  Embed                     1         3  3351.6 1145.0%
+  Binary                    1         3    12.5    4.3%
+dec1.cross           | Ext(Attn(Attention { q: V |    158.3 |  2103296 |     13.3 |     4.5%
+dec0.cross           | Ext(Attn(Attention { q: V |    158.2 |  2103296 |     13.3 |     4.5%
+dec4.cross           | Ext(Attn(Attention { q: V |    158.0 |  2103296 |     13.3 |     4.5%
+dec5.cross           | Ext(Attn(Attention { q: V |    158.0 |  2103296 |     13.3 |     4.5%
+dec2.cross           | Ext(Attn(Attention { q: V |    158.0 |  2103296 |     13.3 |     4.5%
+dec2.self            | Ext(Attn(Attention { q: V |    157.9 |  2117632 |     13.4 |     4.6%
+dec0.self            | Ext(Attn(Attention { q: V |    157.9 |  2117632 |     13.4 |     4.6%
+dec3.cross           | Ext(Attn(Attention { q: V |    157.9 |  2103296 |     13.3 |     4.6%
+dec5.self            | Ext(Attn(Attention { q: V |    157.9 |  2117632 |     13.4 |     4.6%
+dec3.self            | Ext(Attn(Attention { q: V |    157.8 |  2117632 |     13.4 |     4.6%
+dec1.self            | Ext(Attn(Attention { q: V |    157.7 |  2117632 |     13.4 |     4.6%
+dec4.self            | Ext(Attn(Attention { q: V |    157.7 |  2117632 |     13.4 |     4.6%
+lm_head              | GemvPacked { x: ValueId(2 |     54.0 | 11439616 |    211.8 |    72.4%
+dec5.ffn.mlp.down    | GemvPacked { x: ValueId(2 |      6.7 |   733184 |    108.6 |    37.1%
+dec5.ffn.mlp.up      | GemvPacked { x: ValueId(2 |      6.6 |   731136 |    111.1 |    37.9%
+dec4.ffn.mlp.up      | GemvPacked { x: ValueId(1 |      6.6 |   731136 |    111.1 |    37.9%
+dec0.ffn.mlp.down    | GemvPacked { x: ValueId(3 |      6.5 |   733184 |    112.8 |    38.5%
+dec0.ffn.mlp.up      | GemvPacked { x: ValueId(3 |      6.4 |   731136 |    113.9 |    38.9%
+dec1.ffn.mlp.down    | GemvPacked { x: ValueId(7 |      6.4 |   733184 |    114.3 |    39.0%
+dec2.ffn.mlp.down    | GemvPacked { x: ValueId(1 |      6.4 |   733184 |    115.0 |    39.3%
+dec3.ffn.mlp.up      | GemvPacked { x: ValueId(1 |      6.4 |   731136 |    114.7 |    39.2%
+dec1.ffn.mlp.up      | GemvPacked { x: ValueId(6 |      6.4 |   731136 |    114.7 |    39.2%
+dec2.ffn.mlp.up      | GemvPacked { x: ValueId(1 |      6.4 |   731136 |    114.7 |    39.2%
+dec4.ffn.mlp.down    | GemvPacked { x: ValueId(1 |      6.3 |   733184 |    116.5 |    39.8%
+dec3.ffn.mlp.down    | GemvPacked { x: ValueId(1 |      6.3 |   733184 |    117.3 |    40.1%
+dec1.q.fused_qkv     | GemvPacked { x: ValueId(4 |      5.7 |   548864 |     95.5 |    32.6%
+dec5.q.fused_qkv     | GemvPacked { x: ValueId(1 |      5.7 |   548864 |     96.2 |    32.8%
+dec0.q.fused_qkv     | GemvPacked { x: ValueId(7 |      5.7 |   548864 |     96.9 |    33.1%
+dec2.q.fused_qkv     | GemvPacked { x: ValueId(7 |      5.6 |   548864 |     97.6 |    33.3%
+dec3.q.fused_qkv     | GemvPacked { x: ValueId(1 |      5.6 |   548864 |     97.6 |    33.3%
+dec4.q.fused_qkv     | GemvPacked { x: ValueId(1 |      5.5 |   548864 |     99.8 |    34.1%
+dec0.kv_write        | CachedAttention { q: Valu |      5.0 |  2105348 |    424.6 |   145.1%
+dec1.kv_write        | CachedAttention { q: Valu |      4.9 |  2105348 |    428.2 |   146.3%
+dec4.kv_write        | CachedAttention { q: Valu |      4.9 |  2105348 |    428.2 |   146.3%
+dec2.kv_write        | CachedAttention { q: Valu |      4.9 |  2105348 |    431.9 |   147.5%
+dec3.kv_write        | CachedAttention { q: Valu |      4.9 |  2105348 |    431.9 |   147.5%
+dec5.kv_write        | CachedAttention { q: Valu |      4.9 |  2105348 |    431.9 |   147.5%
+dec0.o               | GemvPacked { x: ValueId(2 |      4.0 |   186368 |     47.1 |    16.1%
+dec1.xo              | GemvPacked { x: ValueId(6 |      4.0 |   186368 |     47.1 |    16.1%
+dec4.xo              | GemvPacked { x: ValueId(1 |      3.9 |   186368 |     47.6 |    16.3%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  Attention                12      1898    13.3    4.6%
+  GemvPacked               37       234   114.6   39.2%
+  RmsNorm                  19        64     1.8    0.6%
+  CachedAttention           6        29   440.0  150.3%
+  Unary                     7        18     5.8    2.0%
+  RelPosBias                1         3     5.8    2.0%
+  Embed                     1         3  3393.5 1159.3%
+  Binary                    1         3    12.7    4.3%
+dec4.self            | Ext(Attn(Attention { q: V |    159.5 |  2117632 |     13.3 |     4.5%
+dec0.cross           | Ext(Attn(Attention { q: V |    158.2 |  2103296 |     13.3 |     4.5%
+dec4.cross           | Ext(Attn(Attention { q: V |    158.2 |  2103296 |     13.3 |     4.5%
+dec5.cross           | Ext(Attn(Attention { q: V |    158.2 |  2103296 |     13.3 |     4.5%
+dec1.cross           | Ext(Attn(Attention { q: V |    158.1 |  2103296 |     13.3 |     4.5%
+dec2.cross           | Ext(Attn(Attention { q: V |    158.1 |  2103296 |     13.3 |     4.5%
+dec3.self            | Ext(Attn(Attention { q: V |    158.1 |  2117632 |     13.4 |     4.6%
+dec2.self            | Ext(Attn(Attention { q: V |    158.0 |  2117632 |     13.4 |     4.6%
+dec3.cross           | Ext(Attn(Attention { q: V |    158.0 |  2103296 |     13.3 |     4.5%
+dec5.self            | Ext(Attn(Attention { q: V |    157.9 |  2117632 |     13.4 |     4.6%
+dec0.self            | Ext(Attn(Attention { q: V |    157.8 |  2117632 |     13.4 |     4.6%
+dec1.self            | Ext(Attn(Attention { q: V |    157.8 |  2117632 |     13.4 |     4.6%
+lm_head              | GemvPacked { x: ValueId(2 |     54.0 | 11439616 |    211.8 |    72.4%
+dec1.ffn.mlp.up      | GemvPacked { x: ValueId(6 |      6.6 |   731136 |    111.1 |    37.9%
+dec4.ffn.mlp.up      | GemvPacked { x: ValueId(1 |      6.6 |   731136 |    111.1 |    37.9%
+dec2.ffn.mlp.up      | GemvPacked { x: ValueId(1 |      6.5 |   731136 |    111.8 |    38.2%
+dec5.ffn.mlp.down    | GemvPacked { x: ValueId(2 |      6.5 |   733184 |    112.1 |    38.3%
+dec3.ffn.mlp.up      | GemvPacked { x: ValueId(1 |      6.5 |   731136 |    112.5 |    38.4%
+dec0.ffn.mlp.up      | GemvPacked { x: ValueId(3 |      6.4 |   731136 |    113.9 |    38.9%
+dec3.ffn.mlp.down    | GemvPacked { x: ValueId(1 |      6.4 |   733184 |    115.0 |    39.3%
+dec4.ffn.mlp.down    | GemvPacked { x: ValueId(1 |      6.4 |   733184 |    115.0 |    39.3%
+dec0.ffn.mlp.down    | GemvPacked { x: ValueId(3 |      6.4 |   733184 |    115.0 |    39.3%
+dec5.ffn.mlp.up      | GemvPacked { x: ValueId(2 |      6.4 |   731136 |    114.7 |    39.2%
+dec1.ffn.mlp.down    | GemvPacked { x: ValueId(7 |      6.3 |   733184 |    116.5 |    39.8%
+dec2.ffn.mlp.down    | GemvPacked { x: ValueId(1 |      6.3 |   733184 |    117.3 |    40.1%
+dec0.q.fused_qkv     | GemvPacked { x: ValueId(7 |      5.7 |   548864 |     95.5 |    32.6%
+dec2.q.fused_qkv     | GemvPacked { x: ValueId(7 |      5.7 |   548864 |     95.5 |    32.6%
+dec5.q.fused_qkv     | GemvPacked { x: ValueId(1 |      5.7 |   548864 |     95.5 |    32.6%
+dec1.q.fused_qkv     | GemvPacked { x: ValueId(4 |      5.7 |   548864 |     96.2 |    32.8%
+dec4.q.fused_qkv     | GemvPacked { x: ValueId(1 |      5.7 |   548864 |     96.2 |    32.8%
+dec3.q.fused_qkv     | GemvPacked { x: ValueId(1 |      5.5 |   548864 |     99.0 |    33.8%
+dec3.kv_write        | CachedAttention { q: Valu |      4.9 |  2105348 |    431.9 |   147.5%
+dec5.kv_write        | CachedAttention { q: Valu |      4.8 |  2105348 |    435.6 |   148.8%
+dec0.kv_write        | CachedAttention { q: Valu |      4.8 |  2105348 |    439.4 |   150.1%
+dec1.kv_write        | CachedAttention { q: Valu |      4.8 |  2105348 |    439.4 |   150.1%
+dec2.kv_write        | CachedAttention { q: Valu |      4.7 |  2105348 |    443.2 |   151.4%
+dec4.kv_write        | CachedAttention { q: Valu |      4.7 |  2105348 |    451.2 |   154.1%
+dec5.o               | GemvPacked { x: ValueId(1 |      4.0 |   186368 |     47.1 |    16.1%
+dec4.xo              | GemvPacked { x: ValueId(1 |      3.9 |   186368 |     47.6 |    16.3%
+dec0.xo              | GemvPacked { x: ValueId(3 |      3.9 |   186368 |     48.1 |    16.4%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  Attention                12      1895    13.4    4.6%
+  GemvPacked               37       234   114.9   39.2%
+  RmsNorm                  19        63     1.8    0.6%
+  CachedAttention           6        29   428.2  146.3%
+  Unary                     7        18     5.7    1.9%
+  RelPosBias                1         3     5.8    2.0%
+  Embed                     1         3  3436.4 1174.0%
+  Binary                    1         3    12.1    4.1%
+dec3.cross           | Ext(Attn(Attention { q: V |    158.1 |  2103296 |     13.3 |     4.5%
+dec0.cross           | Ext(Attn(Attention { q: V |    158.1 |  2103296 |     13.3 |     4.5%
+dec4.cross           | Ext(Attn(Attention { q: V |    158.1 |  2103296 |     13.3 |     4.5%
+dec5.cross           | Ext(Attn(Attention { q: V |    158.0 |  2103296 |     13.3 |     4.5%
+dec1.cross           | Ext(Attn(Attention { q: V |    158.0 |  2103296 |     13.3 |     4.5%
+dec2.cross           | Ext(Attn(Attention { q: V |    157.9 |  2103296 |     13.3 |     4.6%
+dec4.self            | Ext(Attn(Attention { q: V |    157.9 |  2117632 |     13.4 |     4.6%
+dec0.self            | Ext(Attn(Attention { q: V |    157.7 |  2117632 |     13.4 |     4.6%
+dec2.self            | Ext(Attn(Attention { q: V |    157.7 |  2117632 |     13.4 |     4.6%
+dec1.self            | Ext(Attn(Attention { q: V |    157.7 |  2117632 |     13.4 |     4.6%
+dec3.self            | Ext(Attn(Attention { q: V |    157.7 |  2117632 |     13.4 |     4.6%
+dec5.self            | Ext(Attn(Attention { q: V |    157.6 |  2117632 |     13.4 |     4.6%
+lm_head              | GemvPacked { x: ValueId(2 |     54.4 | 11439616 |    210.4 |    71.9%
+dec3.ffn.mlp.up      | GemvPacked { x: ValueId(1 |      6.6 |   731136 |    110.4 |    37.7%
+dec1.ffn.mlp.up      | GemvPacked { x: ValueId(6 |      6.5 |   731136 |    112.5 |    38.4%
+dec2.ffn.mlp.up      | GemvPacked { x: ValueId(1 |      6.5 |   731136 |    112.5 |    38.4%
+dec4.ffn.mlp.up      | GemvPacked { x: ValueId(1 |      6.5 |   731136 |    112.5 |    38.4%
+dec0.ffn.mlp.up      | GemvPacked { x: ValueId(3 |      6.5 |   731136 |    112.5 |    38.4%
+dec5.ffn.mlp.up      | GemvPacked { x: ValueId(2 |      6.5 |   731136 |    112.5 |    38.4%
+dec5.ffn.mlp.down    | GemvPacked { x: ValueId(2 |      6.5 |   733184 |    112.8 |    38.5%
+dec0.ffn.mlp.down    | GemvPacked { x: ValueId(3 |      6.4 |   733184 |    115.0 |    39.3%
+dec2.ffn.mlp.down    | GemvPacked { x: ValueId(1 |      6.4 |   733184 |    115.0 |    39.3%
+dec3.ffn.mlp.down    | GemvPacked { x: ValueId(1 |      6.4 |   733184 |    115.0 |    39.3%
+dec1.ffn.mlp.down    | GemvPacked { x: ValueId(7 |      6.3 |   733184 |    115.8 |    39.5%
+dec4.ffn.mlp.down    | GemvPacked { x: ValueId(1 |      6.2 |   733184 |    117.3 |    40.1%
+dec0.q.fused_qkv     | GemvPacked { x: ValueId(7 |      5.7 |   548864 |     96.2 |    32.8%
+dec5.q.fused_qkv     | GemvPacked { x: ValueId(1 |      5.7 |   548864 |     96.2 |    32.8%
+dec2.q.fused_qkv     | GemvPacked { x: ValueId(7 |      5.7 |   548864 |     96.9 |    33.1%
+dec1.q.fused_qkv     | GemvPacked { x: ValueId(4 |      5.6 |   548864 |     97.6 |    33.3%
+dec3.q.fused_qkv     | GemvPacked { x: ValueId(1 |      5.6 |   548864 |     97.6 |    33.3%
+dec4.q.fused_qkv     | GemvPacked { x: ValueId(1 |      5.5 |   548864 |     99.8 |    34.1%
+dec5.kv_write        | CachedAttention { q: Valu |      5.0 |  2105348 |    421.1 |   143.9%
+dec4.kv_write        | CachedAttention { q: Valu |      5.0 |  2105348 |    424.6 |   145.1%
+dec0.kv_write        | CachedAttention { q: Valu |      4.9 |  2105348 |    428.2 |   146.3%
+dec3.kv_write        | CachedAttention { q: Valu |      4.9 |  2105348 |    428.2 |   146.3%
+dec1.kv_write        | CachedAttention { q: Valu |      4.9 |  2105348 |    431.9 |   147.5%
+dec2.kv_write        | CachedAttention { q: Valu |      4.8 |  2105348 |    435.6 |   148.8%
+dec0.o               | GemvPacked { x: ValueId(2 |      3.9 |   186368 |     48.1 |    16.4%
+dec1.o               | GemvPacked { x: ValueId(5 |      3.9 |   186368 |     48.1 |    16.4%
+dec1.xo              | GemvPacked { x: ValueId(6 |      3.9 |   186368 |     48.1 |    16.4%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  Attention                12      1894    13.4    4.6%
+  GemvPacked               37       234   114.9   39.3%
+  RmsNorm                  19        63     1.8    0.6%
+  CachedAttention           6        32   400.5  136.8%
+  Unary                     7        18     5.8    2.0%
+  RelPosBias                1         3     5.8    2.0%
+  Embed                     1         3  3525.5 1204.4%
+  Binary                    1         3    12.9    4.4%
+dec3.cross           | Ext(Attn(Attention { q: V |    158.1 |  2103296 |     13.3 |     4.5%
+dec1.cross           | Ext(Attn(Attention { q: V |    158.1 |  2103296 |     13.3 |     4.5%
+dec4.cross           | Ext(Attn(Attention { q: V |    158.0 |  2103296 |     13.3 |     4.5%
+dec2.cross           | Ext(Attn(Attention { q: V |    158.0 |  2103296 |     13.3 |     4.5%
+dec5.cross           | Ext(Attn(Attention { q: V |    158.0 |  2103296 |     13.3 |     4.5%
+dec2.self            | Ext(Attn(Attention { q: V |    158.0 |  2117632 |     13.4 |     4.6%
+dec0.cross           | Ext(Attn(Attention { q: V |    157.9 |  2103296 |     13.3 |     4.6%
+dec0.self            | Ext(Attn(Attention { q: V |    157.8 |  2117632 |     13.4 |     4.6%
+dec5.self            | Ext(Attn(Attention { q: V |    157.7 |  2117632 |     13.4 |     4.6%
+dec1.self            | Ext(Attn(Attention { q: V |    157.6 |  2117632 |     13.4 |     4.6%
+dec4.self            | Ext(Attn(Attention { q: V |    157.6 |  2117632 |     13.4 |     4.6%
+dec3.self            | Ext(Attn(Attention { q: V |    157.5 |  2117632 |     13.4 |     4.6%
+lm_head              | GemvPacked { x: ValueId(2 |     54.4 | 11439616 |    210.4 |    71.9%
+dec5.ffn.mlp.up      | GemvPacked { x: ValueId(2 |      6.5 |   731136 |    111.8 |    38.2%
+dec1.ffn.mlp.up      | GemvPacked { x: ValueId(6 |      6.5 |   731136 |    112.5 |    38.4%
+dec0.ffn.mlp.up      | GemvPacked { x: ValueId(3 |      6.5 |   731136 |    113.2 |    38.7%
+dec3.ffn.mlp.up      | GemvPacked { x: ValueId(1 |      6.4 |   731136 |    113.9 |    38.9%
+dec2.ffn.mlp.up      | GemvPacked { x: ValueId(1 |      6.4 |   731136 |    113.9 |    38.9%
+dec4.ffn.mlp.up      | GemvPacked { x: ValueId(1 |      6.4 |   731136 |    113.9 |    38.9%
+dec2.ffn.mlp.down    | GemvPacked { x: ValueId(1 |      6.4 |   733184 |    115.0 |    39.3%
+dec3.ffn.mlp.down    | GemvPacked { x: ValueId(1 |      6.4 |   733184 |    115.0 |    39.3%
+dec4.ffn.mlp.down    | GemvPacked { x: ValueId(1 |      6.4 |   733184 |    115.0 |    39.3%
+dec5.ffn.mlp.down    | GemvPacked { x: ValueId(2 |      6.3 |   733184 |    115.8 |    39.5%
+dec0.ffn.mlp.down    | GemvPacked { x: ValueId(3 |      6.3 |   733184 |    116.5 |    39.8%
+dec1.ffn.mlp.down    | GemvPacked { x: ValueId(7 |      6.2 |   733184 |    117.3 |    40.1%
+dec4.q.fused_qkv     | GemvPacked { x: ValueId(1 |      5.8 |   548864 |     95.5 |    32.6%
+dec1.q.fused_qkv     | GemvPacked { x: ValueId(4 |      5.7 |   548864 |     95.5 |    32.6%
+dec2.q.fused_qkv     | GemvPacked { x: ValueId(7 |      5.7 |   548864 |     96.2 |    32.8%
+dec3.q.fused_qkv     | GemvPacked { x: ValueId(1 |      5.7 |   548864 |     96.2 |    32.8%
+dec5.q.fused_qkv     | GemvPacked { x: ValueId(1 |      5.7 |   548864 |     96.2 |    32.8%
+dec0.q.fused_qkv     | GemvPacked { x: ValueId(7 |      5.6 |   548864 |     97.6 |    33.3%
+dec0.kv_write        | CachedAttention { q: Valu |      5.4 |  2105348 |    391.7 |   133.8%
+dec2.kv_write        | CachedAttention { q: Valu |      5.3 |  2105348 |    401.0 |   137.0%
+dec4.kv_write        | CachedAttention { q: Valu |      5.3 |  2105348 |    401.0 |   137.0%
+dec5.kv_write        | CachedAttention { q: Valu |      5.3 |  2105348 |    401.0 |   137.0%
+dec1.kv_write        | CachedAttention { q: Valu |      5.2 |  2105348 |    401.0 |   137.0%
+dec3.kv_write        | CachedAttention { q: Valu |      5.2 |  2105348 |    407.5 |   139.2%
+dec0.o               | GemvPacked { x: ValueId(2 |      4.0 |   186368 |     46.6 |    15.9%
+dec3.o               | GemvPacked { x: ValueId(1 |      3.9 |   186368 |     48.1 |    16.4%
+dec4.o               | GemvPacked { x: ValueId(1 |      3.9 |   186368 |     48.1 |    16.4%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  Attention                12      1895    13.4    4.6%
+  GemvPacked               37       234   114.7   39.2%
+  RmsNorm                  19        64     1.8    0.6%
+  CachedAttention           6        31   405.8  138.6%
+  Unary                     7        18     5.6    1.9%
+  RelPosBias                1         3     5.6    1.9%
+  Embed                     1         3  3619.8 1236.6%
+  Binary                    1         3    12.9    4.4%
+dec1.cross           | Ext(Attn(Attention { q: V |    158.4 |  2103296 |     13.3 |     4.5%
+dec0.cross           | Ext(Attn(Attention { q: V |    158.2 |  2103296 |     13.3 |     4.5%
+dec2.cross           | Ext(Attn(Attention { q: V |    158.2 |  2103296 |     13.3 |     4.5%
+dec4.cross           | Ext(Attn(Attention { q: V |    158.0 |  2103296 |     13.3 |     4.5%
+dec5.cross           | Ext(Attn(Attention { q: V |    158.0 |  2103296 |     13.3 |     4.5%
+dec3.cross           | Ext(Attn(Attention { q: V |    157.9 |  2103296 |     13.3 |     4.6%
+dec2.self            | Ext(Attn(Attention { q: V |    157.8 |  2117632 |     13.4 |     4.6%
+dec0.self            | Ext(Attn(Attention { q: V |    157.7 |  2117632 |     13.4 |     4.6%
+dec3.self            | Ext(Attn(Attention { q: V |    157.7 |  2117632 |     13.4 |     4.6%
+dec5.self            | Ext(Attn(Attention { q: V |    157.7 |  2117632 |     13.4 |     4.6%
+dec1.self            | Ext(Attn(Attention { q: V |    157.6 |  2117632 |     13.4 |     4.6%
+dec4.self            | Ext(Attn(Attention { q: V |    157.6 |  2117632 |     13.4 |     4.6%
+lm_head              | GemvPacked { x: ValueId(2 |     54.0 | 11439616 |    211.8 |    72.4%
+dec0.ffn.mlp.up      | GemvPacked { x: ValueId(3 |      6.5 |   731136 |    111.8 |    38.2%
+dec1.ffn.mlp.up      | GemvPacked { x: ValueId(6 |      6.5 |   731136 |    112.5 |    38.4%
+dec3.ffn.mlp.up      | GemvPacked { x: ValueId(1 |      6.5 |   731136 |    113.2 |    38.7%
+dec0.ffn.mlp.down    | GemvPacked { x: ValueId(3 |      6.4 |   733184 |    114.3 |    39.0%
+dec1.ffn.mlp.down    | GemvPacked { x: ValueId(7 |      6.4 |   733184 |    114.3 |    39.0%
+dec4.ffn.mlp.up      | GemvPacked { x: ValueId(1 |      6.4 |   731136 |    113.9 |    38.9%
+dec5.ffn.mlp.up      | GemvPacked { x: ValueId(2 |      6.4 |   731136 |    113.9 |    38.9%
+dec2.ffn.mlp.up      | GemvPacked { x: ValueId(1 |      6.4 |   731136 |    114.7 |    39.2%
+dec4.ffn.mlp.down    | GemvPacked { x: ValueId(1 |      6.3 |   733184 |    115.8 |    39.5%
+dec2.ffn.mlp.down    | GemvPacked { x: ValueId(1 |      6.3 |   733184 |    116.5 |    39.8%
+dec5.ffn.mlp.down    | GemvPacked { x: ValueId(2 |      6.2 |   733184 |    117.3 |    40.1%
+dec3.ffn.mlp.down    | GemvPacked { x: ValueId(1 |      6.1 |   733184 |    119.7 |    40.9%
+dec4.q.fused_qkv     | GemvPacked { x: ValueId(1 |      5.8 |   548864 |     95.5 |    32.6%
+dec0.q.fused_qkv     | GemvPacked { x: ValueId(7 |      5.7 |   548864 |     95.5 |    32.6%
+dec3.q.fused_qkv     | GemvPacked { x: ValueId(1 |      5.7 |   548864 |     96.2 |    32.8%
+dec5.q.fused_qkv     | GemvPacked { x: ValueId(1 |      5.7 |   548864 |     96.2 |    32.8%
+dec2.q.fused_qkv     | GemvPacked { x: ValueId(7 |      5.7 |   548864 |     96.9 |    33.1%
+dec1.q.fused_qkv     | GemvPacked { x: ValueId(4 |      5.6 |   548864 |     97.6 |    33.3%
+dec2.kv_write        | CachedAttention { q: Valu |      5.4 |  2105348 |    391.7 |   133.8%
+dec5.kv_write        | CachedAttention { q: Valu |      5.3 |  2105348 |    397.9 |   135.9%
+dec1.kv_write        | CachedAttention { q: Valu |      5.2 |  2105348 |    407.5 |   139.2%
+dec3.kv_write        | CachedAttention { q: Valu |      5.1 |  2105348 |    410.8 |   140.3%
+dec4.kv_write        | CachedAttention { q: Valu |      5.1 |  2105348 |    410.8 |   140.3%
+dec0.kv_write        | CachedAttention { q: Valu |      5.0 |  2105348 |    417.6 |   142.7%
+dec1.xo              | GemvPacked { x: ValueId(6 |      4.0 |   186368 |     47.1 |    16.1%
+dec0.o               | GemvPacked { x: ValueId(2 |      3.9 |   186368 |     47.6 |    16.3%
+dec2.xo              | GemvPacked { x: ValueId(9 |      3.9 |   186368 |     47.6 |    16.3%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  Attention                12      1896    13.4    4.6%
+  GemvPacked               37       238   112.9   38.6%
+  RmsNorm                  19        63     1.8    0.6%
+  CachedAttention           6        31   406.4  138.8%
+  Unary                     7        18     5.6    1.9%
+  RelPosBias                1         3     5.6    1.9%
+  Embed                     1         3  3393.5 1159.3%
+  Binary                    1         3    12.7    4.3%
+dec2.self            | Ext(Attn(Attention { q: V |    158.3 |  2117632 |     13.4 |     4.6%
+dec2.cross           | Ext(Attn(Attention { q: V |    158.2 |  2103296 |     13.3 |     4.5%
+dec0.cross           | Ext(Attn(Attention { q: V |    158.2 |  2103296 |     13.3 |     4.5%
+dec3.cross           | Ext(Attn(Attention { q: V |    158.1 |  2103296 |     13.3 |     4.5%
+dec5.cross           | Ext(Attn(Attention { q: V |    158.1 |  2103296 |     13.3 |     4.5%
+dec1.cross           | Ext(Attn(Attention { q: V |    158.0 |  2103296 |     13.3 |     4.5%
+dec4.cross           | Ext(Attn(Attention { q: V |    158.0 |  2103296 |     13.3 |     4.5%
+dec3.self            | Ext(Attn(Attention { q: V |    157.9 |  2117632 |     13.4 |     4.6%
+dec5.self            | Ext(Attn(Attention { q: V |    157.8 |  2117632 |     13.4 |     4.6%
+dec1.self            | Ext(Attn(Attention { q: V |    157.7 |  2117632 |     13.4 |     4.6%
+dec0.self            | Ext(Attn(Attention { q: V |    157.6 |  2117632 |     13.4 |     4.6%
+dec4.self            | Ext(Attn(Attention { q: V |    157.5 |  2117632 |     13.4 |     4.6%
+lm_head              | GemvPacked { x: ValueId(2 |     57.1 | 11439616 |    200.3 |    68.4%
+dec2.ffn.mlp.up      | GemvPacked { x: ValueId(1 |      6.5 |   731136 |    112.5 |    38.4%
+dec4.ffn.mlp.down    | GemvPacked { x: ValueId(1 |      6.5 |   733184 |    112.8 |    38.5%
+dec0.ffn.mlp.up      | GemvPacked { x: ValueId(3 |      6.5 |   731136 |    112.5 |    38.4%
+dec1.ffn.mlp.up      | GemvPacked { x: ValueId(6 |      6.5 |   731136 |    112.5 |    38.4%
+dec3.ffn.mlp.up      | GemvPacked { x: ValueId(1 |      6.5 |   731136 |    112.5 |    38.4%
+dec5.ffn.mlp.up      | GemvPacked { x: ValueId(2 |      6.5 |   731136 |    112.5 |    38.4%
+dec4.ffn.mlp.up      | GemvPacked { x: ValueId(1 |      6.5 |   731136 |    113.2 |    38.7%
+dec0.ffn.mlp.down    | GemvPacked { x: ValueId(3 |      6.4 |   733184 |    114.3 |    39.0%
+dec5.ffn.mlp.down    | GemvPacked { x: ValueId(2 |      6.4 |   733184 |    115.0 |    39.3%
+dec3.ffn.mlp.down    | GemvPacked { x: ValueId(1 |      6.4 |   733184 |    115.0 |    39.3%
+dec1.ffn.mlp.down    | GemvPacked { x: ValueId(7 |      6.3 |   733184 |    115.8 |    39.5%
+dec2.ffn.mlp.down    | GemvPacked { x: ValueId(1 |      6.3 |   733184 |    115.8 |    39.5%
+dec2.q.fused_qkv     | GemvPacked { x: ValueId(7 |      5.8 |   548864 |     94.8 |    32.4%
+dec5.q.fused_qkv     | GemvPacked { x: ValueId(1 |      5.8 |   548864 |     94.8 |    32.4%
+dec0.q.fused_qkv     | GemvPacked { x: ValueId(7 |      5.7 |   548864 |     95.5 |    32.6%
+dec3.q.fused_qkv     | GemvPacked { x: ValueId(1 |      5.7 |   548864 |     95.5 |    32.6%
+dec1.q.fused_qkv     | GemvPacked { x: ValueId(4 |      5.7 |   548864 |     96.9 |    33.1%
+dec4.q.fused_qkv     | GemvPacked { x: ValueId(1 |      5.7 |   548864 |     96.9 |    33.1%
+dec0.kv_write        | CachedAttention { q: Valu |      5.3 |  2105348 |    401.0 |   137.0%
+dec4.kv_write        | CachedAttention { q: Valu |      5.3 |  2105348 |    401.0 |   137.0%
+dec5.kv_write        | CachedAttention { q: Valu |      5.2 |  2105348 |    401.0 |   137.0%
+dec2.kv_write        | CachedAttention { q: Valu |      5.2 |  2105348 |    404.2 |   138.1%
+dec3.kv_write        | CachedAttention { q: Valu |      5.1 |  2105348 |    410.8 |   140.3%
+dec1.kv_write        | CachedAttention { q: Valu |      5.0 |  2105348 |    421.1 |   143.8%
+dec1.o               | GemvPacked { x: ValueId(5 |      4.0 |   186368 |     46.6 |    15.9%
+dec5.xo              | GemvPacked { x: ValueId(1 |      4.0 |   186368 |     47.1 |    16.1%
+dec3.xo              | GemvPacked { x: ValueId(1 |      3.9 |   186368 |     47.6 |    16.3%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  Attention                12      1901    13.3    4.6%
+  GemvPacked               37       235   114.3   39.0%
+  RmsNorm                  19        64     1.8    0.6%
+  CachedAttention           6        32   394.2  134.7%
+  Unary                     7        18     5.8    2.0%
+  RelPosBias                1         3     5.9    2.0%
+  Embed                     1         3  3571.9 1220.2%
+  Binary                    1         3    12.7    4.3%
+dec4.self            | Ext(Attn(Attention { q: V |    161.5 |  2117632 |     13.1 |     4.5%
+dec1.cross           | Ext(Attn(Attention { q: V |    158.6 |  2103296 |     13.3 |     4.5%
+dec0.cross           | Ext(Attn(Attention { q: V |    158.3 |  2103296 |     13.3 |     4.5%
+dec3.cross           | Ext(Attn(Attention { q: V |    158.3 |  2103296 |     13.3 |     4.5%
+dec5.cross           | Ext(Attn(Attention { q: V |    158.3 |  2103296 |     13.3 |     4.5%
+dec2.self            | Ext(Attn(Attention { q: V |    158.2 |  2117632 |     13.4 |     4.6%
+dec2.cross           | Ext(Attn(Attention { q: V |    158.2 |  2103296 |     13.3 |     4.5%
+dec4.cross           | Ext(Attn(Attention { q: V |    158.0 |  2103296 |     13.3 |     4.5%
+dec0.self            | Ext(Attn(Attention { q: V |    158.0 |  2117632 |     13.4 |     4.6%
+dec5.self            | Ext(Attn(Attention { q: V |    157.9 |  2117632 |     13.4 |     4.6%
+dec1.self            | Ext(Attn(Attention { q: V |    157.8 |  2117632 |     13.4 |     4.6%
+dec3.self            | Ext(Attn(Attention { q: V |    157.7 |  2117632 |     13.4 |     4.6%
+lm_head              | GemvPacked { x: ValueId(2 |     54.5 | 11439616 |    210.1 |    71.8%
+dec4.ffn.mlp.up      | GemvPacked { x: ValueId(1 |      6.6 |   731136 |    110.4 |    37.7%
+dec5.ffn.mlp.up      | GemvPacked { x: ValueId(2 |      6.6 |   731136 |    111.1 |    37.9%
+dec0.ffn.mlp.up      | GemvPacked { x: ValueId(3 |      6.5 |   731136 |    112.5 |    38.4%
+dec2.ffn.mlp.up      | GemvPacked { x: ValueId(1 |      6.5 |   731136 |    112.5 |    38.4%
+dec1.ffn.mlp.down    | GemvPacked { x: ValueId(7 |      6.5 |   733184 |    113.5 |    38.8%
+dec3.ffn.mlp.up      | GemvPacked { x: ValueId(1 |      6.5 |   731136 |    113.2 |    38.7%
+dec5.ffn.mlp.down    | GemvPacked { x: ValueId(2 |      6.4 |   733184 |    114.3 |    39.0%
+dec0.ffn.mlp.down    | GemvPacked { x: ValueId(3 |      6.4 |   733184 |    115.0 |    39.3%
+dec1.ffn.mlp.up      | GemvPacked { x: ValueId(6 |      6.4 |   731136 |    114.7 |    39.2%
+dec3.ffn.mlp.down    | GemvPacked { x: ValueId(1 |      6.4 |   733184 |    115.0 |    39.3%
+dec2.ffn.mlp.down    | GemvPacked { x: ValueId(1 |      6.2 |   733184 |    117.3 |    40.1%
+dec4.ffn.mlp.down    | GemvPacked { x: ValueId(1 |      6.2 |   733184 |    117.3 |    40.1%
+dec5.q.fused_qkv     | GemvPacked { x: ValueId(1 |      5.7 |   548864 |     95.5 |    32.6%
+dec2.q.fused_qkv     | GemvPacked { x: ValueId(7 |      5.7 |   548864 |     96.2 |    32.8%
+dec4.q.fused_qkv     | GemvPacked { x: ValueId(1 |      5.6 |   548864 |     97.6 |    33.3%
+dec1.q.fused_qkv     | GemvPacked { x: ValueId(4 |      5.6 |   548864 |     97.6 |    33.3%
+dec3.q.fused_qkv     | GemvPacked { x: ValueId(1 |      5.6 |   548864 |     97.6 |    33.3%
+dec0.q.fused_qkv     | GemvPacked { x: ValueId(7 |      5.5 |   548864 |     99.0 |    33.8%
+dec2.kv_write        | CachedAttention { q: Valu |      5.4 |  2105348 |    391.7 |   133.8%
+dec3.kv_write        | CachedAttention { q: Valu |      5.4 |  2105348 |    391.7 |   133.8%
+dec4.kv_write        | CachedAttention { q: Valu |      5.4 |  2105348 |    391.7 |   133.8%
+dec5.kv_write        | CachedAttention { q: Valu |      5.4 |  2105348 |    391.7 |   133.8%
+dec0.kv_write        | CachedAttention { q: Valu |      5.3 |  2105348 |    394.7 |   134.9%
+dec1.kv_write        | CachedAttention { q: Valu |      5.2 |  2105348 |    404.2 |   138.1%
+dec0.xo              | GemvPacked { x: ValueId(3 |      4.0 |   186368 |     47.1 |    16.1%
+dec1.o               | GemvPacked { x: ValueId(5 |      4.0 |   186368 |     47.1 |    16.1%
+dec3.xo              | GemvPacked { x: ValueId(1 |      3.9 |   186368 |     47.6 |    16.3%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  Attention                12      1895    13.4    4.6%
+  GemvPacked               37       234   114.9   39.3%
+  RmsNorm                  19        64     1.8    0.6%
+  CachedAttention           6        34   377.1  128.8%
+  Unary                     7        18     5.7    2.0%
+  RelPosBias                1         3     5.6    1.9%
+  Embed                     1         3  3718.7 1270.4%
+  Binary                    1         3    12.3    4.2%
+dec2.cross           | Ext(Attn(Attention { q: V |    158.2 |  2103296 |     13.3 |     4.5%
+dec5.cross           | Ext(Attn(Attention { q: V |    158.2 |  2103296 |     13.3 |     4.5%
+dec2.self            | Ext(Attn(Attention { q: V |    158.1 |  2117632 |     13.4 |     4.6%
+dec0.cross           | Ext(Attn(Attention { q: V |    158.1 |  2103296 |     13.3 |     4.5%
+dec4.cross           | Ext(Attn(Attention { q: V |    158.1 |  2103296 |     13.3 |     4.5%
+dec3.cross           | Ext(Attn(Attention { q: V |    158.0 |  2103296 |     13.3 |     4.5%
+dec1.cross           | Ext(Attn(Attention { q: V |    157.9 |  2103296 |     13.3 |     4.6%
+dec1.self            | Ext(Attn(Attention { q: V |    157.7 |  2117632 |     13.4 |     4.6%
+dec4.self            | Ext(Attn(Attention { q: V |    157.6 |  2117632 |     13.4 |     4.6%
+dec0.self            | Ext(Attn(Attention { q: V |    157.6 |  2117632 |     13.4 |     4.6%
+dec3.self            | Ext(Attn(Attention { q: V |    157.6 |  2117632 |     13.4 |     4.6%
+dec5.self            | Ext(Attn(Attention { q: V |    157.5 |  2117632 |     13.4 |     4.6%
+lm_head              | GemvPacked { x: ValueId(2 |     54.3 | 11439616 |    210.7 |    72.0%
+dec0.ffn.mlp.up      | GemvPacked { x: ValueId(3 |      6.5 |   731136 |    112.5 |    38.4%
+dec1.ffn.mlp.up      | GemvPacked { x: ValueId(6 |      6.5 |   731136 |    112.5 |    38.4%
+dec3.ffn.mlp.up      | GemvPacked { x: ValueId(1 |      6.5 |   731136 |    112.5 |    38.4%
+dec5.ffn.mlp.up      | GemvPacked { x: ValueId(2 |      6.5 |   731136 |    112.5 |    38.4%
+dec5.ffn.mlp.down    | GemvPacked { x: ValueId(2 |      6.5 |   733184 |    112.8 |    38.5%
+dec1.ffn.mlp.down    | GemvPacked { x: ValueId(7 |      6.5 |   733184 |    113.5 |    38.8%
+dec0.ffn.mlp.down    | GemvPacked { x: ValueId(3 |      6.4 |   733184 |    114.3 |    39.0%
+dec2.ffn.mlp.up      | GemvPacked { x: ValueId(1 |      6.4 |   731136 |    114.7 |    39.2%
+dec4.ffn.mlp.up      | GemvPacked { x: ValueId(1 |      6.4 |   731136 |    114.7 |    39.2%
+dec4.ffn.mlp.down    | GemvPacked { x: ValueId(1 |      6.3 |   733184 |    115.8 |    39.5%
+dec2.ffn.mlp.down    | GemvPacked { x: ValueId(1 |      6.2 |   733184 |    117.3 |    40.1%
+dec3.ffn.mlp.down    | GemvPacked { x: ValueId(1 |      6.2 |   733184 |    118.9 |    40.6%
+dec3.q.fused_qkv     | GemvPacked { x: ValueId(1 |      5.8 |   548864 |     94.8 |    32.4%
+dec1.q.fused_qkv     | GemvPacked { x: ValueId(4 |      5.7 |   548864 |     96.9 |    33.1%
+dec2.q.fused_qkv     | GemvPacked { x: ValueId(7 |      5.7 |   548864 |     96.9 |    33.1%
+dec0.q.fused_qkv     | GemvPacked { x: ValueId(7 |      5.6 |   548864 |     97.6 |    33.3%
+dec2.kv_write        | CachedAttention { q: Valu |      5.6 |  2105348 |    374.3 |   127.9%
+dec4.q.fused_qkv     | GemvPacked { x: ValueId(1 |      5.6 |   548864 |     97.6 |    33.3%
+dec4.kv_write        | CachedAttention { q: Valu |      5.6 |  2105348 |    374.3 |   127.9%
+dec5.q.fused_qkv     | GemvPacked { x: ValueId(1 |      5.6 |   548864 |     97.6 |    33.3%
+dec1.kv_write        | CachedAttention { q: Valu |      5.6 |  2105348 |    377.1 |   128.8%
+dec5.kv_write        | CachedAttention { q: Valu |      5.6 |  2105348 |    377.1 |   128.8%
+dec0.kv_write        | CachedAttention { q: Valu |      5.5 |  2105348 |    379.9 |   129.8%
+dec3.kv_write        | CachedAttention { q: Valu |      5.5 |  2105348 |    379.9 |   129.8%
+dec2.o               | GemvPacked { x: ValueId(8 |      3.9 |   186368 |     47.6 |    16.3%
+dec0.o               | GemvPacked { x: ValueId(2 |      3.9 |   186368 |     48.1 |    16.4%
+dec0.xq              | GemvPacked { x: ValueId(2 |      3.9 |   184320 |     47.6 |    16.2%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  Attention                12      1894    13.4    4.6%
+  GemvPacked               37       234   114.7   39.2%
+  RmsNorm                  19        62     1.9    0.6%
+  CachedAttention           6        33   380.4  130.0%
+  Unary                     7        17     5.9    2.0%
+  RelPosBias                1         4     5.4    1.8%
+  Embed                     1         3  3572.1 1220.3%
+  Binary                    1         3    12.5    4.3%
+dec0.cross           | Ext(Attn(Attention { q: V |    158.3 |  2103296 |     13.3 |     4.5%
+dec2.cross           | Ext(Attn(Attention { q: V |    158.1 |  2103296 |     13.3 |     4.5%
+dec5.cross           | Ext(Attn(Attention { q: V |    158.1 |  2103296 |     13.3 |     4.5%
+dec4.cross           | Ext(Attn(Attention { q: V |    158.0 |  2103296 |     13.3 |     4.5%
+dec3.cross           | Ext(Attn(Attention { q: V |    158.0 |  2103296 |     13.3 |     4.5%
+dec1.cross           | Ext(Attn(Attention { q: V |    157.9 |  2103296 |     13.3 |     4.6%
+dec2.self            | Ext(Attn(Attention { q: V |    157.8 |  2117632 |     13.4 |     4.6%
+dec1.self            | Ext(Attn(Attention { q: V |    157.6 |  2117632 |     13.4 |     4.6%
+dec3.self            | Ext(Attn(Attention { q: V |    157.6 |  2117632 |     13.4 |     4.6%
+dec5.self            | Ext(Attn(Attention { q: V |    157.6 |  2117632 |     13.4 |     4.6%
+dec0.self            | Ext(Attn(Attention { q: V |    157.6 |  2117632 |     13.4 |     4.6%
+dec4.self            | Ext(Attn(Attention { q: V |    157.5 |  2117632 |     13.4 |     4.6%
+lm_head              | GemvPacked { x: ValueId(2 |     54.3 | 11439616 |    210.9 |    72.0%
+dec0.ffn.mlp.up      | GemvPacked { x: ValueId(3 |      6.5 |   731136 |    112.5 |    38.4%
+dec3.ffn.mlp.up      | GemvPacked { x: ValueId(1 |      6.5 |   731136 |    112.5 |    38.4%
+dec4.ffn.mlp.down    | GemvPacked { x: ValueId(1 |      6.4 |   733184 |    114.3 |    39.0%
+dec2.ffn.mlp.up      | GemvPacked { x: ValueId(1 |      6.4 |   731136 |    114.7 |    39.2%
+dec0.ffn.mlp.down    | GemvPacked { x: ValueId(3 |      6.4 |   733184 |    115.0 |    39.3%
+dec1.ffn.mlp.up      | GemvPacked { x: ValueId(6 |      6.4 |   731136 |    114.7 |    39.2%
+dec1.ffn.mlp.down    | GemvPacked { x: ValueId(7 |      6.4 |   733184 |    115.0 |    39.3%
+dec5.ffn.mlp.down    | GemvPacked { x: ValueId(2 |      6.4 |   733184 |    115.0 |    39.3%
+dec3.ffn.mlp.down    | GemvPacked { x: ValueId(1 |      6.3 |   733184 |    115.8 |    39.5%
+dec5.ffn.mlp.up      | GemvPacked { x: ValueId(2 |      6.3 |   731136 |    115.4 |    39.4%
+dec2.ffn.mlp.down    | GemvPacked { x: ValueId(1 |      6.3 |   733184 |    115.8 |    39.5%
+dec4.ffn.mlp.up      | GemvPacked { x: ValueId(1 |      6.3 |   731136 |    115.4 |    39.4%
+dec2.q.fused_qkv     | GemvPacked { x: ValueId(7 |      5.8 |   548864 |     94.8 |    32.4%
+dec3.q.fused_qkv     | GemvPacked { x: ValueId(1 |      5.7 |   548864 |     95.5 |    32.6%
+dec0.q.fused_qkv     | GemvPacked { x: ValueId(7 |      5.7 |   548864 |     96.2 |    32.8%
+dec1.q.fused_qkv     | GemvPacked { x: ValueId(4 |      5.6 |   548864 |     97.6 |    33.3%
+dec4.q.fused_qkv     | GemvPacked { x: ValueId(1 |      5.6 |   548864 |     97.6 |    33.3%
+dec5.q.fused_qkv     | GemvPacked { x: ValueId(1 |      5.6 |   548864 |     97.6 |    33.3%
+dec5.kv_write        | CachedAttention { q: Valu |      5.6 |  2105348 |    377.1 |   128.8%
+dec1.kv_write        | CachedAttention { q: Valu |      5.5 |  2105348 |    379.9 |   129.8%
+dec2.kv_write        | CachedAttention { q: Valu |      5.5 |  2105348 |    379.9 |   129.8%
+dec4.kv_write        | CachedAttention { q: Valu |      5.5 |  2105348 |    379.9 |   129.8%
+dec3.kv_write        | CachedAttention { q: Valu |      5.5 |  2105348 |    382.8 |   130.8%
+dec0.kv_write        | CachedAttention { q: Valu |      5.5 |  2105348 |    382.8 |   130.8%
+dec0.o               | GemvPacked { x: ValueId(2 |      4.0 |   186368 |     46.6 |    15.9%
+dec0.xo              | GemvPacked { x: ValueId(3 |      4.0 |   186368 |     47.1 |    16.1%
+dec3.o               | GemvPacked { x: ValueId(1 |      4.0 |   186368 |     47.1 |    16.1%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  Attention                12      1893    13.4    4.6%
+  GemvPacked               37       233   115.4   39.4%
+  RmsNorm                  19        62     1.9    0.6%
+  CachedAttention           6        33   386.2  131.9%
+  Unary                     7        18     5.8    2.0%
+  RelPosBias                1         3     5.8    2.0%
+  Embed                     1         3  3668.7 1253.3%
+  Binary                    1         3    13.3    4.5%
+dec0.cross           | Ext(Attn(Attention { q: V |    158.0 |  2103296 |     13.3 |     4.5%
+dec2.cross           | Ext(Attn(Attention { q: V |    158.0 |  2103296 |     13.3 |     4.5%
+dec5.cross           | Ext(Attn(Attention { q: V |    157.9 |  2103296 |     13.3 |     4.6%
+dec1.cross           | Ext(Attn(Attention { q: V |    157.9 |  2103296 |     13.3 |     4.6%
+dec2.self            | Ext(Attn(Attention { q: V |    157.9 |  2117632 |     13.4 |     4.6%
+dec3.cross           | Ext(Attn(Attention { q: V |    157.9 |  2103296 |     13.3 |     4.6%
+dec4.cross           | Ext(Attn(Attention { q: V |    157.9 |  2103296 |     13.3 |     4.6%
+dec1.self            | Ext(Attn(Attention { q: V |    157.6 |  2117632 |     13.4 |     4.6%
+dec3.self            | Ext(Attn(Attention { q: V |    157.6 |  2117632 |     13.4 |     4.6%
+dec0.self            | Ext(Attn(Attention { q: V |    157.5 |  2117632 |     13.4 |     4.6%
+dec4.self            | Ext(Attn(Attention { q: V |    157.5 |  2117632 |     13.4 |     4.6%
+dec5.self            | Ext(Attn(Attention { q: V |    157.5 |  2117632 |     13.4 |     4.6%
+lm_head              | GemvPacked { x: ValueId(2 |     54.0 | 11439616 |    211.7 |    72.3%
+dec0.ffn.mlp.up      | GemvPacked { x: ValueId(3 |      6.5 |   731136 |    112.5 |    38.4%
+dec4.ffn.mlp.up      | GemvPacked { x: ValueId(1 |      6.5 |   731136 |    112.5 |    38.4%
+dec3.ffn.mlp.down    | GemvPacked { x: ValueId(1 |      6.5 |   733184 |    113.5 |    38.8%
+dec5.ffn.mlp.down    | GemvPacked { x: ValueId(2 |      6.5 |   733184 |    113.5 |    38.8%
+dec0.ffn.mlp.down    | GemvPacked { x: ValueId(3 |      6.4 |   733184 |    115.0 |    39.3%
+dec1.ffn.mlp.up      | GemvPacked { x: ValueId(6 |      6.4 |   731136 |    114.7 |    39.2%
+dec1.ffn.mlp.down    | GemvPacked { x: ValueId(7 |      6.4 |   733184 |    115.0 |    39.3%
+dec2.ffn.mlp.down    | GemvPacked { x: ValueId(1 |      6.4 |   733184 |    115.0 |    39.3%
+dec2.ffn.mlp.up      | GemvPacked { x: ValueId(1 |      6.4 |   731136 |    114.7 |    39.2%
+dec3.ffn.mlp.up      | GemvPacked { x: ValueId(1 |      6.4 |   731136 |    114.7 |    39.2%
+dec5.ffn.mlp.up      | GemvPacked { x: ValueId(2 |      6.4 |   731136 |    114.7 |    39.2%
+dec4.ffn.mlp.down    | GemvPacked { x: ValueId(1 |      6.3 |   733184 |    115.8 |    39.5%
+dec3.q.fused_qkv     | GemvPacked { x: ValueId(1 |      5.8 |   548864 |     94.1 |    32.1%
+dec1.q.fused_qkv     | GemvPacked { x: ValueId(4 |      5.6 |   548864 |     97.6 |    33.3%
+dec2.q.fused_qkv     | GemvPacked { x: ValueId(7 |      5.6 |   548864 |     97.6 |    33.3%
+dec4.q.fused_qkv     | GemvPacked { x: ValueId(1 |      5.6 |   548864 |     97.6 |    33.3%
+dec5.q.fused_qkv     | GemvPacked { x: ValueId(1 |      5.6 |   548864 |     97.6 |    33.3%
+dec0.q.fused_qkv     | GemvPacked { x: ValueId(7 |      5.6 |   548864 |     98.3 |    33.6%
+dec2.kv_write        | CachedAttention { q: Valu |      5.5 |  2105348 |    382.8 |   130.8%
+dec4.kv_write        | CachedAttention { q: Valu |      5.5 |  2105348 |    382.8 |   130.8%
+dec5.kv_write        | CachedAttention { q: Valu |      5.5 |  2105348 |    382.8 |   130.8%
+dec0.kv_write        | CachedAttention { q: Valu |      5.5 |  2105348 |    382.8 |   130.8%
+dec3.kv_write        | CachedAttention { q: Valu |      5.4 |  2105348 |    388.7 |   132.8%
+dec1.kv_write        | CachedAttention { q: Valu |      5.3 |  2105348 |    397.9 |   135.9%
+dec5.o               | GemvPacked { x: ValueId(1 |      4.0 |   186368 |     47.1 |    16.1%
+dec0.xo              | GemvPacked { x: ValueId(3 |      3.9 |   186368 |     48.1 |    16.4%
+dec1.xo              | GemvPacked { x: ValueId(6 |      3.9 |   186368 |     48.1 |    16.4%
+⚡ Prefill: 1 tokens in 35.38ms (28.3 tok/s)
+{"model":"google-t5/t5-small","file":"/Users/keas/code/rust-inference-server/disk/models--google-t5--t5-small/snapshots/main/config.json","bytes_per_token":241961984,"bytes_basis":"streamed","ceiling_gbps":292.7195952143199,"decode_tok_s":26.809401828447673,"roofline_tok_s":1209.7751488693361,"roofline_pct":2.2160648491997805,"wall_ms":37.84460655555555,"weights_ms":0.8265998858834277,"rss_gb":0.672743424}
+METRIC geomean_roofline_pct=2.22
+METRIC min_roofline_pct=2.22
+METRIC t5-small_tok_s=26.8

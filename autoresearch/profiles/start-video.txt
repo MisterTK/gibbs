@@ -1,0 +1,32 @@
+═══════════════════════════════════════════════════════════════
+  GIBBS INFERENCE ENGINE // v0.1.0
+═══════════════════════════════════════════════════════════════
+Compute backend: Metal (Apple M5 Pro)
+CPU:    Apple M5 Pro (5 performance + 10 efficiency cores)
+Memory: 51.5 GB
+GPU:    Apple M5 Pro (unified memory)
+CPU features: NEON SME SME2 I8MM BF16 FP16
+[32m[23:09:04.485] [INFO][0m Checking model source: 'ali-vilab/text-to-video-ms-1.7b' (storage: LocalDisk { cache_dir: "disk" })
+Prompt: "a red car driving on a coastal road"
+ali-vilab/text-to-video-ms-1.7b (diffusers) loaded in 0.20s
+Compiled GraphProgram: 1 segments, primary device: Metal
+  prompt encoded: 0.69s
+Compiled GraphProgram: 1 segments, primary device: Metal
+  step 1/10 (t=901.0): 14.98s
+  step 2/10 (t=801.0): 13.08s
+  step 3/10 (t=701.0): 13.04s
+  step 4/10 (t=601.0): 12.87s
+  step 5/10 (t=501.0): 12.80s
+  step 6/10 (t=401.0): 12.85s
+  step 7/10 (t=301.0): 13.05s
+  step 8/10 (t=201.0): 12.90s
+  step 9/10 (t=101.0): 12.73s
+  step 10/10 (t=1.0): 12.78s
+Compiled GraphProgram: 1 segments, primary device: Metal
+  VAE decode: 17.81s
+Seed: 1  Steps: 10  Frames: 16  Guidance: 9  Size: 256x256
+Generated 16 frames in 149.94s
+Saved /tmp/v.mp4 (106853 bytes, 8 fps)
+real 151.20
+user 2.47
+sys 1.06

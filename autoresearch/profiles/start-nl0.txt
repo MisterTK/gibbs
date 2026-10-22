@@ -1,0 +1,1066 @@
+Compiled GraphProgram: 1 segments, primary device: Metal
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  GemmBatchedPacked       138     50394    14.4    4.9%
+  Attention                23      2272    12.8    4.4%
+  LayerNorm                47       520    57.8   19.7%
+  Embed                     2        23  4378.2 1495.7%
+  Binary                    1        16    57.9   19.8%
+  Gather                    1         3   103.6   35.4%
+l1.fc2               | GemmBatchedPacked { x: Va |   1710.4 | 10285056 |      6.0 |     2.1%
+l0.fc2               | GemmBatchedPacked { x: Va |   1698.7 | 10285056 |      6.1 |     2.1%
+l1.fc1               | GemmBatchedPacked { x: Va |   1469.4 |  9981952 |      6.8 |     2.3%
+l0.fc1               | GemmBatchedPacked { x: Va |   1418.8 |  9981952 |      7.0 |     2.4%
+l10.fc2              | GemmBatchedPacked { x: Va |    726.8 | 10285056 |     14.2 |     4.8%
+l5.fc2               | GemmBatchedPacked { x: Va |    725.8 | 10285056 |     14.2 |     4.8%
+l14.fc2              | GemmBatchedPacked { x: Va |    725.2 | 10285056 |     14.2 |     4.8%
+l11.fc2              | GemmBatchedPacked { x: Va |    725.2 | 10285056 |     14.2 |     4.8%
+l2.fc2               | GemmBatchedPacked { x: Va |    724.9 | 10285056 |     14.2 |     4.8%
+l13.fc2              | GemmBatchedPacked { x: Va |    724.9 | 10285056 |     14.2 |     4.8%
+l6.fc2               | GemmBatchedPacked { x: Va |    724.7 | 10285056 |     14.2 |     4.8%
+l15.fc2              | GemmBatchedPacked { x: Va |    724.2 | 10285056 |     14.2 |     4.9%
+l16.fc2              | GemmBatchedPacked { x: Va |    724.0 | 10285056 |     14.2 |     4.9%
+l3.fc2               | GemmBatchedPacked { x: Va |    722.8 | 10285056 |     14.2 |     4.9%
+l8.fc2               | GemmBatchedPacked { x: Va |    721.4 | 10285056 |     14.3 |     4.9%
+l7.fc2               | GemmBatchedPacked { x: Va |    721.1 | 10285056 |     14.3 |     4.9%
+l4.fc2               | GemmBatchedPacked { x: Va |    720.3 | 10285056 |     14.3 |     4.9%
+l12.fc2              | GemmBatchedPacked { x: Va |    719.7 | 10285056 |     14.3 |     4.9%
+l9.fc2               | GemmBatchedPacked { x: Va |    718.8 | 10285056 |     14.3 |     4.9%
+l18.fc2              | GemmBatchedPacked { x: Va |    645.0 | 10285056 |     15.9 |     5.4%
+l17.fc2              | GemmBatchedPacked { x: Va |    644.3 | 10285056 |     16.0 |     5.5%
+l4.fc1               | GemmBatchedPacked { x: Va |    623.0 |  9981952 |     16.0 |     5.5%
+l6.fc1               | GemmBatchedPacked { x: Va |    622.4 |  9981952 |     16.0 |     5.5%
+l15.fc1              | GemmBatchedPacked { x: Va |    622.1 |  9981952 |     16.0 |     5.5%
+l2.fc1               | GemmBatchedPacked { x: Va |    622.0 |  9981952 |     16.0 |     5.5%
+l5.fc1               | GemmBatchedPacked { x: Va |    622.0 |  9981952 |     16.0 |     5.5%
+l10.fc1              | GemmBatchedPacked { x: Va |    604.4 |  9981952 |     16.5 |     5.6%
+l7.fc1               | GemmBatchedPacked { x: Va |    604.0 |  9981952 |     16.5 |     5.6%
+l14.fc1              | GemmBatchedPacked { x: Va |    603.9 |  9981952 |     16.5 |     5.6%
+l9.fc1               | GemmBatchedPacked { x: Va |    603.4 |  9981952 |     16.5 |     5.7%
+l3.fc1               | GemmBatchedPacked { x: Va |    602.5 |  9981952 |     16.6 |     5.7%
+l11.fc1              | GemmBatchedPacked { x: Va |    602.2 |  9981952 |     16.6 |     5.7%
+l16.fc1              | GemmBatchedPacked { x: Va |    601.7 |  9981952 |     16.6 |     5.7%
+l12.fc1              | GemmBatchedPacked { x: Va |    601.4 |  9981952 |     16.6 |     5.7%
+l8.fc1               | GemmBatchedPacked { x: Va |    601.2 |  9981952 |     16.6 |     5.7%
+l13.fc1              | GemmBatchedPacked { x: Va |    600.1 |  9981952 |     16.6 |     5.7%
+l18.fc1              | GemmBatchedPacked { x: Va |    556.1 |  9981952 |     17.9 |     6.1%
+l17.fc1              | GemmBatchedPacked { x: Va |    540.9 |  9981952 |     18.5 |     6.3%
+l19.fc2              | GemmBatchedPacked { x: Va |    532.4 | 10285056 |     19.3 |     6.6%
+l20.fc2              | GemmBatchedPacked { x: Va |    529.6 | 10285056 |     19.4 |     6.6%
+Compiled GraphProgram: 1 segments, primary device: Metal
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  ConvGemm                 66    749052     3.5    1.2%
+  Attention                32    326172     0.9    0.3%
+  GemmBatchedPacked       160     93852    21.3    7.3%
+  Copy                    124      9866   200.1   68.3%
+  Group                    61      3486   103.5   35.4%
+  Binary                   76      2769   337.3  115.2%
+  LayerNorm                48      1954   142.0   48.5%
+  Unary                    61      1798   354.7  121.2%
+up3.0.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |  55446.5 | 20971520 |      0.4 |     0.1%
+up3.2.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |  55442.3 | 20971520 |      0.4 |     0.1%
+down0.1.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |  55395.2 | 20971520 |      0.4 |     0.1%
+down0.0.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |  55334.5 | 20971520 |      0.4 |     0.1%
+up3.1.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |  55241.5 | 20971520 |      0.4 |     0.1%
+up1.upsample_conv.conv | Ext(Conv(ConvGemm { x: Va |  53295.7 | 69473280 |      1.3 |     0.4%
+up2.upsample_conv.conv | Ext(Conv(ConvGemm { x: Va |  49058.8 | 35719680 |      0.7 |     0.2%
+up2.0.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  41349.7 | 54725120 |      1.3 |     0.5%
+up3.0.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  40079.1 | 32032000 |      0.8 |     0.3%
+up2.1.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  33105.3 | 37358080 |      1.1 |     0.4%
+up1.0.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  32052.8 | 121902080 |      3.8 |     1.3%
+up1.1.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  31676.5 | 121902080 |      3.8 |     1.3%
+up3.1.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  26300.5 | 23102720 |      0.9 |     0.3%
+up3.2.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  26123.5 | 23102720 |      0.9 |     0.3%
+up1.2.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  23962.8 | 91755520 |      3.8 |     1.3%
+up2.2.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  20931.5 | 28674560 |      1.4 |     0.5%
+up1.1.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  16213.8 | 61608960 |      3.8 |     1.3%
+down2.1.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  15831.5 | 61608960 |      3.9 |     1.3%
+down2.1.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  15633.8 | 61608960 |      3.9 |     1.3%
+down2.0.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  15609.8 | 61608960 |      3.9 |     1.3%
+up0.upsample_conv.conv | Ext(Conv(ConvGemm { x: Va |  15580.3 | 61608960 |      4.0 |     1.4%
+up1.2.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  15475.5 | 61608960 |      4.0 |     1.4%
+up1.0.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  15420.0 | 61608960 |      4.0 |     1.4%
+up2.0.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  14107.3 | 19991040 |      1.4 |     0.5%
+up2.1.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  13577.6 | 19991040 |      1.5 |     0.5%
+up3.1.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  13497.6 | 14173440 |      1.1 |     0.4%
+down0.1.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  13414.6 | 14173440 |      1.1 |     0.4%
+down0.0.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  13414.3 | 14173440 |      1.1 |     0.4%
+down1.1.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  13338.8 | 19991040 |      1.5 |     0.5%
+down1.0.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  13250.1 | 19991040 |      1.5 |     0.5%
+down0.0.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  13222.6 | 14173440 |      1.1 |     0.4%
+up3.0.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  13188.6 | 14173440 |      1.1 |     0.4%
+down0.1.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  13162.9 | 14173440 |      1.1 |     0.4%
+up2.2.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  13159.1 | 19991040 |      1.5 |     0.5%
+up3.2.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  13119.0 | 14173440 |      1.1 |     0.4%
+down1.1.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  12817.6 | 19991040 |      1.6 |     0.5%
+down2.0.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |   8279.5 | 31462400 |      3.8 |     1.3%
+up2.1.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |   7039.7 | 10485760 |      1.5 |     0.5%
+down1.1.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |   7033.4 | 10485760 |      1.5 |     0.5%
+up2.0.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |   7014.9 | 10485760 |      1.5 |     0.5%
+Compiled GraphProgram: 1 segments, primary device: Metal
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  ConvGemm                 36   4013154     1.2    0.4%
+  Attention                 1     70780     0.5    0.2%
+  Group                    30     49816    73.8   25.2%
+  Unary                    29     13194   277.2   94.7%
+  Upsample                  3      9995    54.6   18.6%
+  Binary                   15      8046   281.5   96.2%
+  GemmBatchedPacked         4      2993    23.1    7.9%
+  Copy                      2       257   130.8   44.7%
+up1.upconv.out       | Ext(Conv(ConvGemm { x: Va | 489381.1 | 277874688 |      0.6 |     0.2%
+up2.upconv.out       | Ext(Conv(ConvGemm { x: Va | 482721.9 | 539231232 |      1.1 |     0.4%
+up2.res0.conv1.out   | Ext(Conv(ConvGemm { x: Va | 245288.9 | 206046208 |      0.8 |     0.3%
+up3.res0.conv1.out   | Ext(Conv(ConvGemm { x: Va | 241770.5 | 403833344 |      1.7 |     0.6%
+up1.res2.conv2.out   | Ext(Conv(ConvGemm { x: Va | 127147.9 | 76548096 |      0.6 |     0.2%
+up1.res0.conv1.out   | Ext(Conv(ConvGemm { x: Va | 125996.0 | 76548096 |      0.6 |     0.2%
+up2.res2.conv1.out   | Ext(Conv(ConvGemm { x: Va | 125734.9 | 136578048 |      1.1 |     0.4%
+up1.res1.conv1.out   | Ext(Conv(ConvGemm { x: Va | 125666.9 | 76548096 |      0.6 |     0.2%
+up1.res2.conv1.out   | Ext(Conv(ConvGemm { x: Va | 125402.2 | 76548096 |      0.6 |     0.2%
+up1.res1.conv2.out   | Ext(Conv(ConvGemm { x: Va | 125377.6 | 76548096 |      0.6 |     0.2%
+up0.upconv.out       | Ext(Conv(ConvGemm { x: Va | 124304.2 | 76548096 |      0.6 |     0.2%
+up3.res2.conv2.out   | Ext(Conv(ConvGemm { x: Va | 124222.3 | 269025792 |      2.2 |     0.7%
+up1.res0.conv2.out   | Ext(Conv(ConvGemm { x: Va | 123842.5 | 76548096 |      0.6 |     0.2%
+up3.res1.conv2.out   | Ext(Conv(ConvGemm { x: Va | 122686.5 | 269025792 |      2.2 |     0.7%
+up2.res2.conv2.out   | Ext(Conv(ConvGemm { x: Va | 122418.3 | 136578048 |      1.1 |     0.4%
+up3.res0.conv2.out   | Ext(Conv(ConvGemm { x: Va | 122199.2 | 269025792 |      2.2 |     0.8%
+up2.res1.conv1.out   | Ext(Conv(ConvGemm { x: Va | 122169.9 | 136578048 |      1.1 |     0.4%
+up2.res0.conv2.out   | Ext(Conv(ConvGemm { x: Va | 122109.1 | 136578048 |      1.1 |     0.4%
+up3.res1.conv1.out   | Ext(Conv(ConvGemm { x: Va | 122083.5 | 269025792 |      2.2 |     0.8%
+up2.res1.conv2.out   | Ext(Conv(ConvGemm { x: Va | 121928.2 | 136578048 |      1.1 |     0.4%
+up3.res2.conv1.out   | Ext(Conv(ConvGemm { x: Va | 121433.0 | 269025792 |      2.2 |     0.8%
+mid.attn.attn        | Ext(Attn(Attention { q: V |  70779.8 | 33554432 |      0.5 |     0.2%
+tail.conv_out.out    | Ext(Conv(ConvGemm { x: Va |  58254.3 | 137377292 |      2.4 |     0.8%
+up0.res0.conv1.out   | Ext(Conv(ConvGemm { x: Va |  33929.3 | 26216448 |      0.8 |     0.3%
+mid.res1.conv1.out   | Ext(Conv(ConvGemm { x: Va |  33873.2 | 26216448 |      0.8 |     0.3%
+mid.res0.conv2.out   | Ext(Conv(ConvGemm { x: Va |  33583.2 | 26216448 |      0.8 |     0.3%
+up0.res2.conv1.out   | Ext(Conv(ConvGemm { x: Va |  33437.6 | 26216448 |      0.8 |     0.3%
+mid.res0.conv1.out   | Ext(Conv(ConvGemm { x: Va |  33408.4 | 26216448 |      0.8 |     0.3%
+up0.res2.conv2.out   | Ext(Conv(ConvGemm { x: Va |  33302.2 | 26216448 |      0.8 |     0.3%
+up0.res1.conv1.out   | Ext(Conv(ConvGemm { x: Va |  33231.9 | 26216448 |      0.8 |     0.3%
+mid.res1.conv2.out   | Ext(Conv(ConvGemm { x: Va |  33004.0 | 26216448 |      0.8 |     0.3%
+up0.res1.conv2.out   | Ext(Conv(ConvGemm { x: Va |  32820.5 | 26216448 |      0.8 |     0.3%
+up0.res0.conv2.out   | Ext(Conv(ConvGemm { x: Va |  32753.6 | 26216448 |      0.8 |     0.3%
+up2.res0.shortcut.out | Ext(Conv(ConvGemm { x: Va |  27885.5 | 201851904 |      7.2 |     2.5%
+up3.res0.shortcut.out | Ext(Conv(ConvGemm { x: Va |  27391.9 | 402784768 |     14.7 |     5.0%
+up3.res0.norm1.gn    | Ext(Norm(Group { x: Value |   7310.6 | 536872960 |     73.4 |    25.1%
+up2.upsample         | Ext(Movement(Upsample { x |   6148.9 | 335544320 |     54.6 |    18.6%
+tail.norm_out.gn     | Ext(Norm(Group { x: Value |   3710.0 | 268436480 |     72.4 |    24.7%
+up3.res1.norm2.gn    | Ext(Norm(Group { x: Value |   3704.7 | 268436480 |     72.5 |    24.8%
+up2.res0.norm1.gn    | Ext(Norm(Group { x: Value |   3679.8 | 268439552 |     73.0 |    24.9%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  GemmBatchedPacked       138     23451    30.9   10.6%
+  Attention                23      1051    27.6    9.4%
+  LayerNorm                47       255   117.5   40.2%
+  Embed                     2         6 16878.7 5766.2%
+  Binary                    1         4   224.8   76.8%
+  Gather                    1         3   118.0   40.3%
+l6.fc2               | GemmBatchedPacked { x: Va |    356.7 | 10285056 |     28.8 |     9.8%
+l21.fc2              | GemmBatchedPacked { x: Va |    356.7 | 10285056 |     28.8 |     9.9%
+l19.fc2              | GemmBatchedPacked { x: Va |    356.5 | 10285056 |     28.8 |     9.9%
+l8.fc2               | GemmBatchedPacked { x: Va |    356.5 | 10285056 |     28.9 |     9.9%
+l7.fc2               | GemmBatchedPacked { x: Va |    356.4 | 10285056 |     28.9 |     9.9%
+l14.fc2              | GemmBatchedPacked { x: Va |    356.2 | 10285056 |     28.9 |     9.9%
+l5.fc2               | GemmBatchedPacked { x: Va |    356.1 | 10285056 |     28.9 |     9.9%
+l12.fc2              | GemmBatchedPacked { x: Va |    355.5 | 10285056 |     28.9 |     9.9%
+l13.fc2              | GemmBatchedPacked { x: Va |    355.5 | 10285056 |     28.9 |     9.9%
+l10.fc2              | GemmBatchedPacked { x: Va |    355.5 | 10285056 |     28.9 |     9.9%
+l16.fc2              | GemmBatchedPacked { x: Va |    355.5 | 10285056 |     28.9 |     9.9%
+l17.fc2              | GemmBatchedPacked { x: Va |    355.5 | 10285056 |     28.9 |     9.9%
+l15.fc2              | GemmBatchedPacked { x: Va |    355.2 | 10285056 |     29.0 |     9.9%
+l9.fc2               | GemmBatchedPacked { x: Va |    355.0 | 10285056 |     29.0 |     9.9%
+l18.fc2              | GemmBatchedPacked { x: Va |    354.9 | 10285056 |     29.0 |     9.9%
+l22.fc2              | GemmBatchedPacked { x: Va |    354.8 | 10285056 |     29.0 |     9.9%
+l3.fc2               | GemmBatchedPacked { x: Va |    354.7 | 10285056 |     29.0 |     9.9%
+l0.fc2               | GemmBatchedPacked { x: Va |    354.4 | 10285056 |     29.0 |     9.9%
+l20.fc2              | GemmBatchedPacked { x: Va |    354.0 | 10285056 |     29.1 |     9.9%
+l2.fc2               | GemmBatchedPacked { x: Va |    353.8 | 10285056 |     29.1 |     9.9%
+l11.fc2              | GemmBatchedPacked { x: Va |    353.5 | 10285056 |     29.1 |     9.9%
+l4.fc2               | GemmBatchedPacked { x: Va |    353.2 | 10285056 |     29.1 |     9.9%
+l1.fc2               | GemmBatchedPacked { x: Va |    353.2 | 10285056 |     29.1 |     9.9%
+l4.fc1               | GemmBatchedPacked { x: Va |    306.7 |  9981952 |     32.5 |    11.1%
+l16.fc1              | GemmBatchedPacked { x: Va |    306.5 |  9981952 |     32.6 |    11.1%
+l22.fc1              | GemmBatchedPacked { x: Va |    306.1 |  9981952 |     32.6 |    11.1%
+l6.fc1               | GemmBatchedPacked { x: Va |    306.0 |  9981952 |     32.6 |    11.1%
+l13.fc1              | GemmBatchedPacked { x: Va |    306.0 |  9981952 |     32.6 |    11.1%
+l2.fc1               | GemmBatchedPacked { x: Va |    305.9 |  9981952 |     32.6 |    11.1%
+l20.fc1              | GemmBatchedPacked { x: Va |    305.5 |  9981952 |     32.7 |    11.2%
+l3.fc1               | GemmBatchedPacked { x: Va |    299.4 |  9981952 |     33.3 |    11.4%
+l21.fc1              | GemmBatchedPacked { x: Va |    298.0 |  9981952 |     33.5 |    11.4%
+l10.fc1              | GemmBatchedPacked { x: Va |    298.0 |  9981952 |     33.5 |    11.4%
+l7.fc1               | GemmBatchedPacked { x: Va |    297.7 |  9981952 |     33.5 |    11.5%
+l12.fc1              | GemmBatchedPacked { x: Va |    297.7 |  9981952 |     33.5 |    11.5%
+l9.fc1               | GemmBatchedPacked { x: Va |    297.6 |  9981952 |     33.5 |    11.5%
+l17.fc1              | GemmBatchedPacked { x: Va |    297.5 |  9981952 |     33.6 |    11.5%
+l18.fc1              | GemmBatchedPacked { x: Va |    297.1 |  9981952 |     33.6 |    11.5%
+l15.fc1              | GemmBatchedPacked { x: Va |    296.9 |  9981952 |     33.6 |    11.5%
+l19.fc1              | GemmBatchedPacked { x: Va |    296.8 |  9981952 |     33.6 |    11.5%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  ConvGemm                 66    746140     3.5    1.2%
+  Attention                32    326493     0.9    0.3%
+  GemmBatchedPacked       160     93849    21.3    7.3%
+  Copy                    124      9864   200.1   68.4%
+  Group                    61      3188   113.2   38.7%
+  Binary                   76      2743   340.5  116.3%
+  LayerNorm                48      1954   142.0   48.5%
+  Unary                    61      1695   376.2  128.5%
+down0.1.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |  55566.6 | 20971520 |      0.4 |     0.1%
+up3.2.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |  55433.8 | 20971520 |      0.4 |     0.1%
+up3.1.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |  55411.4 | 20971520 |      0.4 |     0.1%
+down0.0.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |  55364.7 | 20971520 |      0.4 |     0.1%
+up3.0.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |  55347.1 | 20971520 |      0.4 |     0.1%
+up1.upsample_conv.conv | Ext(Conv(ConvGemm { x: Va |  51852.8 | 69473280 |      1.3 |     0.5%
+up2.upsample_conv.conv | Ext(Conv(ConvGemm { x: Va |  49972.3 | 35719680 |      0.7 |     0.2%
+up2.0.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  41237.1 | 54725120 |      1.3 |     0.5%
+up3.0.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  40706.8 | 32032000 |      0.8 |     0.3%
+up1.1.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  32389.3 | 121902080 |      3.8 |     1.3%
+up1.0.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  31569.3 | 121902080 |      3.9 |     1.3%
+up2.1.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  28052.5 | 37358080 |      1.3 |     0.5%
+up3.2.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  26390.2 | 23102720 |      0.9 |     0.3%
+up3.1.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  26199.0 | 23102720 |      0.9 |     0.3%
+up1.2.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  23421.7 | 91755520 |      3.9 |     1.3%
+up2.2.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  20014.0 | 28674560 |      1.4 |     0.5%
+down2.1.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  16460.3 | 61608960 |      3.7 |     1.3%
+down1.1.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  16416.1 | 19991040 |      1.2 |     0.4%
+down1.0.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  16169.5 | 19991040 |      1.2 |     0.4%
+down2.0.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  15548.9 | 61608960 |      4.0 |     1.4%
+up0.upsample_conv.conv | Ext(Conv(ConvGemm { x: Va |  15458.8 | 61608960 |      4.0 |     1.4%
+up1.2.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  15398.6 | 61608960 |      4.0 |     1.4%
+up1.1.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  15349.4 | 61608960 |      4.0 |     1.4%
+up1.0.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  15346.2 | 61608960 |      4.0 |     1.4%
+down2.1.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  15145.5 | 61608960 |      4.1 |     1.4%
+up2.1.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  13846.3 | 19991040 |      1.4 |     0.5%
+down0.0.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  13642.9 | 14173440 |      1.0 |     0.4%
+down1.1.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  13603.8 | 19991040 |      1.5 |     0.5%
+down0.1.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  13538.1 | 14173440 |      1.0 |     0.4%
+up3.2.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  13320.9 | 14173440 |      1.1 |     0.4%
+up3.0.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  13285.8 | 14173440 |      1.1 |     0.4%
+down0.1.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  13174.3 | 14173440 |      1.1 |     0.4%
+down0.0.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  13157.4 | 14173440 |      1.1 |     0.4%
+up3.1.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  13124.7 | 14173440 |      1.1 |     0.4%
+up2.0.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  13063.0 | 19991040 |      1.5 |     0.5%
+up2.2.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  12919.4 | 19991040 |      1.5 |     0.5%
+down2.0.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |   8059.9 | 31462400 |      3.9 |     1.3%
+up2.1.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |   7032.5 | 10485760 |      1.5 |     0.5%
+down1.1.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |   7029.0 | 10485760 |      1.5 |     0.5%
+up2.2.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |   7028.8 | 10485760 |      1.5 |     0.5%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  ConvGemm                 36   4092564     1.2    0.4%
+  Attention                 1     71166     0.5    0.2%
+  Group                    30     49499    74.2   25.4%
+  Unary                    29     13137   278.4   95.1%
+  Upsample                  3      9996    54.5   18.6%
+  Binary                   15      8082   280.3   95.7%
+  GemmBatchedPacked         4      2987    23.2    7.9%
+  Copy                      2       256   130.9   44.7%
+up2.upconv.out       | Ext(Conv(ConvGemm { x: Va | 525597.7 | 539231232 |      1.0 |     0.4%
+up1.upconv.out       | Ext(Conv(ConvGemm { x: Va | 488635.4 | 277874688 |      0.6 |     0.2%
+up3.res0.conv1.out   | Ext(Conv(ConvGemm { x: Va | 257260.5 | 403833344 |      1.6 |     0.5%
+up2.res0.conv1.out   | Ext(Conv(ConvGemm { x: Va | 252297.0 | 206046208 |      0.8 |     0.3%
+up3.res1.conv1.out   | Ext(Conv(ConvGemm { x: Va | 130748.8 | 269025792 |      2.1 |     0.7%
+up3.res0.conv2.out   | Ext(Conv(ConvGemm { x: Va | 128337.0 | 269025792 |      2.1 |     0.7%
+up1.res2.conv1.out   | Ext(Conv(ConvGemm { x: Va | 126999.4 | 76548096 |      0.6 |     0.2%
+up1.res1.conv1.out   | Ext(Conv(ConvGemm { x: Va | 126243.9 | 76548096 |      0.6 |     0.2%
+up1.res0.conv1.out   | Ext(Conv(ConvGemm { x: Va | 125235.7 | 76548096 |      0.6 |     0.2%
+up1.res0.conv2.out   | Ext(Conv(ConvGemm { x: Va | 125122.6 | 76548096 |      0.6 |     0.2%
+up3.res1.conv2.out   | Ext(Conv(ConvGemm { x: Va | 125057.3 | 269025792 |      2.2 |     0.7%
+up1.res1.conv2.out   | Ext(Conv(ConvGemm { x: Va | 124344.8 | 76548096 |      0.6 |     0.2%
+up1.res2.conv2.out   | Ext(Conv(ConvGemm { x: Va | 124148.7 | 76548096 |      0.6 |     0.2%
+up0.upconv.out       | Ext(Conv(ConvGemm { x: Va | 123772.3 | 76548096 |      0.6 |     0.2%
+up2.res0.conv2.out   | Ext(Conv(ConvGemm { x: Va | 123412.4 | 136578048 |      1.1 |     0.4%
+up2.res1.conv1.out   | Ext(Conv(ConvGemm { x: Va | 123013.7 | 136578048 |      1.1 |     0.4%
+up2.res2.conv2.out   | Ext(Conv(ConvGemm { x: Va | 122147.8 | 136578048 |      1.1 |     0.4%
+up3.res2.conv1.out   | Ext(Conv(ConvGemm { x: Va | 122064.0 | 269025792 |      2.2 |     0.8%
+up3.res2.conv2.out   | Ext(Conv(ConvGemm { x: Va | 121722.3 | 269025792 |      2.2 |     0.8%
+up2.res2.conv1.out   | Ext(Conv(ConvGemm { x: Va | 121075.6 | 136578048 |      1.1 |     0.4%
+up2.res1.conv2.out   | Ext(Conv(ConvGemm { x: Va | 121054.0 | 136578048 |      1.1 |     0.4%
+mid.attn.attn        | Ext(Attn(Attention { q: V |  71166.5 | 33554432 |      0.5 |     0.2%
+tail.conv_out.out    | Ext(Conv(ConvGemm { x: Va |  58414.0 | 137377292 |      2.4 |     0.8%
+mid.res0.conv1.out   | Ext(Conv(ConvGemm { x: Va |  34954.2 | 26216448 |      0.8 |     0.3%
+mid.res1.conv2.out   | Ext(Conv(ConvGemm { x: Va |  34624.7 | 26216448 |      0.8 |     0.3%
+up0.res2.conv2.out   | Ext(Conv(ConvGemm { x: Va |  34436.0 | 26216448 |      0.8 |     0.3%
+up0.res0.conv2.out   | Ext(Conv(ConvGemm { x: Va |  34118.7 | 26216448 |      0.8 |     0.3%
+up0.res0.conv1.out   | Ext(Conv(ConvGemm { x: Va |  33510.6 | 26216448 |      0.8 |     0.3%
+mid.res1.conv1.out   | Ext(Conv(ConvGemm { x: Va |  33375.8 | 26216448 |      0.8 |     0.3%
+up0.res2.conv1.out   | Ext(Conv(ConvGemm { x: Va |  33334.0 | 26216448 |      0.8 |     0.3%
+mid.res0.conv2.out   | Ext(Conv(ConvGemm { x: Va |  33171.5 | 26216448 |      0.8 |     0.3%
+up0.res1.conv1.out   | Ext(Conv(ConvGemm { x: Va |  33017.3 | 26216448 |      0.8 |     0.3%
+up0.res1.conv2.out   | Ext(Conv(ConvGemm { x: Va |  32965.3 | 26216448 |      0.8 |     0.3%
+up3.res0.shortcut.out | Ext(Conv(ConvGemm { x: Va |  30043.8 | 402784768 |     13.4 |     4.6%
+up2.res0.shortcut.out | Ext(Conv(ConvGemm { x: Va |  27759.9 | 201851904 |      7.3 |     2.5%
+up3.res0.norm1.gn    | Ext(Norm(Group { x: Value |   7393.3 | 536872960 |     72.6 |    24.8%
+up2.upsample         | Ext(Movement(Upsample { x |   6149.5 | 335544320 |     54.6 |    18.6%
+up3.res0.norm2.gn    | Ext(Norm(Group { x: Value |   3729.8 | 268436480 |     72.0 |    24.6%
+up3.res1.norm1.gn    | Ext(Norm(Group { x: Value |   3709.2 | 268436480 |     72.4 |    24.7%
+up3.res1.norm2.gn    | Ext(Norm(Group { x: Value |   3698.7 | 268436480 |     72.6 |    24.8%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  GemmBatchedPacked       138     23439    30.9   10.6%
+  Attention                23      1051    27.6    9.4%
+  LayerNorm                47       256   117.2   40.0%
+  Embed                     2         6 17607.5 6015.1%
+  Binary                    1         4   222.6   76.1%
+  Gather                    1         3   123.7   42.2%
+l16.fc2              | GemmBatchedPacked { x: Va |    357.1 | 10285056 |     28.8 |     9.8%
+l3.fc2               | GemmBatchedPacked { x: Va |    357.0 | 10285056 |     28.8 |     9.8%
+l5.fc2               | GemmBatchedPacked { x: Va |    357.0 | 10285056 |     28.8 |     9.8%
+l11.fc2              | GemmBatchedPacked { x: Va |    356.9 | 10285056 |     28.8 |     9.8%
+l12.fc2              | GemmBatchedPacked { x: Va |    356.8 | 10285056 |     28.8 |     9.8%
+l13.fc2              | GemmBatchedPacked { x: Va |    356.5 | 10285056 |     28.9 |     9.9%
+l14.fc2              | GemmBatchedPacked { x: Va |    356.5 | 10285056 |     28.9 |     9.9%
+l9.fc2               | GemmBatchedPacked { x: Va |    356.0 | 10285056 |     28.9 |     9.9%
+l8.fc2               | GemmBatchedPacked { x: Va |    355.5 | 10285056 |     28.9 |     9.9%
+l17.fc2              | GemmBatchedPacked { x: Va |    355.5 | 10285056 |     28.9 |     9.9%
+l21.fc2              | GemmBatchedPacked { x: Va |    355.5 | 10285056 |     28.9 |     9.9%
+l10.fc2              | GemmBatchedPacked { x: Va |    355.5 | 10285056 |     28.9 |     9.9%
+l1.fc2               | GemmBatchedPacked { x: Va |    355.4 | 10285056 |     28.9 |     9.9%
+l15.fc2              | GemmBatchedPacked { x: Va |    355.2 | 10285056 |     29.0 |     9.9%
+l18.fc2              | GemmBatchedPacked { x: Va |    354.8 | 10285056 |     29.0 |     9.9%
+l19.fc2              | GemmBatchedPacked { x: Va |    354.8 | 10285056 |     29.0 |     9.9%
+l6.fc2               | GemmBatchedPacked { x: Va |    354.8 | 10285056 |     29.0 |     9.9%
+l2.fc2               | GemmBatchedPacked { x: Va |    354.7 | 10285056 |     29.0 |     9.9%
+l22.fc2              | GemmBatchedPacked { x: Va |    354.2 | 10285056 |     29.0 |     9.9%
+l0.fc2               | GemmBatchedPacked { x: Va |    354.1 | 10285056 |     29.0 |     9.9%
+l7.fc2               | GemmBatchedPacked { x: Va |    353.9 | 10285056 |     29.1 |     9.9%
+l4.fc2               | GemmBatchedPacked { x: Va |    353.8 | 10285056 |     29.1 |     9.9%
+l20.fc2              | GemmBatchedPacked { x: Va |    353.8 | 10285056 |     29.1 |     9.9%
+l0.fc1               | GemmBatchedPacked { x: Va |    306.9 |  9981952 |     32.5 |    11.1%
+l11.fc1              | GemmBatchedPacked { x: Va |    306.3 |  9981952 |     32.6 |    11.1%
+l4.fc1               | GemmBatchedPacked { x: Va |    306.1 |  9981952 |     32.6 |    11.1%
+l13.fc1              | GemmBatchedPacked { x: Va |    305.5 |  9981952 |     32.7 |    11.2%
+l12.fc1              | GemmBatchedPacked { x: Va |    305.4 |  9981952 |     32.7 |    11.2%
+l16.fc1              | GemmBatchedPacked { x: Va |    305.1 |  9981952 |     32.7 |    11.2%
+l19.fc1              | GemmBatchedPacked { x: Va |    298.6 |  9981952 |     33.4 |    11.4%
+l14.fc1              | GemmBatchedPacked { x: Va |    298.3 |  9981952 |     33.5 |    11.4%
+l10.fc1              | GemmBatchedPacked { x: Va |    298.1 |  9981952 |     33.5 |    11.4%
+l17.fc1              | GemmBatchedPacked { x: Va |    298.0 |  9981952 |     33.5 |    11.4%
+l1.fc1               | GemmBatchedPacked { x: Va |    297.8 |  9981952 |     33.5 |    11.5%
+l2.fc1               | GemmBatchedPacked { x: Va |    297.8 |  9981952 |     33.5 |    11.5%
+l15.fc1              | GemmBatchedPacked { x: Va |    297.4 |  9981952 |     33.6 |    11.5%
+l18.fc1              | GemmBatchedPacked { x: Va |    297.0 |  9981952 |     33.6 |    11.5%
+l6.fc1               | GemmBatchedPacked { x: Va |    296.4 |  9981952 |     33.7 |    11.5%
+l20.fc1              | GemmBatchedPacked { x: Va |    295.9 |  9981952 |     33.7 |    11.5%
+l21.fc1              | GemmBatchedPacked { x: Va |    295.8 |  9981952 |     33.7 |    11.5%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  ConvGemm                 66    739405     3.6    1.2%
+  Attention                32    326105     0.9    0.3%
+  GemmBatchedPacked       160     93813    21.3    7.3%
+  Copy                    124      9870   200.0   68.3%
+  Group                    61      3186   113.3   38.7%
+  Binary                   76      2741   340.7  116.4%
+  LayerNorm                48      1954   142.0   48.5%
+  Unary                    61      1691   377.0  128.8%
+up3.2.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |  55478.2 | 20971520 |      0.4 |     0.1%
+up3.0.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |  55454.2 | 20971520 |      0.4 |     0.1%
+down0.1.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |  55300.2 | 20971520 |      0.4 |     0.1%
+down0.0.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |  55277.0 | 20971520 |      0.4 |     0.1%
+up3.1.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |  55232.8 | 20971520 |      0.4 |     0.1%
+up1.upsample_conv.conv | Ext(Conv(ConvGemm { x: Va |  52982.2 | 69473280 |      1.3 |     0.4%
+up2.upsample_conv.conv | Ext(Conv(ConvGemm { x: Va |  50641.4 | 35719680 |      0.7 |     0.2%
+up2.0.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  40917.4 | 54725120 |      1.3 |     0.5%
+up3.0.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  39855.8 | 32032000 |      0.8 |     0.3%
+up1.1.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  31322.8 | 121902080 |      3.9 |     1.3%
+up1.0.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  30519.5 | 121902080 |      4.0 |     1.4%
+up2.1.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  26868.1 | 37358080 |      1.4 |     0.5%
+up3.2.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  26821.2 | 23102720 |      0.9 |     0.3%
+up3.1.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  26105.8 | 23102720 |      0.9 |     0.3%
+up1.2.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  23115.1 | 91755520 |      4.0 |     1.4%
+up2.2.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  20992.0 | 28674560 |      1.4 |     0.5%
+up0.upsample_conv.conv | Ext(Conv(ConvGemm { x: Va |  17145.2 | 61608960 |      3.6 |     1.2%
+up1.0.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  16167.9 | 61608960 |      3.8 |     1.3%
+down2.1.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  15732.4 | 61608960 |      3.9 |     1.3%
+up1.2.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  15727.8 | 61608960 |      3.9 |     1.3%
+up1.1.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  15494.8 | 61608960 |      4.0 |     1.4%
+down2.0.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  15440.8 | 61608960 |      4.0 |     1.4%
+down2.1.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  15375.3 | 61608960 |      4.0 |     1.4%
+up3.0.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  13493.2 | 14173440 |      1.1 |     0.4%
+down0.0.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  13276.6 | 14173440 |      1.1 |     0.4%
+down1.1.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  13272.0 | 19991040 |      1.5 |     0.5%
+down0.1.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  13267.8 | 14173440 |      1.1 |     0.4%
+up3.2.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  13264.8 | 14173440 |      1.1 |     0.4%
+down0.0.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  13242.2 | 14173440 |      1.1 |     0.4%
+up3.1.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  13201.6 | 14173440 |      1.1 |     0.4%
+up2.1.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  13192.3 | 19991040 |      1.5 |     0.5%
+down0.1.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  13172.7 | 14173440 |      1.1 |     0.4%
+up2.2.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  13095.7 | 19991040 |      1.5 |     0.5%
+down1.1.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  13089.2 | 19991040 |      1.5 |     0.5%
+up2.0.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  13001.2 | 19991040 |      1.5 |     0.5%
+down1.0.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  12960.9 | 19991040 |      1.5 |     0.5%
+down2.0.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |   8137.0 | 31462400 |      3.9 |     1.3%
+down1.1.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |   7059.9 | 10485760 |      1.5 |     0.5%
+up2.0.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |   7032.9 | 10485760 |      1.5 |     0.5%
+up2.1.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |   7032.2 | 10485760 |      1.5 |     0.5%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  ConvGemm                 66    736706     3.6    1.2%
+  Attention                32    325773     0.9    0.3%
+  GemmBatchedPacked       160     93853    21.3    7.3%
+  Copy                    124      9870   200.0   68.3%
+  Group                    61      3190   113.1   38.6%
+  Binary                   76      2730   342.1  116.9%
+  LayerNorm                48      1956   141.9   48.5%
+  Unary                    61      1695   376.2  128.5%
+up3.0.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |  55349.8 | 20971520 |      0.4 |     0.1%
+down0.1.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |  55319.5 | 20971520 |      0.4 |     0.1%
+up3.2.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |  55305.1 | 20971520 |      0.4 |     0.1%
+up3.1.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |  55270.2 | 20971520 |      0.4 |     0.1%
+down0.0.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |  55234.5 | 20971520 |      0.4 |     0.1%
+up1.upsample_conv.conv | Ext(Conv(ConvGemm { x: Va |  52418.7 | 69473280 |      1.3 |     0.5%
+up2.upsample_conv.conv | Ext(Conv(ConvGemm { x: Va |  49455.4 | 35719680 |      0.7 |     0.2%
+up2.0.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  40637.3 | 54725120 |      1.3 |     0.5%
+up3.0.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  39229.9 | 32032000 |      0.8 |     0.3%
+up1.1.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  31419.2 | 121902080 |      3.9 |     1.3%
+up1.0.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  31377.4 | 121902080 |      3.9 |     1.3%
+up2.1.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  27366.7 | 37358080 |      1.4 |     0.5%
+up3.2.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  26618.2 | 23102720 |      0.9 |     0.3%
+up3.1.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  26354.3 | 23102720 |      0.9 |     0.3%
+up1.2.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  22904.1 | 91755520 |      4.0 |     1.4%
+up2.2.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  20714.8 | 28674560 |      1.4 |     0.5%
+down2.1.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  16569.3 | 61608960 |      3.7 |     1.3%
+down2.0.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  16057.4 | 61608960 |      3.8 |     1.3%
+up1.1.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  15805.8 | 61608960 |      3.9 |     1.3%
+up0.upsample_conv.conv | Ext(Conv(ConvGemm { x: Va |  15598.0 | 61608960 |      3.9 |     1.3%
+up1.0.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  15425.1 | 61608960 |      4.0 |     1.4%
+down2.1.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  15396.4 | 61608960 |      4.0 |     1.4%
+up1.2.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  15351.1 | 61608960 |      4.0 |     1.4%
+down1.1.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  14052.6 | 19991040 |      1.4 |     0.5%
+up3.2.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  13481.4 | 14173440 |      1.1 |     0.4%
+down0.0.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  13392.7 | 14173440 |      1.1 |     0.4%
+down0.1.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  13337.0 | 14173440 |      1.1 |     0.4%
+up3.1.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  13270.3 | 14173440 |      1.1 |     0.4%
+up2.0.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  13192.2 | 19991040 |      1.5 |     0.5%
+down1.0.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  13191.5 | 19991040 |      1.5 |     0.5%
+down0.0.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  13148.0 | 14173440 |      1.1 |     0.4%
+up2.1.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  13139.0 | 19991040 |      1.5 |     0.5%
+down0.1.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  13109.5 | 14173440 |      1.1 |     0.4%
+up3.0.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  13027.6 | 14173440 |      1.1 |     0.4%
+down1.1.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  12976.5 | 19991040 |      1.5 |     0.5%
+up2.2.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  12909.4 | 19991040 |      1.5 |     0.5%
+down2.0.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |   7656.2 | 31462400 |      4.1 |     1.4%
+down1.1.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |   7030.8 | 10485760 |      1.5 |     0.5%
+down1.0.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |   7028.4 | 10485760 |      1.5 |     0.5%
+up2.2.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |   7026.0 | 10485760 |      1.5 |     0.5%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  ConvGemm                 66    738393     3.6    1.2%
+  Attention                32    326157     0.9    0.3%
+  GemmBatchedPacked       160     93838    21.3    7.3%
+  Copy                    124      9868   200.0   68.3%
+  Group                    61      3180   113.5   38.8%
+  Binary                   76      2761   338.3  115.6%
+  LayerNorm                48      1955   141.9   48.5%
+  Unary                    61      1703   374.5  127.9%
+down0.1.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |  55498.4 | 20971520 |      0.4 |     0.1%
+up3.0.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |  55461.7 | 20971520 |      0.4 |     0.1%
+down0.0.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |  55432.7 | 20971520 |      0.4 |     0.1%
+up3.1.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |  55245.5 | 20971520 |      0.4 |     0.1%
+up3.2.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |  55215.3 | 20971520 |      0.4 |     0.1%
+up1.upsample_conv.conv | Ext(Conv(ConvGemm { x: Va |  52027.2 | 69473280 |      1.3 |     0.5%
+up2.upsample_conv.conv | Ext(Conv(ConvGemm { x: Va |  49772.3 | 35719680 |      0.7 |     0.2%
+up2.0.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  39993.6 | 54725120 |      1.4 |     0.5%
+up3.0.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  39151.0 | 32032000 |      0.8 |     0.3%
+up1.1.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  32547.8 | 121902080 |      3.7 |     1.3%
+up1.0.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  31451.8 | 121902080 |      3.9 |     1.3%
+up3.1.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  26720.0 | 23102720 |      0.9 |     0.3%
+up3.2.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  26305.9 | 23102720 |      0.9 |     0.3%
+up2.1.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  25953.8 | 37358080 |      1.4 |     0.5%
+up1.2.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  23721.9 | 91755520 |      3.9 |     1.3%
+up2.2.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  21470.2 | 28674560 |      1.3 |     0.5%
+up1.1.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  16348.2 | 61608960 |      3.8 |     1.3%
+up1.0.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  15570.2 | 61608960 |      4.0 |     1.4%
+down2.1.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  15553.8 | 61608960 |      4.0 |     1.4%
+down2.1.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  15442.8 | 61608960 |      4.0 |     1.4%
+down2.0.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  15435.8 | 61608960 |      4.0 |     1.4%
+up0.upsample_conv.conv | Ext(Conv(ConvGemm { x: Va |  15401.5 | 61608960 |      4.0 |     1.4%
+up1.2.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  15194.2 | 61608960 |      4.1 |     1.4%
+down0.0.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  13924.0 | 14173440 |      1.0 |     0.3%
+up2.0.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  13833.2 | 19991040 |      1.4 |     0.5%
+up2.1.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  13477.8 | 19991040 |      1.5 |     0.5%
+up2.2.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  13474.4 | 19991040 |      1.5 |     0.5%
+down1.0.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  13397.5 | 19991040 |      1.5 |     0.5%
+down0.1.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  13336.4 | 14173440 |      1.1 |     0.4%
+down0.1.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  13299.7 | 14173440 |      1.1 |     0.4%
+up3.1.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  13231.9 | 14173440 |      1.1 |     0.4%
+down1.1.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  13187.0 | 19991040 |      1.5 |     0.5%
+up3.2.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  13147.4 | 14173440 |      1.1 |     0.4%
+down1.1.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  13108.9 | 19991040 |      1.5 |     0.5%
+down0.0.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  13099.8 | 14173440 |      1.1 |     0.4%
+up3.0.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  13027.9 | 14173440 |      1.1 |     0.4%
+down2.0.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |   8194.1 | 31462400 |      3.8 |     1.3%
+down1.1.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |   7044.0 | 10485760 |      1.5 |     0.5%
+up2.0.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |   7039.7 | 10485760 |      1.5 |     0.5%
+down1.0.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |   7029.3 | 10485760 |      1.5 |     0.5%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  ConvGemm                 66    745731     3.5    1.2%
+  Attention                32    326081     0.9    0.3%
+  GemmBatchedPacked       160     93854    21.3    7.3%
+  Copy                    124      9869   200.0   68.3%
+  Group                    61      3185   113.3   38.7%
+  Binary                   76      2739   341.0  116.5%
+  LayerNorm                48      1954   142.0   48.5%
+  Unary                    61      1692   376.9  128.7%
+up3.2.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |  55533.7 | 20971520 |      0.4 |     0.1%
+up3.1.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |  55392.4 | 20971520 |      0.4 |     0.1%
+down0.1.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |  55391.0 | 20971520 |      0.4 |     0.1%
+down0.0.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |  55274.9 | 20971520 |      0.4 |     0.1%
+up1.upsample_conv.conv | Ext(Conv(ConvGemm { x: Va |  55239.0 | 69473280 |      1.3 |     0.4%
+up3.0.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |  55227.8 | 20971520 |      0.4 |     0.1%
+up2.upsample_conv.conv | Ext(Conv(ConvGemm { x: Va |  49698.8 | 35719680 |      0.7 |     0.2%
+up2.0.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  43610.7 | 54725120 |      1.3 |     0.4%
+up3.0.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  39393.4 | 32032000 |      0.8 |     0.3%
+up1.0.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  31651.9 | 121902080 |      3.9 |     1.3%
+up1.1.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  31618.7 | 121902080 |      3.9 |     1.3%
+up3.1.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  26754.6 | 23102720 |      0.9 |     0.3%
+up2.1.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  26711.7 | 37358080 |      1.4 |     0.5%
+up3.2.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  26133.0 | 23102720 |      0.9 |     0.3%
+up1.2.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  22990.7 | 91755520 |      4.0 |     1.4%
+up2.2.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  19869.5 | 28674560 |      1.4 |     0.5%
+down1.1.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  16323.9 | 19991040 |      1.2 |     0.4%
+down2.0.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  15864.7 | 61608960 |      3.9 |     1.3%
+up1.2.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  15579.9 | 61608960 |      4.0 |     1.4%
+up0.upsample_conv.conv | Ext(Conv(ConvGemm { x: Va |  15556.6 | 61608960 |      4.0 |     1.4%
+down2.1.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  15477.2 | 61608960 |      4.0 |     1.4%
+down2.1.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  15438.5 | 61608960 |      4.0 |     1.4%
+up1.0.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  15293.0 | 61608960 |      4.0 |     1.4%
+up1.1.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  15285.4 | 61608960 |      4.0 |     1.4%
+down1.0.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  14000.3 | 19991040 |      1.4 |     0.5%
+up2.2.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  13592.7 | 19991040 |      1.5 |     0.5%
+down1.1.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  13510.1 | 19991040 |      1.5 |     0.5%
+down0.0.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  13479.1 | 14173440 |      1.1 |     0.4%
+up2.0.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  13473.3 | 19991040 |      1.5 |     0.5%
+down0.0.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  13401.8 | 14173440 |      1.1 |     0.4%
+down0.1.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  13375.7 | 14173440 |      1.1 |     0.4%
+up3.0.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  13296.2 | 14173440 |      1.1 |     0.4%
+down0.1.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  13232.5 | 14173440 |      1.1 |     0.4%
+up3.2.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  13217.7 | 14173440 |      1.1 |     0.4%
+up3.1.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  13141.6 | 14173440 |      1.1 |     0.4%
+up2.1.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  12933.8 | 19991040 |      1.5 |     0.5%
+down2.0.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |   8186.5 | 31462400 |      3.8 |     1.3%
+down1.0.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |   7039.5 | 10485760 |      1.5 |     0.5%
+up2.1.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |   7034.3 | 10485760 |      1.5 |     0.5%
+up2.2.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |   6996.5 | 10485760 |      1.5 |     0.5%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  ConvGemm                 36   4006547     1.2    0.4%
+  Attention                 1     70359     0.5    0.2%
+  Group                    30     49207    74.7   25.5%
+  Unary                    29     13095   279.3   95.4%
+  Upsample                  3      9996    54.6   18.6%
+  Binary                   15      8015   282.6   96.5%
+  GemmBatchedPacked         4      2990    23.1    7.9%
+  Copy                      2       257   130.8   44.7%
+up1.upconv.out       | Ext(Conv(ConvGemm { x: Va | 491824.0 | 277874688 |      0.6 |     0.2%
+up2.upconv.out       | Ext(Conv(ConvGemm { x: Va | 480000.6 | 539231232 |      1.1 |     0.4%
+up2.res0.conv1.out   | Ext(Conv(ConvGemm { x: Va | 247246.5 | 206046208 |      0.8 |     0.3%
+up3.res0.conv1.out   | Ext(Conv(ConvGemm { x: Va | 244239.5 | 403833344 |      1.7 |     0.6%
+up0.upconv.out       | Ext(Conv(ConvGemm { x: Va | 126140.7 | 76548096 |      0.6 |     0.2%
+up1.res1.conv2.out   | Ext(Conv(ConvGemm { x: Va | 125062.7 | 76548096 |      0.6 |     0.2%
+up1.res0.conv2.out   | Ext(Conv(ConvGemm { x: Va | 124929.4 | 76548096 |      0.6 |     0.2%
+up1.res2.conv1.out   | Ext(Conv(ConvGemm { x: Va | 124880.4 | 76548096 |      0.6 |     0.2%
+up1.res1.conv1.out   | Ext(Conv(ConvGemm { x: Va | 124476.1 | 76548096 |      0.6 |     0.2%
+up1.res0.conv1.out   | Ext(Conv(ConvGemm { x: Va | 123802.8 | 76548096 |      0.6 |     0.2%
+up1.res2.conv2.out   | Ext(Conv(ConvGemm { x: Va | 123311.0 | 76548096 |      0.6 |     0.2%
+up2.res1.conv1.out   | Ext(Conv(ConvGemm { x: Va | 123263.0 | 136578048 |      1.1 |     0.4%
+up2.res0.conv2.out   | Ext(Conv(ConvGemm { x: Va | 122978.6 | 136578048 |      1.1 |     0.4%
+up2.res1.conv2.out   | Ext(Conv(ConvGemm { x: Va | 122834.0 | 136578048 |      1.1 |     0.4%
+up2.res2.conv1.out   | Ext(Conv(ConvGemm { x: Va | 122417.5 | 136578048 |      1.1 |     0.4%
+up2.res2.conv2.out   | Ext(Conv(ConvGemm { x: Va | 122263.3 | 136578048 |      1.1 |     0.4%
+up3.res1.conv2.out   | Ext(Conv(ConvGemm { x: Va | 122247.2 | 269025792 |      2.2 |     0.8%
+up3.res0.conv2.out   | Ext(Conv(ConvGemm { x: Va | 121943.4 | 269025792 |      2.2 |     0.8%
+up3.res1.conv1.out   | Ext(Conv(ConvGemm { x: Va | 121622.4 | 269025792 |      2.2 |     0.8%
+up3.res2.conv2.out   | Ext(Conv(ConvGemm { x: Va | 121464.8 | 269025792 |      2.2 |     0.8%
+up3.res2.conv1.out   | Ext(Conv(ConvGemm { x: Va | 121332.8 | 269025792 |      2.2 |     0.8%
+mid.attn.attn        | Ext(Attn(Attention { q: V |  70358.6 | 33554432 |      0.5 |     0.2%
+tail.conv_out.out    | Ext(Conv(ConvGemm { x: Va |  58184.7 | 137377292 |      2.4 |     0.8%
+mid.res0.conv2.out   | Ext(Conv(ConvGemm { x: Va |  33840.4 | 26216448 |      0.8 |     0.3%
+mid.res0.conv1.out   | Ext(Conv(ConvGemm { x: Va |  33794.0 | 26216448 |      0.8 |     0.3%
+up0.res2.conv2.out   | Ext(Conv(ConvGemm { x: Va |  33644.8 | 26216448 |      0.8 |     0.3%
+up0.res1.conv1.out   | Ext(Conv(ConvGemm { x: Va |  33577.1 | 26216448 |      0.8 |     0.3%
+mid.res1.conv1.out   | Ext(Conv(ConvGemm { x: Va |  33555.9 | 26216448 |      0.8 |     0.3%
+mid.res1.conv2.out   | Ext(Conv(ConvGemm { x: Va |  33455.5 | 26216448 |      0.8 |     0.3%
+up0.res2.conv1.out   | Ext(Conv(ConvGemm { x: Va |  33374.5 | 26216448 |      0.8 |     0.3%
+up0.res1.conv2.out   | Ext(Conv(ConvGemm { x: Va |  33370.2 | 26216448 |      0.8 |     0.3%
+up0.res0.conv2.out   | Ext(Conv(ConvGemm { x: Va |  33315.1 | 26216448 |      0.8 |     0.3%
+up0.res0.conv1.out   | Ext(Conv(ConvGemm { x: Va |  32926.8 | 26216448 |      0.8 |     0.3%
+up2.res0.shortcut.out | Ext(Conv(ConvGemm { x: Va |  27483.5 | 201851904 |      7.3 |     2.5%
+up3.res0.shortcut.out | Ext(Conv(ConvGemm { x: Va |  27202.4 | 402784768 |     14.8 |     5.1%
+up3.res0.norm1.gn    | Ext(Norm(Group { x: Value |   7312.6 | 536872960 |     73.4 |    25.1%
+up2.upsample         | Ext(Movement(Upsample { x |   6148.9 | 335544320 |     54.6 |    18.6%
+up3.res1.norm1.gn    | Ext(Norm(Group { x: Value |   3671.3 | 268436480 |     73.1 |    25.0%
+up2.res0.norm1.gn    | Ext(Norm(Group { x: Value |   3669.9 | 268439552 |     73.1 |    25.0%
+tail.norm_out.gn     | Ext(Norm(Group { x: Value |   3662.7 | 268436480 |     73.3 |    25.0%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  GemmBatchedPacked       138     23472    30.9   10.5%
+  Attention                23      1051    27.6    9.4%
+  LayerNorm                47       257   116.7   39.9%
+  Embed                     2         6 16763.1 5726.7%
+  Binary                    1         4   222.6   76.1%
+  Gather                    1         3   112.8   38.5%
+l18.fc2              | GemmBatchedPacked { x: Va |    357.3 | 10285056 |     28.8 |     9.8%
+l4.fc2               | GemmBatchedPacked { x: Va |    356.9 | 10285056 |     28.8 |     9.8%
+l10.fc2              | GemmBatchedPacked { x: Va |    356.7 | 10285056 |     28.8 |     9.9%
+l21.fc2              | GemmBatchedPacked { x: Va |    356.7 | 10285056 |     28.8 |     9.9%
+l3.fc2               | GemmBatchedPacked { x: Va |    356.5 | 10285056 |     28.9 |     9.9%
+l11.fc2              | GemmBatchedPacked { x: Va |    356.3 | 10285056 |     28.9 |     9.9%
+l13.fc2              | GemmBatchedPacked { x: Va |    356.1 | 10285056 |     28.9 |     9.9%
+l17.fc2              | GemmBatchedPacked { x: Va |    355.9 | 10285056 |     28.9 |     9.9%
+l22.fc2              | GemmBatchedPacked { x: Va |    355.9 | 10285056 |     28.9 |     9.9%
+l2.fc2               | GemmBatchedPacked { x: Va |    355.8 | 10285056 |     28.9 |     9.9%
+l15.fc2              | GemmBatchedPacked { x: Va |    355.4 | 10285056 |     28.9 |     9.9%
+l7.fc2               | GemmBatchedPacked { x: Va |    355.4 | 10285056 |     28.9 |     9.9%
+l1.fc2               | GemmBatchedPacked { x: Va |    355.3 | 10285056 |     28.9 |     9.9%
+l16.fc2              | GemmBatchedPacked { x: Va |    355.3 | 10285056 |     28.9 |     9.9%
+l14.fc2              | GemmBatchedPacked { x: Va |    355.3 | 10285056 |     29.0 |     9.9%
+l0.fc2               | GemmBatchedPacked { x: Va |    355.2 | 10285056 |     29.0 |     9.9%
+l9.fc2               | GemmBatchedPacked { x: Va |    355.2 | 10285056 |     29.0 |     9.9%
+l8.fc2               | GemmBatchedPacked { x: Va |    355.1 | 10285056 |     29.0 |     9.9%
+l12.fc2              | GemmBatchedPacked { x: Va |    355.1 | 10285056 |     29.0 |     9.9%
+l5.fc2               | GemmBatchedPacked { x: Va |    355.0 | 10285056 |     29.0 |     9.9%
+l6.fc2               | GemmBatchedPacked { x: Va |    355.0 | 10285056 |     29.0 |     9.9%
+l19.fc2              | GemmBatchedPacked { x: Va |    354.1 | 10285056 |     29.0 |     9.9%
+l20.fc2              | GemmBatchedPacked { x: Va |    354.1 | 10285056 |     29.0 |     9.9%
+l2.fc1               | GemmBatchedPacked { x: Va |    306.7 |  9981952 |     32.5 |    11.1%
+l5.fc1               | GemmBatchedPacked { x: Va |    306.7 |  9981952 |     32.5 |    11.1%
+l13.fc1              | GemmBatchedPacked { x: Va |    306.3 |  9981952 |     32.6 |    11.1%
+l7.fc1               | GemmBatchedPacked { x: Va |    306.2 |  9981952 |     32.6 |    11.1%
+l12.fc1              | GemmBatchedPacked { x: Va |    305.6 |  9981952 |     32.7 |    11.2%
+l10.fc1              | GemmBatchedPacked { x: Va |    305.4 |  9981952 |     32.7 |    11.2%
+l18.fc1              | GemmBatchedPacked { x: Va |    305.4 |  9981952 |     32.7 |    11.2%
+l9.fc1               | GemmBatchedPacked { x: Va |    304.2 |  9981952 |     32.8 |    11.2%
+l6.fc1               | GemmBatchedPacked { x: Va |    303.8 |  9981952 |     32.9 |    11.2%
+l21.fc1              | GemmBatchedPacked { x: Va |    298.7 |  9981952 |     33.4 |    11.4%
+l3.fc1               | GemmBatchedPacked { x: Va |    298.3 |  9981952 |     33.5 |    11.4%
+l22.fc1              | GemmBatchedPacked { x: Va |    298.0 |  9981952 |     33.5 |    11.4%
+l1.fc1               | GemmBatchedPacked { x: Va |    297.9 |  9981952 |     33.5 |    11.4%
+l17.fc1              | GemmBatchedPacked { x: Va |    297.9 |  9981952 |     33.5 |    11.4%
+l15.fc1              | GemmBatchedPacked { x: Va |    297.7 |  9981952 |     33.5 |    11.5%
+l14.fc1              | GemmBatchedPacked { x: Va |    297.6 |  9981952 |     33.5 |    11.5%
+l16.fc1              | GemmBatchedPacked { x: Va |    297.5 |  9981952 |     33.6 |    11.5%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  ConvGemm                 66    743533     3.5    1.2%
+  Attention                32    326331     0.9    0.3%
+  GemmBatchedPacked       160     93876    21.3    7.3%
+  Copy                    124      9869   200.0   68.3%
+  Group                    61      3183   113.4   38.7%
+  Binary                   76      2751   339.5  116.0%
+  LayerNorm                48      1953   142.1   48.5%
+  Unary                    61      1695   376.2  128.5%
+up3.0.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |  55542.6 | 20971520 |      0.4 |     0.1%
+down0.0.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |  55503.0 | 20971520 |      0.4 |     0.1%
+up3.2.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |  55439.9 | 20971520 |      0.4 |     0.1%
+down0.1.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |  55364.1 | 20971520 |      0.4 |     0.1%
+up3.1.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |  55247.1 | 20971520 |      0.4 |     0.1%
+up1.upsample_conv.conv | Ext(Conv(ConvGemm { x: Va |  52614.6 | 69473280 |      1.3 |     0.5%
+up2.upsample_conv.conv | Ext(Conv(ConvGemm { x: Va |  49488.6 | 35719680 |      0.7 |     0.2%
+up2.0.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  42758.2 | 54725120 |      1.3 |     0.4%
+up3.0.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  40449.1 | 32032000 |      0.8 |     0.3%
+up1.0.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  31413.9 | 121902080 |      3.9 |     1.3%
+up1.1.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  30629.0 | 121902080 |      4.0 |     1.4%
+up2.1.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  27581.5 | 37358080 |      1.4 |     0.5%
+up3.1.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  27223.4 | 23102720 |      0.8 |     0.3%
+up3.2.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  26304.8 | 23102720 |      0.9 |     0.3%
+up1.2.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  23495.2 | 91755520 |      3.9 |     1.3%
+up2.2.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  19926.1 | 28674560 |      1.4 |     0.5%
+up2.0.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  16654.0 | 19991040 |      1.2 |     0.4%
+down2.0.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  15665.5 | 61608960 |      3.9 |     1.3%
+up1.1.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  15555.8 | 61608960 |      4.0 |     1.4%
+up1.2.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  15465.4 | 61608960 |      4.0 |     1.4%
+up1.0.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  15458.0 | 61608960 |      4.0 |     1.4%
+down2.1.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  15454.7 | 61608960 |      4.0 |     1.4%
+down2.1.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  15411.9 | 61608960 |      4.0 |     1.4%
+up0.upsample_conv.conv | Ext(Conv(ConvGemm { x: Va |  15344.8 | 61608960 |      4.0 |     1.4%
+down1.1.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  13845.9 | 19991040 |      1.4 |     0.5%
+up2.2.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  13506.6 | 19991040 |      1.5 |     0.5%
+down1.1.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  13435.0 | 19991040 |      1.5 |     0.5%
+up3.0.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  13417.3 | 14173440 |      1.1 |     0.4%
+down0.0.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  13345.1 | 14173440 |      1.1 |     0.4%
+down0.1.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  13284.3 | 14173440 |      1.1 |     0.4%
+up2.1.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  13221.9 | 19991040 |      1.5 |     0.5%
+down0.0.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  13221.5 | 14173440 |      1.1 |     0.4%
+down0.1.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  13191.1 | 14173440 |      1.1 |     0.4%
+up3.1.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  13152.4 | 14173440 |      1.1 |     0.4%
+up3.2.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  12980.8 | 14173440 |      1.1 |     0.4%
+down1.0.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  12969.7 | 19991040 |      1.5 |     0.5%
+down2.0.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |   7650.9 | 31462400 |      4.1 |     1.4%
+up2.0.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |   7030.1 | 10485760 |      1.5 |     0.5%
+down1.1.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |   7017.5 | 10485760 |      1.5 |     0.5%
+down1.0.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |   6993.7 | 10485760 |      1.5 |     0.5%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  ConvGemm                 36   4008643     1.2    0.4%
+  Attention                 1     69919     0.5    0.2%
+  Group                    30     49231    74.6   25.5%
+  Unary                    29     13101   279.2   95.4%
+  Upsample                  3      9995    54.6   18.6%
+  Binary                   15      7956   284.7   97.3%
+  GemmBatchedPacked         4      2992    23.1    7.9%
+  Copy                      2       257   130.8   44.7%
+up1.upconv.out       | Ext(Conv(ConvGemm { x: Va | 495428.3 | 277874688 |      0.6 |     0.2%
+up2.upconv.out       | Ext(Conv(ConvGemm { x: Va | 481211.1 | 539231232 |      1.1 |     0.4%
+up3.res0.conv1.out   | Ext(Conv(ConvGemm { x: Va | 247926.0 | 403833344 |      1.6 |     0.6%
+up2.res0.conv1.out   | Ext(Conv(ConvGemm { x: Va | 247832.3 | 206046208 |      0.8 |     0.3%
+up1.res0.conv1.out   | Ext(Conv(ConvGemm { x: Va | 125618.9 | 76548096 |      0.6 |     0.2%
+up1.res1.conv2.out   | Ext(Conv(ConvGemm { x: Va | 125469.2 | 76548096 |      0.6 |     0.2%
+up0.upconv.out       | Ext(Conv(ConvGemm { x: Va | 124875.5 | 76548096 |      0.6 |     0.2%
+up1.res2.conv1.out   | Ext(Conv(ConvGemm { x: Va | 124744.3 | 76548096 |      0.6 |     0.2%
+up1.res2.conv2.out   | Ext(Conv(ConvGemm { x: Va | 124701.6 | 76548096 |      0.6 |     0.2%
+up1.res1.conv1.out   | Ext(Conv(ConvGemm { x: Va | 124587.3 | 76548096 |      0.6 |     0.2%
+up1.res0.conv2.out   | Ext(Conv(ConvGemm { x: Va | 123842.5 | 76548096 |      0.6 |     0.2%
+up3.res1.conv1.out   | Ext(Conv(ConvGemm { x: Va | 123763.7 | 269025792 |      2.2 |     0.7%
+up2.res2.conv1.out   | Ext(Conv(ConvGemm { x: Va | 121944.5 | 136578048 |      1.1 |     0.4%
+up2.res2.conv2.out   | Ext(Conv(ConvGemm { x: Va | 121265.6 | 136578048 |      1.1 |     0.4%
+up2.res1.conv2.out   | Ext(Conv(ConvGemm { x: Va | 120918.1 | 136578048 |      1.1 |     0.4%
+up2.res1.conv1.out   | Ext(Conv(ConvGemm { x: Va | 120862.4 | 136578048 |      1.1 |     0.4%
+up3.res1.conv2.out   | Ext(Conv(ConvGemm { x: Va | 120862.0 | 269025792 |      2.2 |     0.8%
+up3.res2.conv2.out   | Ext(Conv(ConvGemm { x: Va | 120790.8 | 269025792 |      2.2 |     0.8%
+up3.res0.conv2.out   | Ext(Conv(ConvGemm { x: Va | 120657.5 | 269025792 |      2.2 |     0.8%
+up3.res2.conv1.out   | Ext(Conv(ConvGemm { x: Va | 120447.7 | 269025792 |      2.2 |     0.8%
+up2.res0.conv2.out   | Ext(Conv(ConvGemm { x: Va | 119824.7 | 136578048 |      1.1 |     0.4%
+mid.attn.attn        | Ext(Attn(Attention { q: V |  69918.9 | 33554432 |      0.5 |     0.2%
+tail.conv_out.out    | Ext(Conv(ConvGemm { x: Va |  57836.4 | 137377292 |      2.4 |     0.8%
+up0.res1.conv1.out   | Ext(Conv(ConvGemm { x: Va |  34725.9 | 26216448 |      0.8 |     0.3%
+mid.res0.conv1.out   | Ext(Conv(ConvGemm { x: Va |  34722.3 | 26216448 |      0.8 |     0.3%
+up0.res2.conv2.out   | Ext(Conv(ConvGemm { x: Va |  33938.0 | 26216448 |      0.8 |     0.3%
+mid.res1.conv2.out   | Ext(Conv(ConvGemm { x: Va |  33920.5 | 26216448 |      0.8 |     0.3%
+mid.res1.conv1.out   | Ext(Conv(ConvGemm { x: Va |  33700.4 | 26216448 |      0.8 |     0.3%
+up0.res0.conv1.out   | Ext(Conv(ConvGemm { x: Va |  33587.3 | 26216448 |      0.8 |     0.3%
+up0.res0.conv2.out   | Ext(Conv(ConvGemm { x: Va |  33358.2 | 26216448 |      0.8 |     0.3%
+up0.res2.conv1.out   | Ext(Conv(ConvGemm { x: Va |  33316.9 | 26216448 |      0.8 |     0.3%
+up0.res1.conv2.out   | Ext(Conv(ConvGemm { x: Va |  33308.2 | 26216448 |      0.8 |     0.3%
+mid.res0.conv2.out   | Ext(Conv(ConvGemm { x: Va |  33008.3 | 26216448 |      0.8 |     0.3%
+up2.res0.shortcut.out | Ext(Conv(ConvGemm { x: Va |  27712.0 | 201851904 |      7.3 |     2.5%
+up3.res0.shortcut.out | Ext(Conv(ConvGemm { x: Va |  27391.4 | 402784768 |     14.7 |     5.0%
+up3.res0.norm1.gn    | Ext(Norm(Group { x: Value |   7343.9 | 536872960 |     73.1 |    25.0%
+up2.upsample         | Ext(Movement(Upsample { x |   6148.2 | 335544320 |     54.6 |    18.6%
+up3.res1.norm2.gn    | Ext(Norm(Group { x: Value |   3678.5 | 268436480 |     73.0 |    24.9%
+up3.res2.norm1.gn    | Ext(Norm(Group { x: Value |   3660.4 | 268436480 |     73.3 |    25.1%
+up3.res1.norm1.gn    | Ext(Norm(Group { x: Value |   3657.2 | 268436480 |     73.4 |    25.1%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  GemmBatchedPacked       138     23425    30.9   10.6%
+  Attention                23      1052    27.6    9.4%
+  LayerNorm                47       257   116.8   39.9%
+  Embed                     2         6 17481.7 5972.2%
+  Binary                    1         4   234.1   80.0%
+  Gather                    1         3   116.2   39.7%
+l1.fc2               | GemmBatchedPacked { x: Va |    357.3 | 10285056 |     28.8 |     9.8%
+l16.fc2              | GemmBatchedPacked { x: Va |    357.0 | 10285056 |     28.8 |     9.8%
+l15.fc2              | GemmBatchedPacked { x: Va |    356.8 | 10285056 |     28.8 |     9.8%
+l22.fc2              | GemmBatchedPacked { x: Va |    356.6 | 10285056 |     28.8 |     9.9%
+l14.fc2              | GemmBatchedPacked { x: Va |    356.6 | 10285056 |     28.8 |     9.9%
+l5.fc2               | GemmBatchedPacked { x: Va |    356.4 | 10285056 |     28.9 |     9.9%
+l8.fc2               | GemmBatchedPacked { x: Va |    356.1 | 10285056 |     28.9 |     9.9%
+l13.fc2              | GemmBatchedPacked { x: Va |    355.5 | 10285056 |     28.9 |     9.9%
+l17.fc2              | GemmBatchedPacked { x: Va |    355.4 | 10285056 |     28.9 |     9.9%
+l0.fc2               | GemmBatchedPacked { x: Va |    355.3 | 10285056 |     29.0 |     9.9%
+l18.fc2              | GemmBatchedPacked { x: Va |    355.2 | 10285056 |     29.0 |     9.9%
+l20.fc2              | GemmBatchedPacked { x: Va |    355.2 | 10285056 |     29.0 |     9.9%
+l6.fc2               | GemmBatchedPacked { x: Va |    355.1 | 10285056 |     29.0 |     9.9%
+l2.fc2               | GemmBatchedPacked { x: Va |    355.0 | 10285056 |     29.0 |     9.9%
+l10.fc2              | GemmBatchedPacked { x: Va |    355.0 | 10285056 |     29.0 |     9.9%
+l3.fc2               | GemmBatchedPacked { x: Va |    355.0 | 10285056 |     29.0 |     9.9%
+l7.fc2               | GemmBatchedPacked { x: Va |    355.0 | 10285056 |     29.0 |     9.9%
+l12.fc2              | GemmBatchedPacked { x: Va |    354.8 | 10285056 |     29.0 |     9.9%
+l9.fc2               | GemmBatchedPacked { x: Va |    354.5 | 10285056 |     29.0 |     9.9%
+l21.fc2              | GemmBatchedPacked { x: Va |    354.2 | 10285056 |     29.0 |     9.9%
+l11.fc2              | GemmBatchedPacked { x: Va |    354.0 | 10285056 |     29.1 |     9.9%
+l4.fc2               | GemmBatchedPacked { x: Va |    353.5 | 10285056 |     29.1 |     9.9%
+l19.fc2              | GemmBatchedPacked { x: Va |    352.8 | 10285056 |     29.2 |    10.0%
+l11.fc1              | GemmBatchedPacked { x: Va |    307.1 |  9981952 |     32.5 |    11.1%
+l21.fc1              | GemmBatchedPacked { x: Va |    306.3 |  9981952 |     32.6 |    11.1%
+l10.fc1              | GemmBatchedPacked { x: Va |    306.2 |  9981952 |     32.6 |    11.1%
+l15.fc1              | GemmBatchedPacked { x: Va |    306.2 |  9981952 |     32.6 |    11.1%
+l2.fc1               | GemmBatchedPacked { x: Va |    305.4 |  9981952 |     32.7 |    11.2%
+l7.fc1               | GemmBatchedPacked { x: Va |    298.5 |  9981952 |     33.4 |    11.4%
+l3.fc1               | GemmBatchedPacked { x: Va |    297.7 |  9981952 |     33.5 |    11.5%
+l17.fc1              | GemmBatchedPacked { x: Va |    297.6 |  9981952 |     33.5 |    11.5%
+l4.fc1               | GemmBatchedPacked { x: Va |    297.6 |  9981952 |     33.5 |    11.5%
+l12.fc1              | GemmBatchedPacked { x: Va |    297.5 |  9981952 |     33.6 |    11.5%
+l16.fc1              | GemmBatchedPacked { x: Va |    297.4 |  9981952 |     33.6 |    11.5%
+l13.fc1              | GemmBatchedPacked { x: Va |    297.4 |  9981952 |     33.6 |    11.5%
+l6.fc1               | GemmBatchedPacked { x: Va |    296.8 |  9981952 |     33.6 |    11.5%
+l20.fc1              | GemmBatchedPacked { x: Va |    296.8 |  9981952 |     33.6 |    11.5%
+l0.fc1               | GemmBatchedPacked { x: Va |    296.4 |  9981952 |     33.7 |    11.5%
+l18.fc1              | GemmBatchedPacked { x: Va |    296.4 |  9981952 |     33.7 |    11.5%
+l9.fc1               | GemmBatchedPacked { x: Va |    296.2 |  9981952 |     33.7 |    11.5%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  ConvGemm                 66    744780     3.5    1.2%
+  Attention                32    326096     0.9    0.3%
+  GemmBatchedPacked       160     93842    21.3    7.3%
+  Copy                    124      9870   200.0   68.3%
+  Group                    61      3185   113.3   38.7%
+  Binary                   76      2758   338.6  115.7%
+  LayerNorm                48      1955   141.9   48.5%
+  Unary                    61      1695   376.1  128.5%
+up3.0.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |  55512.2 | 20971520 |      0.4 |     0.1%
+down0.1.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |  55378.8 | 20971520 |      0.4 |     0.1%
+up3.1.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |  55370.6 | 20971520 |      0.4 |     0.1%
+up3.2.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |  55231.8 | 20971520 |      0.4 |     0.1%
+down0.0.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |  55228.3 | 20971520 |      0.4 |     0.1%
+up1.upsample_conv.conv | Ext(Conv(ConvGemm { x: Va |  52650.4 | 69473280 |      1.3 |     0.5%
+up2.upsample_conv.conv | Ext(Conv(ConvGemm { x: Va |  49682.1 | 35719680 |      0.7 |     0.2%
+up2.0.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  40592.1 | 54725120 |      1.3 |     0.5%
+up3.0.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  39684.7 | 32032000 |      0.8 |     0.3%
+up1.1.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  31212.1 | 121902080 |      3.9 |     1.3%
+up1.0.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  30953.1 | 121902080 |      3.9 |     1.3%
+up2.1.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  27689.2 | 37358080 |      1.3 |     0.5%
+up3.2.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  26616.5 | 23102720 |      0.9 |     0.3%
+up3.1.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  26291.9 | 23102720 |      0.9 |     0.3%
+up1.2.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  23598.5 | 91755520 |      3.9 |     1.3%
+up2.2.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  20602.5 | 28674560 |      1.4 |     0.5%
+down1.1.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  16672.3 | 19991040 |      1.2 |     0.4%
+up2.2.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  16449.2 | 19991040 |      1.2 |     0.4%
+down2.1.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  15672.4 | 61608960 |      3.9 |     1.3%
+up1.0.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  15572.3 | 61608960 |      4.0 |     1.4%
+down2.0.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  15509.1 | 61608960 |      4.0 |     1.4%
+down2.1.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  15508.5 | 61608960 |      4.0 |     1.4%
+up0.upsample_conv.conv | Ext(Conv(ConvGemm { x: Va |  15382.5 | 61608960 |      4.0 |     1.4%
+up1.1.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  15374.0 | 61608960 |      4.0 |     1.4%
+up1.2.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  15370.4 | 61608960 |      4.0 |     1.4%
+down1.1.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  13981.2 | 19991040 |      1.4 |     0.5%
+up2.1.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  13811.7 | 19991040 |      1.4 |     0.5%
+down0.0.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  13744.0 | 14173440 |      1.0 |     0.4%
+down0.1.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  13511.1 | 14173440 |      1.0 |     0.4%
+up3.0.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  13506.7 | 14173440 |      1.0 |     0.4%
+down0.0.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  13428.3 | 14173440 |      1.1 |     0.4%
+down0.1.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  13372.1 | 14173440 |      1.1 |     0.4%
+up3.1.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  13251.0 | 14173440 |      1.1 |     0.4%
+up3.2.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  13072.0 | 14173440 |      1.1 |     0.4%
+up2.0.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  12852.4 | 19991040 |      1.6 |     0.5%
+down1.0.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  12615.4 | 19991040 |      1.6 |     0.5%
+down2.0.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |   7800.5 | 31462400 |      4.0 |     1.4%
+down1.1.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |   7033.8 | 10485760 |      1.5 |     0.5%
+up2.1.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |   7033.7 | 10485760 |      1.5 |     0.5%
+up2.2.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |   7030.3 | 10485760 |      1.5 |     0.5%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  ConvGemm                 66    737564     3.6    1.2%
+  Attention                32    326742     0.9    0.3%
+  GemmBatchedPacked       160     93825    21.3    7.3%
+  Copy                    124      9870   200.0   68.3%
+  Group                    61      3187   113.2   38.7%
+  Binary                   76      2744   340.4  116.3%
+  LayerNorm                48      1954   142.0   48.5%
+  Unary                    61      1690   377.4  128.9%
+down0.0.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |  55563.4 | 20971520 |      0.4 |     0.1%
+down0.1.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |  55500.5 | 20971520 |      0.4 |     0.1%
+up3.2.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |  55484.7 | 20971520 |      0.4 |     0.1%
+up3.1.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |  55471.0 | 20971520 |      0.4 |     0.1%
+up3.0.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |  55339.9 | 20971520 |      0.4 |     0.1%
+up1.upsample_conv.conv | Ext(Conv(ConvGemm { x: Va |  52612.9 | 69473280 |      1.3 |     0.5%
+up2.upsample_conv.conv | Ext(Conv(ConvGemm { x: Va |  48919.9 | 35719680 |      0.7 |     0.2%
+up3.0.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  39617.3 | 32032000 |      0.8 |     0.3%
+up2.0.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  38807.5 | 54725120 |      1.4 |     0.5%
+up1.0.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  31369.4 | 121902080 |      3.9 |     1.3%
+up1.1.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  30884.6 | 121902080 |      3.9 |     1.3%
+up2.1.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  27398.1 | 37358080 |      1.4 |     0.5%
+up3.2.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  26985.6 | 23102720 |      0.9 |     0.3%
+up3.1.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  26070.8 | 23102720 |      0.9 |     0.3%
+up1.2.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  22956.3 | 91755520 |      4.0 |     1.4%
+up2.2.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  21511.7 | 28674560 |      1.3 |     0.5%
+up1.2.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  16727.9 | 61608960 |      3.7 |     1.3%
+down2.1.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  15745.0 | 61608960 |      3.9 |     1.3%
+down2.1.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  15590.2 | 61608960 |      4.0 |     1.4%
+up1.0.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  15404.5 | 61608960 |      4.0 |     1.4%
+down2.0.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  15403.1 | 61608960 |      4.0 |     1.4%
+up0.upsample_conv.conv | Ext(Conv(ConvGemm { x: Va |  15270.0 | 61608960 |      4.0 |     1.4%
+up1.1.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  15238.4 | 61608960 |      4.0 |     1.4%
+up2.1.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  14232.7 | 19991040 |      1.4 |     0.5%
+up2.2.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  13908.0 | 19991040 |      1.4 |     0.5%
+down1.0.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  13760.1 | 19991040 |      1.5 |     0.5%
+down1.1.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  13520.4 | 19991040 |      1.5 |     0.5%
+down1.1.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  13229.7 | 19991040 |      1.5 |     0.5%
+down0.1.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  13218.5 | 14173440 |      1.1 |     0.4%
+up3.1.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  13215.7 | 14173440 |      1.1 |     0.4%
+up3.0.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  13205.6 | 14173440 |      1.1 |     0.4%
+down0.1.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  13184.2 | 14173440 |      1.1 |     0.4%
+down0.0.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  13159.6 | 14173440 |      1.1 |     0.4%
+down0.0.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  13144.9 | 14173440 |      1.1 |     0.4%
+up2.0.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  13091.3 | 19991040 |      1.5 |     0.5%
+up3.2.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  13013.5 | 14173440 |      1.1 |     0.4%
+down2.0.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |   7648.5 | 31462400 |      4.1 |     1.4%
+down1.1.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |   7036.7 | 10485760 |      1.5 |     0.5%
+down1.0.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |   7034.4 | 10485760 |      1.5 |     0.5%
+up2.1.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |   7032.9 | 10485760 |      1.5 |     0.5%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  ConvGemm                 66    738941     3.6    1.2%
+  Attention                32    326114     0.9    0.3%
+  GemmBatchedPacked       160     93876    21.3    7.3%
+  Copy                    124      9866   200.1   68.3%
+  Group                    61      3191   113.1   38.6%
+  Binary                   76      2754   339.1  115.9%
+  LayerNorm                48      1956   141.9   48.5%
+  Unary                    61      1696   376.0  128.5%
+up3.2.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |  55556.3 | 20971520 |      0.4 |     0.1%
+down0.1.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |  55365.0 | 20971520 |      0.4 |     0.1%
+down0.0.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |  55318.8 | 20971520 |      0.4 |     0.1%
+up3.0.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |  55243.0 | 20971520 |      0.4 |     0.1%
+up3.1.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |  55224.7 | 20971520 |      0.4 |     0.1%
+up1.upsample_conv.conv | Ext(Conv(ConvGemm { x: Va |  52931.6 | 69473280 |      1.3 |     0.4%
+up2.upsample_conv.conv | Ext(Conv(ConvGemm { x: Va |  49448.7 | 35719680 |      0.7 |     0.2%
+up2.0.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  41005.3 | 54725120 |      1.3 |     0.5%
+up3.0.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  39263.4 | 32032000 |      0.8 |     0.3%
+up1.0.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  31510.0 | 121902080 |      3.9 |     1.3%
+up1.1.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  31212.3 | 121902080 |      3.9 |     1.3%
+up2.1.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  26689.6 | 37358080 |      1.4 |     0.5%
+up3.2.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  26134.1 | 23102720 |      0.9 |     0.3%
+up3.1.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  25768.4 | 23102720 |      0.9 |     0.3%
+up1.2.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  23211.3 | 91755520 |      4.0 |     1.4%
+up2.2.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  19462.6 | 28674560 |      1.5 |     0.5%
+up1.2.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  15711.3 | 61608960 |      3.9 |     1.3%
+up0.upsample_conv.conv | Ext(Conv(ConvGemm { x: Va |  15674.5 | 61608960 |      3.9 |     1.3%
+down2.0.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  15636.3 | 61608960 |      3.9 |     1.3%
+up1.1.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  15433.8 | 61608960 |      4.0 |     1.4%
+down2.1.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  15416.1 | 61608960 |      4.0 |     1.4%
+up1.0.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  15277.8 | 61608960 |      4.0 |     1.4%
+down2.1.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  15239.1 | 61608960 |      4.0 |     1.4%
+down1.1.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  14033.1 | 19991040 |      1.4 |     0.5%
+down1.1.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  13826.5 | 19991040 |      1.4 |     0.5%
+up2.2.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  13556.8 | 19991040 |      1.5 |     0.5%
+up2.1.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  13552.1 | 19991040 |      1.5 |     0.5%
+down1.0.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  13548.7 | 19991040 |      1.5 |     0.5%
+down0.0.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  13469.7 | 14173440 |      1.1 |     0.4%
+up3.0.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  13455.3 | 14173440 |      1.1 |     0.4%
+up2.0.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  13380.6 | 19991040 |      1.5 |     0.5%
+down0.1.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  13336.3 | 14173440 |      1.1 |     0.4%
+down0.0.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  13327.2 | 14173440 |      1.1 |     0.4%
+up3.1.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  13267.2 | 14173440 |      1.1 |     0.4%
+down0.1.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  13114.3 | 14173440 |      1.1 |     0.4%
+up3.2.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  13105.4 | 14173440 |      1.1 |     0.4%
+down1.0.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |   8261.6 | 11307520 |      1.4 |     0.5%
+down2.0.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |   8036.9 | 31462400 |      3.9 |     1.3%
+down1.1.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |   7035.6 | 10485760 |      1.5 |     0.5%
+down1.0.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |   7031.3 | 10485760 |      1.5 |     0.5%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  ConvGemm                 66    742442     3.6    1.2%
+  Attention                32    325885     0.9    0.3%
+  GemmBatchedPacked       160     93832    21.3    7.3%
+  Copy                    124      9868   200.0   68.3%
+  Group                    61      3189   113.2   38.7%
+  Binary                   76      2751   339.5  116.0%
+  LayerNorm                48      1954   142.0   48.5%
+  Unary                    61      1701   374.9  128.1%
+down0.0.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |  55556.4 | 20971520 |      0.4 |     0.1%
+up3.1.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |  55292.1 | 20971520 |      0.4 |     0.1%
+down0.1.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |  55243.5 | 20971520 |      0.4 |     0.1%
+up3.0.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |  55220.6 | 20971520 |      0.4 |     0.1%
+up3.2.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |  55219.6 | 20971520 |      0.4 |     0.1%
+up1.upsample_conv.conv | Ext(Conv(ConvGemm { x: Va |  52482.4 | 69473280 |      1.3 |     0.5%
+up2.upsample_conv.conv | Ext(Conv(ConvGemm { x: Va |  50473.6 | 35719680 |      0.7 |     0.2%
+up2.0.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  39861.6 | 54725120 |      1.4 |     0.5%
+up3.0.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  39047.3 | 32032000 |      0.8 |     0.3%
+up1.1.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  31330.2 | 121902080 |      3.9 |     1.3%
+up1.0.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  30747.3 | 121902080 |      4.0 |     1.4%
+up2.1.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  27758.3 | 37358080 |      1.3 |     0.5%
+up3.1.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  26612.9 | 23102720 |      0.9 |     0.3%
+up3.2.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  26519.4 | 23102720 |      0.9 |     0.3%
+up2.2.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  24457.3 | 28674560 |      1.2 |     0.4%
+up1.2.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  23262.9 | 91755520 |      3.9 |     1.3%
+up1.2.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  16164.0 | 61608960 |      3.8 |     1.3%
+up0.upsample_conv.conv | Ext(Conv(ConvGemm { x: Va |  15507.2 | 61608960 |      4.0 |     1.4%
+up1.1.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  15436.3 | 61608960 |      4.0 |     1.4%
+down2.0.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  15432.2 | 61608960 |      4.0 |     1.4%
+up1.0.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  15380.3 | 61608960 |      4.0 |     1.4%
+down2.1.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  15317.3 | 61608960 |      4.0 |     1.4%
+down2.1.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  15315.5 | 61608960 |      4.0 |     1.4%
+down1.1.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  14060.5 | 19991040 |      1.4 |     0.5%
+down1.0.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  13917.9 | 19991040 |      1.4 |     0.5%
+down1.1.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  13695.2 | 19991040 |      1.5 |     0.5%
+up2.1.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  13619.1 | 19991040 |      1.5 |     0.5%
+up2.0.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  13578.6 | 19991040 |      1.5 |     0.5%
+down0.1.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  13464.0 | 14173440 |      1.1 |     0.4%
+up3.2.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  13425.7 | 14173440 |      1.1 |     0.4%
+up3.1.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  13414.8 | 14173440 |      1.1 |     0.4%
+down0.0.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  13394.3 | 14173440 |      1.1 |     0.4%
+up2.2.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  13312.4 | 19991040 |      1.5 |     0.5%
+up3.0.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  13257.7 | 14173440 |      1.1 |     0.4%
+down0.1.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  13107.6 | 14173440 |      1.1 |     0.4%
+down0.0.res.conv2.conv | Ext(Conv(ConvGemm { x: Va |  13063.0 | 14173440 |      1.1 |     0.4%
+down2.0.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |   7568.9 | 31462400 |      4.2 |     1.4%
+down1.1.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |   7050.2 | 10485760 |      1.5 |     0.5%
+up2.0.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |   7034.5 | 10485760 |      1.5 |     0.5%
+up2.1.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |   7032.7 | 10485760 |      1.5 |     0.5%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  ConvGemm                 36   4010277     1.2    0.4%
+  Attention                 1     69000     0.5    0.2%
+  Group                    30     49163    74.7   25.5%
+  Unary                    29     13018   281.0   96.0%
+  Upsample                  3      9995    54.6   18.6%
+  Binary                   15      7968   284.3   97.1%
+  GemmBatchedPacked         4      2988    23.2    7.9%
+  Copy                      2       257   130.6   44.6%
+up1.upconv.out       | Ext(Conv(ConvGemm { x: Va | 493286.5 | 277874688 |      0.6 |     0.2%
+up2.upconv.out       | Ext(Conv(ConvGemm { x: Va | 481599.6 | 539231232 |      1.1 |     0.4%
+up3.res0.conv1.out   | Ext(Conv(ConvGemm { x: Va | 243279.2 | 403833344 |      1.7 |     0.6%
+up2.res0.conv1.out   | Ext(Conv(ConvGemm { x: Va | 242565.7 | 206046208 |      0.8 |     0.3%
+up1.res2.conv1.out   | Ext(Conv(ConvGemm { x: Va | 125760.4 | 76548096 |      0.6 |     0.2%
+up0.upconv.out       | Ext(Conv(ConvGemm { x: Va | 125275.6 | 76548096 |      0.6 |     0.2%
+up1.res0.conv2.out   | Ext(Conv(ConvGemm { x: Va | 125256.5 | 76548096 |      0.6 |     0.2%
+up1.res2.conv2.out   | Ext(Conv(ConvGemm { x: Va | 124937.2 | 76548096 |      0.6 |     0.2%
+up1.res1.conv1.out   | Ext(Conv(ConvGemm { x: Va | 124903.7 | 76548096 |      0.6 |     0.2%
+up3.res2.conv2.out   | Ext(Conv(ConvGemm { x: Va | 124877.3 | 269025792 |      2.2 |     0.7%
+up3.res1.conv1.out   | Ext(Conv(ConvGemm { x: Va | 124539.0 | 269025792 |      2.2 |     0.7%
+up1.res0.conv1.out   | Ext(Conv(ConvGemm { x: Va | 123906.3 | 76548096 |      0.6 |     0.2%
+up1.res1.conv2.out   | Ext(Conv(ConvGemm { x: Va | 123688.7 | 76548096 |      0.6 |     0.2%
+up3.res0.conv2.out   | Ext(Conv(ConvGemm { x: Va | 122797.7 | 269025792 |      2.2 |     0.7%
+up3.res1.conv2.out   | Ext(Conv(ConvGemm { x: Va | 122497.8 | 269025792 |      2.2 |     0.8%
+up2.res1.conv2.out   | Ext(Conv(ConvGemm { x: Va | 122330.2 | 136578048 |      1.1 |     0.4%
+up2.res2.conv1.out   | Ext(Conv(ConvGemm { x: Va | 122300.9 | 136578048 |      1.1 |     0.4%
+up2.res0.conv2.out   | Ext(Conv(ConvGemm { x: Va | 122029.5 | 136578048 |      1.1 |     0.4%
+up3.res2.conv1.out   | Ext(Conv(ConvGemm { x: Va | 121965.4 | 269025792 |      2.2 |     0.8%
+up2.res2.conv2.out   | Ext(Conv(ConvGemm { x: Va | 121725.1 | 136578048 |      1.1 |     0.4%
+up2.res1.conv1.out   | Ext(Conv(ConvGemm { x: Va | 121709.7 | 136578048 |      1.1 |     0.4%
+mid.attn.attn        | Ext(Attn(Attention { q: V |  68999.7 | 33554432 |      0.5 |     0.2%
+tail.conv_out.out    | Ext(Conv(ConvGemm { x: Va |  58235.1 | 137377292 |      2.4 |     0.8%
+mid.res1.conv1.out   | Ext(Conv(ConvGemm { x: Va |  34496.9 | 26216448 |      0.8 |     0.3%
+up0.res2.conv1.out   | Ext(Conv(ConvGemm { x: Va |  34066.4 | 26216448 |      0.8 |     0.3%
+up0.res1.conv2.out   | Ext(Conv(ConvGemm { x: Va |  33585.2 | 26216448 |      0.8 |     0.3%
+up0.res0.conv1.out   | Ext(Conv(ConvGemm { x: Va |  33564.1 | 26216448 |      0.8 |     0.3%
+up0.res1.conv1.out   | Ext(Conv(ConvGemm { x: Va |  33508.3 | 26216448 |      0.8 |     0.3%
+up0.res2.conv2.out   | Ext(Conv(ConvGemm { x: Va |  33489.1 | 26216448 |      0.8 |     0.3%
+mid.res0.conv2.out   | Ext(Conv(ConvGemm { x: Va |  33371.0 | 26216448 |      0.8 |     0.3%
+mid.res1.conv2.out   | Ext(Conv(ConvGemm { x: Va |  33145.4 | 26216448 |      0.8 |     0.3%
+up0.res0.conv2.out   | Ext(Conv(ConvGemm { x: Va |  33104.0 | 26216448 |      0.8 |     0.3%
+mid.res0.conv1.out   | Ext(Conv(ConvGemm { x: Va |  33002.4 | 26216448 |      0.8 |     0.3%
+up2.res0.shortcut.out | Ext(Conv(ConvGemm { x: Va |  27697.5 | 201851904 |      7.3 |     2.5%
+up3.res0.shortcut.out | Ext(Conv(ConvGemm { x: Va |  27231.1 | 402784768 |     14.8 |     5.1%
+up3.res0.norm1.gn    | Ext(Norm(Group { x: Value |   7312.9 | 536872960 |     73.4 |    25.1%
+up2.upsample         | Ext(Movement(Upsample { x |   6148.3 | 335544320 |     54.6 |    18.6%
+tail.norm_out.gn     | Ext(Norm(Group { x: Value |   3708.9 | 268436480 |     72.4 |    24.7%
+up3.res0.norm2.gn    | Ext(Norm(Group { x: Value |   3673.2 | 268436480 |     73.1 |    25.0%
+up3.res2.norm2.gn    | Ext(Norm(Group { x: Value |   3658.0 | 268436480 |     73.4 |    25.1%
+{"model":"stabilityai/sd-turbo","kind":"image","width":512,"height":512,"steps":4,"s_per_step":2.5935276386666666,"fixed_s":8.698421028333334,"rss_gb":14.854045696}
+METRIC sd-turbo_s_per_step=2.5935
