@@ -584,14 +584,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             telemetry.log_info(&format!("Compute backend: {}", model_exec.backend_label()));
             if let Some(d) = &cli.draft {
-                let dr: Arc<dyn gibbs_engine::scheduler::spec::Drafter> =
-                    if d == "ngram" || d == "n-gram" {
-                        Arc::new(gibbs_engine::runtime::draft::NgramDrafter::default())
-                    } else {
-                        let da = hub.auto_download_and_cache(d, token.as_deref())?;
-                        gibbs_engine::runtime::draft::load_drafter(&da, artifacts, placement)
-                            .map_err(|e| format!("Cannot load drafter '{d}': {e}"))?
-                    };
+                let da = hub.auto_download_and_cache(d, token.as_deref())?;
+                let dr = gibbs_engine::runtime::draft::load_drafter(&da, artifacts, placement)
+                    .map_err(|e| format!("Cannot load drafter '{d}': {e}"))?;
                 telemetry.log_info(&format!("Speculative decoding drafter: {}", dr.label()));
                 drafter = Some(dr);
             }

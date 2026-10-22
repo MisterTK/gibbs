@@ -66,8 +66,6 @@ pub struct BenchModel {
     pub items: Option<usize>,
     #[serde(default)]
     pub temperature: Option<f32>,
-    #[serde(default)]
-    pub draft: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -234,7 +232,6 @@ pub fn measure_loaded(
         ceiling_gbps,
         prefill_tokens,
         0.0,
-        None,
     )
 }
 
@@ -248,7 +245,6 @@ fn measure_loaded_with(
     ceiling_gbps: f64,
     prefill_tokens: usize,
     temperature: f32,
-    drafter: Option<std::sync::Arc<dyn crate::scheduler::spec::Drafter>>,
 ) -> Result<ModelBenchResult, String> {
     if bytes_per_token == 0 || ceiling_gbps <= 0.0 {
         return Err("no weight bytes found, cannot compute a roofline".into());
@@ -273,13 +269,13 @@ fn measure_loaded_with(
     } else {
         None
     };
-    exec.generate_text_measured_with(prompt, 16, temperature, drafter.clone())?;
+    exec.generate_text_measured_plain(prompt, 16, temperature)?;
     let (mut speeds, mut walls) = (Vec::new(), Vec::new());
     let (mut gpu, mut run, mut enc, mut disp) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     for _ in 0..runs {
         crate::graph::metal::take_run_samples();
         let (_, passes, dur) =
-            exec.generate_text_measured_with(prompt, decode_tokens, temperature, drafter.clone())?;
+            exec.generate_text_measured_plain(prompt, decode_tokens, temperature)?;
         let s = dur.as_secs_f64();
         if s > 0.0 && passes > 0 {
             speeds.push(passes as f64 / s);
@@ -457,25 +453,6 @@ pub fn run_bench_suite(path: &str) -> Result<i32, String> {
                 };
                 let model_exec = load.exec;
                 let (bytes_per_token, bytes_basis) = roofline_bytes(&artifacts, &load.applied);
-                let draft = model_cfg.draft.as_deref().or_else(|| {
-                    model_cfg
-                        .prompt_file
-                        .as_deref()
-                        .filter(|p| p.ends_with("repeat.txt"))
-                        .map(|_| "ngram")
-                });
-                let drafter: Option<std::sync::Arc<dyn crate::scheduler::spec::Drafter>> =
-                    match draft {
-                        None => None,
-                        Some("ngram" | "n-gram") => Some(std::sync::Arc::new(
-                            crate::runtime::draft::NgramDrafter::default(),
-                        )),
-                        Some(other) => {
-                            fail(&format!("unknown bench draft '{other}'"));
-                            had_error = true;
-                            continue;
-                        }
-                    };
                 let mut res = match measure_loaded_with(
                     &model_exec,
                     &prompt,
@@ -485,7 +462,6 @@ pub fn run_bench_suite(path: &str) -> Result<i32, String> {
                     ceiling_gbps,
                     prefill_tokens,
                     model_cfg.temperature.unwrap_or(0.0),
-                    drafter,
                 ) {
                     Ok(r) => r,
                     Err(e) => {

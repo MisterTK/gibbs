@@ -173,20 +173,6 @@ impl ExecutableModel {
         Ok((g.text, g.decode.1, g.decode.0))
     }
 
-    /// [`Self::generate_text_measured`] with the given `drafter` (`None` turns speculation off).
-    pub fn generate_text_measured_with(
-        &self,
-        prompt: &str,
-        max_new_tokens: usize,
-        temperature: f32,
-        drafter: Option<Arc<dyn Drafter>>,
-    ) -> Result<(String, usize, std::time::Duration), String> {
-        let s = self.one_shot_scheduler();
-        s.set_drafter(drafter);
-        let g = s.generate(prompt, max_new_tokens, temperature)?;
-        Ok((g.text, g.decode.1, g.decode.0))
-    }
-
     /// [`Self::generate_text_measured`] with drafters off: one forward pass per generated token,
     /// the quantity the bench's roofline is defined over.
     pub fn generate_text_measured_plain(
@@ -195,7 +181,10 @@ impl ExecutableModel {
         max_new_tokens: usize,
         temperature: f32,
     ) -> Result<(String, usize, std::time::Duration), String> {
-        self.generate_text_measured_with(prompt, max_new_tokens, temperature, None)
+        let s = self.one_shot_scheduler();
+        s.set_drafter(None);
+        let g = s.generate(prompt, max_new_tokens, temperature)?;
+        Ok((g.text, g.decode.1, g.decode.0))
     }
 
     /// A private scheduler for one-shot generation: its KV pool holds the model's whole context
@@ -1228,19 +1217,15 @@ impl ContinuousBatchScheduler {
                 all.extend_from_slice(&seq.output_tokens);
                 // Draft no more than the sequence may still emit (the target adds one) or hold.
                 let spec_k = seq.spec.as_ref().map(|sp| {
-                    if temp > 1e-4 && sp.greedy_only() {
-                        0
-                    } else {
-                        self.k_tuner
-                            .lock()
-                            .choose(sp.max_k())
-                            .min(
-                                seq.params
-                                    .max_new_tokens
-                                    .saturating_sub(seq.output_tokens.len() + 1),
-                            )
-                            .min(context_len.saturating_sub(all.len()))
-                    }
+                    self.k_tuner
+                        .lock()
+                        .choose(sp.max_k())
+                        .min(
+                            seq.params
+                                .max_new_tokens
+                                .saturating_sub(seq.output_tokens.len() + 1),
+                        )
+                        .min(context_len.saturating_sub(all.len()))
                 });
                 // Ensure sufficient KV blocks are allocated for the positions this step may add.
                 let needed_capacity = seq.total_tokens() + 1 + spec_k.unwrap_or(0);

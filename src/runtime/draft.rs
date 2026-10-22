@@ -914,77 +914,6 @@ impl Drafter for Plain {
     }
 }
 
-// ---- prompt-lookup (n-gram) drafter -----------------------------------------------------------
-
-/// Prompt-lookup drafter: finds the longest suffix of `tokens` (`max_n` down to `min_n`) that
-/// occurred earlier in `tokens` (latest earlier match) and proposes up to `k` tokens that
-/// followed it. Greedy-only (`pick` is never called).
-#[derive(Clone, Copy, Debug)]
-pub struct NgramDrafter {
-    pub min_n: usize,
-    pub max_n: usize,
-}
-
-impl NgramDrafter {
-    pub const fn new(min_n: usize, max_n: usize) -> Self {
-        Self { min_n, max_n }
-    }
-}
-
-impl Default for NgramDrafter {
-    fn default() -> Self {
-        Self { min_n: 2, max_n: 4 }
-    }
-}
-
-impl Drafter for NgramDrafter {
-    fn label(&self) -> String {
-        "n-gram".into()
-    }
-
-    fn tap_layers(&self) -> Vec<usize> {
-        Vec::new()
-    }
-
-    fn new_state(&self) -> DraftState {
-        Box::new(())
-    }
-
-    fn max_k(&self) -> usize {
-        8
-    }
-
-    fn greedy_only(&self) -> bool {
-        true
-    }
-
-    fn propose(
-        &self,
-        _st: &mut DraftState,
-        tokens: &[u32],
-        _hidden: &[f32],
-        k: usize,
-        _pick: &mut dyn FnMut(&[f32]) -> u32,
-    ) -> Result<Vec<u32>, String> {
-        let len = tokens.len();
-        if k == 0 || self.min_n == 0 || len <= self.min_n {
-            return Ok(Vec::new());
-        }
-        let max_n = self.max_n.min(len - 1);
-        for n in (self.min_n..=max_n).rev() {
-            let suffix = &tokens[len - n..];
-            for i in (0..len - n).rev() {
-                if &tokens[i..i + n] == suffix {
-                    let start = i + n;
-                    let end = (start + k).min(len);
-                    return Ok(tokens[start..end].to_vec());
-                }
-            }
-        }
-        Ok(Vec::new())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1187,47 +1116,5 @@ mod tests {
             toks.push(got[0]);
             toks.push((got[1] + 1) % V as u32);
         }
-    }
-
-    #[test]
-    fn ngram_drafter_proposes_suffix_continuation_and_matches_greedy() {
-        let _g = crate::hardware::cpu_compute::allow();
-        let d = NgramDrafter::default();
-        let mut st = d.new_state();
-        let got = d
-            .propose(&mut st, &[1, 2, 3, 9, 1, 2], &[], 3, &mut |_| {
-                panic!("NgramDrafter must never call pick")
-            })
-            .unwrap();
-        assert_eq!(got, vec![3, 9, 1]);
-
-        let dir = tempfile::tempdir().unwrap();
-        let exec = crate::arch::testing::synthetic_lm(
-            dir.path(),
-            json!({"max_position_embeddings": 128}),
-            Device::Cpu,
-        );
-        let prompt = "Repeat the following paragraph: alpha beta gamma delta alpha beta gamma delta alpha beta";
-        let ids = exec.tokenizer().encode(prompt);
-        assert!(
-            !d.propose(&mut st, &ids, &[], 4, &mut |_| unreachable!())
-                .unwrap()
-                .is_empty()
-        );
-        let (plain, plain_n, _) = exec.generate_text_measured_plain(prompt, 16, 0.0).unwrap();
-        let (with_ngram, ngram_n, _) = exec
-            .generate_text_measured_with(prompt, 16, 0.0, Some(Arc::new(NgramDrafter::default())))
-            .unwrap();
-        assert_eq!(with_ngram, plain);
-        assert_eq!(ngram_n, plain_n);
-
-        let s = crate::scheduler::ContinuousBatchScheduler::new(
-            "",
-            Arc::new(crate::kv::PagedKVPool::new(64)),
-            Some(exec.clone()),
-        );
-        s.set_drafter(Some(Arc::new(NgramDrafter::default())));
-        let _ = s.generate(prompt, 16, 0.0).unwrap();
-        assert!(s.telemetry.get_summary().spec_drafted > 0);
     }
 }
