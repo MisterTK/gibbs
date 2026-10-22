@@ -1067,7 +1067,7 @@ impl Runtime {
                 continue;
             }
             let bytes = n * (k / elems) * block_bytes;
-            let copies = ((192usize << 20) / bytes).max(1);
+            let copies = ((192usize << 20) / bytes).clamp(1, 256);
             let mut raw = Vec::with_capacity(copies * bytes);
             while raw.len() < copies * bytes {
                 raw.extend_from_slice(&pattern[..(copies * bytes - raw.len()).min(pattern.len())]);
@@ -5403,9 +5403,13 @@ fn weight_format_bytes(fmt: WeightFormat, n: usize) -> usize {
     match fmt {
         WeightFormat::F32 | WeightFormat::U32 => n * 4,
         WeightFormat::BF16 | WeightFormat::F16 => n * 2,
-        WeightFormat::Q4_0 | WeightFormat::Q8_0 | WeightFormat::Q4_K | WeightFormat::Q2_K | WeightFormat::Gen(_) => {
-            let (elems, bytes) =
-                codec::block_geometry(fmt.codec_format().expect("codec format")).expect("block geometry");
+        WeightFormat::Q4_0
+        | WeightFormat::Q8_0
+        | WeightFormat::Q4_K
+        | WeightFormat::Q2_K
+        | WeightFormat::Gen(_) => {
+            let (elems, bytes) = codec::block_geometry(fmt.codec_format().expect("codec format"))
+                .expect("block geometry");
             (n / elems) * bytes
         }
     }
