@@ -19,20 +19,20 @@ use crate::arch::dispatch::Loaded;
 use crate::hardware::{HardwareCapability, PlacementMode, QuantFormat};
 use crate::kv::PagedKVPool;
 use crate::model::classifier::{self, ClassifierSlot};
-use crate::runtime::encoder::{Activation, LabelScore};
 use crate::model::hf_loader::ChatMessage;
 use crate::model::hub::{
     split_revision, split_weight_file, DownloadProgress, HuggingFaceHub, StorageBackend,
 };
 use crate::model::image::ImageBuffer;
-use crate::runtime::encoder::system1::{ChoiceOption, JevSystem1Model};
 use crate::model::native::MediaInput;
 use crate::model::reencode::ReencodeProgress;
-use crate::runtime::diffusion::{ImageRequest, ImageSlot};
 use crate::model::tokenizer::Tokenizer;
 use crate::model::weight_format::{
     reencode_override, set_reencode_override, ReencodeConfig, ReencodePolicy, VariantPolicy,
 };
+use crate::runtime::diffusion::{ImageRequest, ImageSlot};
+use crate::runtime::encoder::system1::{ChoiceOption, JevSystem1Model};
+use crate::runtime::encoder::{Activation, LabelScore};
 use crate::scheduler::{finish_outcome, ContinuousBatchScheduler, SamplingParams};
 use crate::telemetry::{EngineTelemetry, KernelRow};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -930,6 +930,7 @@ impl TuiApp {
                 RUNS,
                 bytes,
                 ceiling,
+                0,
             )
             .map(|mut r| {
                 r.model = name;
@@ -1526,8 +1527,11 @@ impl TuiApp {
             crate::tui::qos::set_qos(crate::tui::qos::QosClass::Utility);
             let attach = || -> Result<String, String> {
                 let da = hub.auto_download_and_cache(&id, token.as_deref())?;
-                let d =
-                    crate::runtime::draft::load_drafter(&da, &hub.locate_model(&target), placement)?;
+                let d = crate::runtime::draft::load_drafter(
+                    &da,
+                    &hub.locate_model(&target),
+                    placement,
+                )?;
                 // ponytail: check-then-set; a model swap landing in between keeps this drafter
                 // until the swap resets it. Add a guarded set if loads race in practice.
                 if sched.model_id() != target {
@@ -1587,8 +1591,9 @@ impl TuiApp {
                     };
                     match result {
                         Ok(shape) => {
-                            self.telemetry
-                                .log_info(&format!("TUI: loaded '{id}' in {secs:.1}s ({source}): {shape}"));
+                            self.telemetry.log_info(&format!(
+                                "TUI: loaded '{id}' in {secs:.1}s ({source}): {shape}"
+                            ));
                             self.picker.mark_cached(&id);
                             self.finish(idx, Kind::Text, shape, source);
                         }
@@ -3445,7 +3450,11 @@ mod tests {
     fn llm_can_be_used_and_toggled_as_system1_in_tui() {
         let kv = Arc::new(PagedKVPool::new(64));
         let dir = tempfile::tempdir().unwrap();
-        let llm = crate::arch::testing::synthetic_lm(dir.path(), serde_json::json!({}), crate::hardware::Device::Cpu);
+        let llm = crate::arch::testing::synthetic_lm(
+            dir.path(),
+            serde_json::json!({}),
+            crate::hardware::Device::Cpu,
+        );
         let sched = Arc::new(ContinuousBatchScheduler::new(
             "foundry/smollm-1m",
             kv.clone(),

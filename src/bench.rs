@@ -11,6 +11,8 @@ pub struct BenchDefaults {
     pub runs: usize,
     #[serde(default = "default_reencode")]
     pub reencode: String,
+    #[serde(default)]
+    pub prefill_tokens: usize,
 }
 
 /// The prompt a benchmark decodes from unless the suite names one.
@@ -50,6 +52,18 @@ pub struct BenchModel {
     /// Prompt text file, relative to the suite file's directory; overrides `prompt`.
     #[serde(default)]
     pub prompt_file: Option<String>,
+    #[serde(default)]
+    pub prefill_tokens: Option<usize>,
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub steps: Option<usize>,
+    #[serde(default)]
+    pub width: Option<usize>,
+    #[serde(default)]
+    pub height: Option<usize>,
+    #[serde(default)]
+    pub items: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -130,7 +144,11 @@ pub fn applied_policy() -> Applied {
     let (policy, saved_bytes, force) =
         crate::model::reencode::native_applied().unwrap_or((ReencodePolicy::BitExact, 0, None));
     Applied {
-        policy: if saved_bytes > 0 { ReencodePolicy::BitExact } else { policy },
+        policy: if saved_bytes > 0 {
+            ReencodePolicy::BitExact
+        } else {
+            policy
+        },
         saved_bytes,
         force,
     }
@@ -200,10 +218,31 @@ pub fn measure_loaded(
     runs: usize,
     bytes_per_token: u64,
     ceiling_gbps: f64,
+    prefill_tokens: usize,
 ) -> Result<ModelBenchResult, String> {
     if bytes_per_token == 0 || ceiling_gbps <= 0.0 {
         return Err("no weight bytes found, cannot compute a roofline".into());
     }
+    let prefill_tok_s = if prefill_tokens > 0 {
+        let base = exec.tokenizer().encode(prompt);
+        if base.is_empty() {
+            return Err("bench prompt encodes to no tokens".into());
+        }
+        let ids: Vec<u32> = base.iter().copied().cycle().take(prefill_tokens).collect();
+        exec.prompt_logits(ids.clone())?;
+        let mut pf_secs = Vec::with_capacity(runs);
+        for _ in 0..runs {
+            let t0 = std::time::Instant::now();
+            exec.prompt_logits(ids.clone())?;
+            pf_secs.push(t0.elapsed().as_secs_f64());
+        }
+        crate::graph::metal::take_run_samples();
+        median(&mut pf_secs)
+            .filter(|&s| s > 0.0)
+            .map(|s| prefill_tokens as f64 / s)
+    } else {
+        None
+    };
     exec.generate_text_measured_plain(prompt, 16, 0.0)?;
     let (mut speeds, mut walls) = (Vec::new(), Vec::new());
     let (mut gpu, mut run, mut enc, mut disp) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
@@ -246,7 +285,7 @@ pub fn measure_loaded(
         encode_us: median(&mut enc),
         dispatches: median(&mut disp),
         weights_ms: bytes_per_token as f64 / 1e9 / ceiling_gbps * 1e3,
-        prefill_tok_s: None,
+        prefill_tok_s,
         rss_gb: get_peak_rss_gb(),
         top_kernels: None,
     })
@@ -308,12 +347,13 @@ pub fn run_bench_suite(path: &str) -> Result<i32, String> {
         decode_tokens: default_decode_tokens(),
         runs: default_runs(),
         reencode: default_reencode(),
+        prefill_tokens: 0,
     });
 
     let mut had_error = false;
     let mut missed_floor = false;
     let mut roofline_pcts = Vec::new();
-    let mut slug_speeds = Vec::new();
+    let mut metric_lines = Vec::new();
     let suite_dir = std::path::Path::new(path)
         .parent()
         .map(|p| p.to_path_buf())
@@ -335,8 +375,18 @@ pub fn run_bench_suite(path: &str) -> Result<i32, String> {
 
     for model_cfg in &suite.models {
         let decode_tokens = model_cfg.decode_tokens.unwrap_or(defaults.decode_tokens);
+        let prefill_tokens = model_cfg.prefill_tokens.unwrap_or(defaults.prefill_tokens);
         let runs = model_cfg.runs.unwrap_or(defaults.runs);
         let reencode = model_cfg.reencode.as_ref().unwrap_or(&defaults.reencode);
+        let kind = model_cfg.kind.as_deref().unwrap_or("lm");
+        let slug = model_cfg.name.clone().unwrap_or_else(|| {
+            model_cfg
+                .id
+                .split('/')
+                .next_back()
+                .unwrap_or(&model_cfg.id)
+                .replace(".gguf", "")
+        });
         let fail = |e: &str| println!("{}", serde_json::json!({"model": model_cfg.id, "error": e}));
         let prompt = match &model_cfg.prompt_file {
             Some(f) => match std::fs::read_to_string(suite_dir.join(f)) {
@@ -353,68 +403,265 @@ pub fn run_bench_suite(path: &str) -> Result<i32, String> {
                 .unwrap_or_else(|| defaults.prompt.clone()),
         };
 
-        let artifacts = match hub.auto_download_and_cache(&model_cfg.id, None) {
-            Ok(a) => a,
-            Err(e) => {
-                fail(&e);
-                had_error = true;
-                continue;
-            }
-        };
+        match kind {
+            "lm" => {
+                let artifacts = match hub.auto_download_and_cache(&model_cfg.id, None) {
+                    Ok(a) => a,
+                    Err(e) => {
+                        fail(&e);
+                        had_error = true;
+                        continue;
+                    }
+                };
 
-        // Held until this model's row is printed: concurrent benchmarks would corrupt each other.
-        let _lock = crate::hardware::gpu_lock()?;
-        let load = match load_for_bench(&artifacts, reencode) {
-            Ok(x) => x,
-            Err(e) => {
-                fail(&e);
-                had_error = true;
-                continue;
+                // Held until this model's row is printed: concurrent benchmarks would corrupt each other.
+                let _lock = crate::hardware::gpu_lock()?;
+                let load = match load_for_bench(&artifacts, reencode) {
+                    Ok(x) => x,
+                    Err(e) => {
+                        fail(&e);
+                        had_error = true;
+                        continue;
+                    }
+                };
+                let model_exec = load.exec;
+                let (bytes_per_token, bytes_basis) = roofline_bytes(&artifacts, &load.applied);
+                let mut res = match measure_loaded(
+                    &model_exec,
+                    &prompt,
+                    decode_tokens,
+                    runs,
+                    bytes_per_token,
+                    ceiling_gbps,
+                    prefill_tokens,
+                ) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        fail(&e);
+                        had_error = true;
+                        continue;
+                    }
+                };
+                res.bytes_basis = bytes_basis;
+                res.model = model_cfg.id.clone();
+                res.file = artifacts
+                    .config_path
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| model_cfg.id.clone());
+                roofline_pcts.push(res.roofline_pct);
+                metric_lines.push(format!("METRIC {slug}_tok_s={:.1}", res.decode_tok_s));
+                if model_cfg
+                    .min_tok_s
+                    .is_some_and(|floor| res.decode_tok_s < floor)
+                {
+                    missed_floor = true;
+                }
+                if let Ok(line) = serde_json::to_string(&res) {
+                    println!("{line}");
+                }
             }
-        };
-        let model_exec = load.exec;
-        let (bytes_per_token, bytes_basis) =
-            roofline_bytes(&artifacts, &load.applied);
-        let mut res = match measure_loaded(
-            &model_exec,
-            &prompt,
-            decode_tokens,
-            runs,
-            bytes_per_token,
-            ceiling_gbps,
-        ) {
-            Ok(r) => r,
-            Err(e) => {
-                fail(&e);
-                had_error = true;
-                continue;
+            "image" => {
+                let policy: crate::model::weight_format::ReencodePolicy = match reencode.parse() {
+                    Ok(p) => p,
+                    Err(e) => {
+                        fail(&e);
+                        had_error = true;
+                        continue;
+                    }
+                };
+                let steps_s = model_cfg.steps.unwrap_or(4);
+                if steps_s < 2 {
+                    fail("image bench requires steps >= 2");
+                    had_error = true;
+                    continue;
+                }
+                let width = model_cfg.width.unwrap_or(512);
+                let height = model_cfg.height.unwrap_or(512);
+                let _lock = crate::hardware::gpu_lock()?;
+                let hw = crate::hardware::HardwareCapability::probe_system();
+                let opts = crate::arch::LoadOpts {
+                    placement: crate::hardware::PlacementMode::Pin(crate::hardware::Device::Metal),
+                    token: None,
+                    quant_name: None,
+                    hw: &hw,
+                    reencode: crate::model::weight_format::ReencodeConfig {
+                        policy,
+                        ..Default::default()
+                    },
+                    family: None,
+                    stage: &|_| {},
+                    admit: &|_| Ok(()),
+                    system1_first: true,
+                };
+                let g = match crate::arch::load_model(&hub, &model_cfg.id, &opts) {
+                    Ok(crate::arch::Loaded::Image(g)) => g,
+                    Ok(_) => {
+                        fail("expected image model");
+                        had_error = true;
+                        continue;
+                    }
+                    Err(e) => {
+                        fail(&e);
+                        had_error = true;
+                        continue;
+                    }
+                };
+                let req = |steps| crate::runtime::diffusion::ImageRequest {
+                    prompt: prompt.clone(),
+                    negative_prompt: None,
+                    width: Some(width),
+                    height: Some(height),
+                    steps: Some(steps),
+                    guidance: None,
+                    seed: 1,
+                };
+                if let Err(e) = g.text_to_image(&req(1)) {
+                    fail(&e);
+                    had_error = true;
+                    continue;
+                }
+                let mut t1_runs = Vec::with_capacity(runs);
+                let mut ts_runs = Vec::with_capacity(runs);
+                let mut run_err = None;
+                for _ in 0..runs {
+                    let t0 = std::time::Instant::now();
+                    if let Err(e) = g.text_to_image(&req(1)) {
+                        run_err = Some(e);
+                        break;
+                    }
+                    t1_runs.push(t0.elapsed().as_secs_f64());
+                    let t0 = std::time::Instant::now();
+                    if let Err(e) = g.text_to_image(&req(steps_s)) {
+                        run_err = Some(e);
+                        break;
+                    }
+                    ts_runs.push(t0.elapsed().as_secs_f64());
+                }
+                if let Some(e) = run_err {
+                    fail(&e);
+                    had_error = true;
+                    continue;
+                }
+                let t1 = median(&mut t1_runs).unwrap_or(0.0);
+                let ts = median(&mut ts_runs).unwrap_or(0.0);
+                let s_per_step = (ts - t1) / (steps_s - 1) as f64;
+                let fixed_s = t1 - s_per_step;
+                let rss_gb = get_peak_rss_gb();
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "model": model_cfg.id,
+                        "kind": "image",
+                        "width": width,
+                        "height": height,
+                        "steps": steps_s,
+                        "s_per_step": s_per_step,
+                        "fixed_s": fixed_s,
+                        "rss_gb": rss_gb,
+                    })
+                );
+                metric_lines.push(format!("METRIC {slug}_s_per_step={s_per_step:.4}"));
             }
-        };
-        res.bytes_basis = bytes_basis;
-        res.model = model_cfg.id.clone();
-        res.file = artifacts
-            .config_path
-            .as_ref()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| model_cfg.id.clone());
-        roofline_pcts.push(res.roofline_pct);
-        let slug = model_cfg.name.clone().unwrap_or_else(|| {
-            model_cfg
-                .id
-                .split('/')
-                .next_back()
-                .unwrap_or(&model_cfg.id)
-                .replace(".gguf", "")
-        });
-        slug_speeds.push((slug, res.decode_tok_s));
-        if model_cfg
-            .min_tok_s
-            .is_some_and(|floor| res.decode_tok_s < floor)
-        {
-            missed_floor = true;
-        }
-        if let Ok(line) = serde_json::to_string(&res) {
-            println!("{line}");
+            "embed" => {
+                let policy: crate::model::weight_format::ReencodePolicy = match reencode.parse() {
+                    Ok(p) => p,
+                    Err(e) => {
+                        fail(&e);
+                        had_error = true;
+                        continue;
+                    }
+                };
+                let words: Vec<&str> = prompt.split_whitespace().collect();
+                if words.len() < 32 {
+                    fail("embed bench prompt must have >= 32 words");
+                    had_error = true;
+                    continue;
+                }
+                let prefixes: Vec<String> = (0..8).map(|i| words[..4 + 4 * i].join(" ")).collect();
+                let items = model_cfg.items.unwrap_or(64).max(1);
+                let _lock = crate::hardware::gpu_lock()?;
+                let hw = crate::hardware::HardwareCapability::probe_system();
+                let opts = crate::arch::LoadOpts {
+                    placement: crate::hardware::PlacementMode::Pin(crate::hardware::Device::Metal),
+                    token: None,
+                    quant_name: None,
+                    hw: &hw,
+                    reencode: crate::model::weight_format::ReencodeConfig {
+                        policy,
+                        ..Default::default()
+                    },
+                    family: None,
+                    stage: &|_| {},
+                    admit: &|_| Ok(()),
+                    system1_first: true,
+                };
+                let jev = match crate::arch::load_model(&hub, &model_cfg.id, &opts) {
+                    Ok(crate::arch::Loaded::System1(jev)) => jev,
+                    Ok(_) => {
+                        fail("expected System1 embed model");
+                        had_error = true;
+                        continue;
+                    }
+                    Err(e) => {
+                        fail(&e);
+                        had_error = true;
+                        continue;
+                    }
+                };
+                let mut warm_err = None;
+                for p in &prefixes {
+                    if let Err(e) = jev.embed(p) {
+                        warm_err = Some(e);
+                        break;
+                    }
+                }
+                if let Some(e) = warm_err {
+                    fail(&e);
+                    had_error = true;
+                    continue;
+                }
+                let mut secs = Vec::with_capacity(runs);
+                let mut run_err = None;
+                for _ in 0..runs {
+                    let t0 = std::time::Instant::now();
+                    for idx in 0..items {
+                        if let Err(e) = jev.embed(&prefixes[idx % 8]) {
+                            run_err = Some(e);
+                            break;
+                        }
+                    }
+                    if run_err.is_some() {
+                        break;
+                    }
+                    secs.push(t0.elapsed().as_secs_f64());
+                }
+                if let Some(e) = run_err {
+                    fail(&e);
+                    had_error = true;
+                    continue;
+                }
+                let sec = median(&mut secs).unwrap_or(0.0);
+                let ms_per_item = sec * 1000.0 / items as f64;
+                let items_per_s = if sec > 0.0 { items as f64 / sec } else { 0.0 };
+                let rss_gb = get_peak_rss_gb();
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "model": model_cfg.id,
+                        "kind": "embed",
+                        "items": items,
+                        "ms_per_item": ms_per_item,
+                        "items_per_s": items_per_s,
+                        "rss_gb": rss_gb,
+                    })
+                );
+                metric_lines.push(format!("METRIC {slug}_items_per_s={items_per_s:.1}"));
+            }
+            other => {
+                fail(&format!("unknown bench kind '{other}'"));
+                had_error = true;
+            }
         }
     }
 
@@ -427,10 +674,9 @@ pub fn run_bench_suite(path: &str) -> Result<i32, String> {
         println!("METRIC min_roofline_pct={min_pct:.2}");
     }
 
-    for (slug, speed) in slug_speeds {
-        println!("METRIC {slug}_tok_s={speed:.1}");
+    for line in metric_lines {
+        println!("{line}");
     }
-
     if had_error {
         Ok(2)
     } else if missed_floor {
@@ -654,7 +900,11 @@ mod suite_tests {
     /// Every committed suite parses as `run_bench_suite` reads it, with a valid re-encode policy per row.
     #[test]
     fn bench_suites_parse() {
-        for path in ["bench/loop.json", "bench/reference-7b.json"] {
+        for path in [
+            "bench/loop.json",
+            "bench/reference-7b.json",
+            "bench/nonlm.json",
+        ] {
             let text = std::fs::read_to_string(path).unwrap();
             let suite: super::BenchSuite = serde_json::from_str(&text).unwrap();
             assert!(!suite.models.is_empty(), "{path}: no models");
@@ -669,5 +919,11 @@ mod suite_tests {
                     .unwrap();
             }
         }
+        let s: super::BenchSuite = serde_json::from_str(
+            r#"{"defaults":{"prefill_tokens":512},"models":[{"id":"x","prefill_tokens":4096}]}"#,
+        )
+        .unwrap();
+        assert_eq!(s.defaults.unwrap().prefill_tokens, 512);
+        assert_eq!(s.models[0].prefill_tokens, Some(4096));
     }
 }

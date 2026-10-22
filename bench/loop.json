@@ -3,7 +3,8 @@
     "prompt": "Explain the second law of thermodynamics to a curious student.",
     "decode_tokens": 128,
     "runs": 3,
-    "reencode": "max-speed"
+    "reencode": "max-speed",
+    "prefill_tokens": 512
   },
   "models": [
     {
@@ -40,7 +41,8 @@
       "id": "unsloth/gemma-4-E2B-it-qat-GGUF/gemma-4-E2B-it-qat-UD-Q2_K_XL.gguf",
       "name": "e2b-qat-ctx4k",
       "prompt_file": "prompts/long-4k.txt",
-      "decode_tokens": 64
+      "decode_tokens": 64,
+      "prefill_tokens": 4096
     }
   ]
 }

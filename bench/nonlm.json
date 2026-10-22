@@ -1,0 +1,36 @@
+{
+  "defaults": {
+    "prompt": "a lighthouse on a rocky cliff at dusk, oil painting",
+    "runs": 2,
+    "reencode": "max-speed"
+  },
+  "models": [
+    {
+      "id": "stabilityai/sd-turbo",
+      "kind": "image",
+      "steps": 4,
+      "width": 512,
+      "height": 512
+    },
+    {
+      "id": "abenzerps/Qwen-Image-2.1-Uncensored-GGUF",
+      "kind": "image",
+      "steps": 4,
+      "width": 512,
+      "height": 512
+    },
+    {
+      "id": "sentence-transformers/all-MiniLM-L6-v2",
+      "kind": "embed",
+      "items": 64,
+      "prompt": "The quick brown fox jumps over the lazy dog while the farmer counts his sheep in the early morning light, and the river keeps flowing past the old mill toward the sea where fishing boats wait for the tide to turn again tonight."
+    },
+    {
+      "id": "google-t5/t5-small",
+      "kind": "lm",
+      "prompt": "translate English to German: The house is wonderful and the garden is large.",
+      "decode_tokens": 32,
+      "prefill_tokens": 0
+    }
+  ]
+}
