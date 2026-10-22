@@ -12,8 +12,7 @@ use super::super::{new_shared_buffer, numel, set_bytes, u32_of, Planned, Session
 use super::{Enc, PlanOut};
 use crate::graph::codec::{codec, Codec};
 use crate::graph::codegen::{
-    block_ref, device_msl, gemv_indexed, gemv_indexed_name, gemv_rows_per_tg, iq2_grid_msl,
-    GemvParams, Iq2Grid,
+    block_ref, device_msl, gemv_indexed, gemv_indexed_name, gemv_rows_per_tg, GemvParams,
 };
 use crate::graph::{DType, Graph, Node, Op, ValueId};
 use crate::hardware::QuantFormat;
@@ -445,27 +444,8 @@ thread_local! {
     static TEST_ROWS_PER_SG: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static TEST_PSO_OVERRIDE: std::cell::RefCell<Option<ComputePipelineState>> =
         const { std::cell::RefCell::new(None) };
-    static TEST_IQ2_GRID: std::cell::Cell<Option<Iq2Grid>> = const { std::cell::Cell::new(None) };
 }
 
-/// The grid binding of `c`'s expert GEMV: [`Iq2Grid::Program`] unless `c` is IQ2_XXS and
-/// `GIBBS_IQ2_GRID=tg|buf` (read once) picks the threadgroup-staged or bound-buffer lookup.
-fn iq2_grid(c: &Codec) -> Iq2Grid {
-    if c.format != QuantFormat::GGUF_IQ2_XXS {
-        return Iq2Grid::Program;
-    }
-    #[cfg(test)]
-    if let Some(m) = TEST_IQ2_GRID.get() {
-        return m;
-    }
-    static MODE: LazyLock<Iq2Grid> =
-        LazyLock::new(|| match std::env::var("GIBBS_IQ2_GRID").as_deref() {
-            Ok("tg") => Iq2Grid::Threadgroup,
-            Ok("buf") => Iq2Grid::Buffer,
-            _ => Iq2Grid::Program,
-        });
-    *MODE
-}
 
 fn moe_rows_per_sg(_c: &Codec) -> usize {
     #[cfg(test)]
@@ -482,10 +462,9 @@ fn moe_rows_per_sg(_c: &Codec) -> usize {
     // }
     2
 }
-/// Per (device, codec, rows_per_sg, grid binding) pipelines of [`gemv_indexed`], compiled on first use.
-static MOE_GEMV: LazyLock<
-    Mutex<HashMap<(u64, QuantFormat, usize, Iq2Grid), ComputePipelineState>>,
-> = LazyLock::new(|| Mutex::new(HashMap::new()));
+/// Per (device, codec, rows_per_sg) pipelines of [`gemv_indexed`], compiled on first use.
+static MOE_GEMV: LazyLock<Mutex<HashMap<(u64, QuantFormat, usize), ComputePipelineState>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 fn moe_gemv_pso(sess: &Session, c: &Codec, r: usize) -> Result<ComputePipelineState, String> {
     #[cfg(test)]
@@ -493,8 +472,7 @@ fn moe_gemv_pso(sess: &Session, c: &Codec, r: usize) -> Result<ComputePipelineSt
         return Ok(pso);
     }
     let device = &sess.rt.device;
-    let grid = iq2_grid(c);
-    let key = (device.registry_id(), c.format, r, grid);
+    let key = (device.registry_id(), c.format, r);
     if let Some(p) = MOE_GEMV.lock().get(&key) {
         return Ok(p.clone());
     }
@@ -504,7 +482,7 @@ fn moe_gemv_pso(sess: &Session, c: &Codec, r: usize) -> Result<ComputePipelineSt
     };
     let src = format!(
         "#include <metal_stdlib>\nusing namespace metal;\n{}",
-        iq2_grid_msl(gemv_indexed(c, params), grid)?
+        gemv_indexed(c, params)
     );
     let opts = CompileOptions::new();
     let lib = device.new_library_with_source(&src, &opts).map_err(|e| {
@@ -639,9 +617,6 @@ pub(super) fn encode(sess: &Session, e: &Enc, s: &Planned, st: &Step) -> Result<
                 ],
             );
             e.bind(4, *ids);
-            if iq2_grid(c) == Iq2Grid::Buffer {
-                set_bytes(enc, 5, &crate::model::layers::IQ2XXS_GRID);
-            }
             let rows_per_tg = gemv_rows_per_tg(GemvParams {
                 rows_per_sg: r,
                 ..Default::default()
@@ -1276,34 +1251,6 @@ mod tests {
         super::TEST_ROWS_PER_SG.set(0);
     }
 
-    /// The threadgroup-staged and bound-buffer IQ2_XXS grid lookups match the CPU reference, with a
-    /// row tail (35 rows) whose idle simdgroups still reach the staging barrier.
-    #[test]
-    fn moe_linear_iq2xxs_grid_modes_match_cpu() {
-        let ids = vec![4, 0, 5, 2, 2, 1];
-        for grid in [super::Iq2Grid::Threadgroup, super::Iq2Grid::Buffer] {
-            super::TEST_IQ2_GRID.set(Some(grid));
-            for r in [2usize, 4] {
-                super::TEST_ROWS_PER_SG.set(r);
-                for x_rows in [2, 6] {
-                    let (want, got) = moe_both(
-                        Fmt::Q(Q::GGUF_IQ2_XXS),
-                        x_rows,
-                        512,
-                        35,
-                        6,
-                        3,
-                        ids.clone(),
-                        21,
-                    );
-                    let err = rel_err(&want, &got);
-                    assert!(err < 1e-4, "{grid:?} r={r} x_rows={x_rows}: {err}");
-                }
-            }
-        }
-        super::TEST_IQ2_GRID.set(None);
-        super::TEST_ROWS_PER_SG.set(0);
-    }
 
     #[test]
     fn moe_linear_shapes_and_routing_match_cpu() {
@@ -1709,7 +1656,6 @@ mod tests {
     #[test]
     #[ignore = "bandwidth measurement"]
     fn moe_gemv_bandwidth() {
-        use super::Iq2Grid as G;
         let (experts, top_k, steps) = (16usize, 8usize, 8usize);
         let ids = Tensor::U32(vec![0, 2, 5, 7, 9, 11, 13, 15]);
         for (f, rows, cols, x_rows) in [
@@ -1742,13 +1688,9 @@ mod tests {
             let s = Session::new(rt(), &w).unwrap();
             let plan = s.prepare_plan(&g).unwrap();
             let xs = Tensor::F32(vec![0.25; x_rows * cols]);
-            let mut legs = vec![("r2", 2usize, G::Program), ("r4", 4, G::Program)];
-            if f == Q::GGUF_IQ2_XXS {
-                legs.extend([("r2/tg", 2, G::Threadgroup), ("r2/buf", 2, G::Buffer)]);
-            }
-            let run_leg = |&(_, r, grid): &(&str, usize, G), n: usize| -> f64 {
+            let legs = [("r2", 2usize), ("r4", 4)];
+            let run_leg = |&(_, r): &(&str, usize), n: usize| -> f64 {
                 super::TEST_ROWS_PER_SG.set(r);
-                super::TEST_IQ2_GRID.set(Some(grid));
                 let mut leg_s = 0.0;
                 for _ in 0..n {
                     s.run_prepared(&g, &plan, None, vec![xs.clone(), ids.clone()])
@@ -1771,7 +1713,6 @@ mod tests {
                 }
             }
             super::TEST_ROWS_PER_SG.set(0);
-            super::TEST_IQ2_GRID.set(None);
             let median = |t: &[f64]| {
                 let mut v = t.to_vec();
                 v.sort_by(|a, b| a.total_cmp(b));
@@ -1781,7 +1722,7 @@ mod tests {
             let report: Vec<String> = legs
                 .iter()
                 .zip(&rounds)
-                .map(|(&(label, _, _), t)| {
+                .map(|(&(label, _), t)| {
                     let wins = t.iter().zip(base).filter(|(a, b)| a < b).count();
                     let worst = t
                         .iter()

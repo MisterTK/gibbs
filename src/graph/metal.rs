@@ -7094,7 +7094,7 @@ mod tests {
     /// dispatched and no runtime (host-profile measurement) is created.
     #[test]
     fn every_kernel_source_compiles() {
-        use crate::graph::codegen::{self, GemvParams, Iq2Grid};
+        use crate::graph::codegen::{self, GemvParams};
         let device = Device::system_default().expect("Metal device");
         let (lib, mpp) = compile(&device).expect("kernel library");
         mpp.expect("MSL 4.0 kernel library");
@@ -7200,16 +7200,10 @@ mod tests {
                     rows_per_sg: r,
                     ..Default::default()
                 };
-                let grids: &[Iq2Grid] = if c.format == QuantFormat::GGUF_IQ2_XXS {
-                    &[Iq2Grid::Program, Iq2Grid::Threadgroup, Iq2Grid::Buffer]
-                } else {
-                    &[Iq2Grid::Program]
-                };
-                for &grid in grids {
-                    let src = codegen::iq2_grid_msl(codegen::gemv_indexed(c, p), grid)
-                        .unwrap_or_else(|e| panic!("{:?} {grid:?}: {e}", c.format));
-                    build(&format!("{head}{src}"), &codegen::gemv_indexed_name(c, p));
-                }
+                build(
+                    &format!("{head}{}", codegen::gemv_indexed(c, p)),
+                    &codegen::gemv_indexed_name(c, p),
+                );
             }
         }
     }
