@@ -84,7 +84,7 @@ Effective GB/s = bytes per token × tok/s; llama.cpp's bytes are the GGUF file s
 ### Build
 ```bash
 cargo build --release      # or: make release
-# Produces ./target/release/gibbs (also ./target/release/foundry-engine)
+# Produces ./target/release/gibbs
 
 make tui                   # build, then open the dashboard
 make tui ARGS="--model THUDM/glm-edge-1.5b-chat --port 8081"
@@ -376,20 +376,11 @@ Which files are downloaded: the hub lists the repo (Hugging Face tree API), fetc
 | `GIBBS_SPEC=off` | Disables speculative decoding (built-in MTP heads and `--draft`). |
 | `GIBBS_TUNE=off` (also `0`, `false`) | Keeps each weight format's default GEMV variant without running the per-shape tuner or reading the tune cache (`src/graph/tune.rs`). |
 | `GIBBS_TUNE_BUSY_PCT=<n>` | Device-utilization percent above which foreign GPU load is assumed and tuned winners are kept in-memory only instead of persisted (default `20`). |
-| `GIBBS_FUSION=xla` | Restricts the Metal planner to XLA's GPU fusion classes (elementwise chain, reduce-input, dot-epilogue, sibling same-kind), disabling horizontal batching for comparison (`src/graph/metal.rs`). |
-| `GIBBS_DISABLE=<item>,...` | Per-item kill switch for A/B runs: `deltanet` (fused `DeltaNetStep`), `qwen_packed` (Qwen3.5 GGUF keeps identity `linear_attn` tensors packed), `pipeline` (greedy decode waits for each token before encoding the next, instead of keeping the next token's command buffers queued with its id picked and fed on the GPU). Other fusions stay as `GIBBS_FUSION` sets them (`src/graph/mod.rs`). |
+| `GIBBS_FUSION=off` (also `none`, `0`) | Disables planner fusions (`src/graph/metal.rs`). |
+| `GIBBS_DISABLE=<item>,...` | Per-item kill switch for A/B runs: `deltanet` (fused `DeltaNetStep`) and `pipeline` (greedy decode waits for each token before encoding the next, instead of keeping the next token's command buffers queued with its id picked and fed on the GPU). Other fusions stay as `GIBBS_FUSION` sets them (`src/graph/mod.rs`). |
 | `GIBBS_KV_DTYPE=f32\|f16` | Metal attention KV cache storage (default `f32`). `f16` halves the cache bytes (attention accumulates in f32; K/V beyond ±65504 saturate) but decoded 0.5–24% slower per bench model (worst at 4k context; Qwen3.5 rows, with few attention layers, about 1%), so it is opt-in. Caches that anything other than cached attention also reads (encoder-decoder self attention, `StateReorder`) stay f32. |
-| `GIBBS_CB_CHUNK=<first>,<chunk>` | Steps encoded into the first Metal command buffer and into each subsequent buffer when a plan has at least 400 steps (default `24,160`; `0` encodes the whole forward pass in a single command buffer). |
-| `GIBBS_EXEC_ORDER_WEIGHTS=1` (also `on`, `true`) | Repacks Metal weight buffers in graph execution order at load time (experimental, off by default). |
-| `GIBBS_PLE_FUSED=one` | Fuses each m = 1 `GeGlu`-epilogue GEMV (`gelu(W_a x) * side`, ≤ 512 rows) and the GEMV that is its only reader into one Metal dispatch that recomputes the activation in every threadgroup (experimental, off by default; `src/graph/metal/ext/ple.rs`). |
-| `GIBBS_GPU_ARGMAX=1` (also `on`, `true`) | Greedy (temperature 0) decode steps of a single-Metal-segment program with a vocabulary of at least 150k pick the token on the GPU (two-pass argmax, ties to the lowest index) and read back one `u32` instead of the logits row; logprobs, `--bench-parity` and sampled decoding still read the full row (experimental, off by default; `src/graph/program.rs`). |
-| `GIBBS_IQ2_GRID=tg` / `buf` | IQ2_XXS expert (MoE) GEMVs read the 2 KB grid from a per-threadgroup `uint` copy (`tg`) or a bound `constant` buffer (`buf`) instead of the program-scope `constant` table (experimental, off by default). |
-| `GIBBS_DELTANET_STATE=f16` (or `bf16`) | Stores the recurrent state of fused decode delta-rule layers in half / bfloat, with f32 arithmetic (opt-in, default `f32`; planning fails if a stateful delta rule stays unfused, and the host reads such a state only as raw bytes). |
-| `GIBBS_BATCH_COMMUTE=1` (also `on`, `true`) | Lets a horizontal RmsNorm batch move any independent single-output step ahead of it, not only a GEMV (planner batching rule in `src/graph/metal/fuse.rs`; changes plans, measurement-gated, off by default). |
-| `GIBBS_PLAN_SEARCH=1` (also `on`, `true`) | On a Metal load, times the e-graph's fusion choices on the device: each repeated pattern flipped from the cost model's pick (then combinations of the winners) as a whole-model decode step, in two opposite-order rounds; a flip is kept only if it beats the cost-model plan by more than 2% in both (8% under foreign GPU load). Budget 2 s per model; one verdict per timed pattern persists in the tune file (never under foreign load or with > 5% round spread), and later loads time only the patterns not yet settled (`src/graph/search.rs`; off by default). Each candidate clones the graph and weights: cheap for mapped weights, so don't enable it on models whose loader dequantizes large tensors. |
 | `GIBBS_PROFILE_KERNELS=1` / `GIBBS_PROFILE_ROWS=<n>` | Prints a per-command-buffer kernel timing table by kind and the `<n>` slowest steps (default `10`) with effective GB/s and % of ceiling to stderr. |
 | `GIBBS_DUMP_PLAN=1` | Prints every planned Metal step index, name and kernel kind to stderr during `prepare_plan`. |
-| `GIBBS_TRACE_ENCODE=1` | Prints CPU command-buffer encode time (µs) and GPU execution time (ms) per decode step to stderr. |
 
 ### Sampling and scheduling
 
