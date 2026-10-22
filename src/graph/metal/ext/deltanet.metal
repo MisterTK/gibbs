@@ -29,20 +29,6 @@ struct DnF32 {
     static float ld(float v) { return v; }
     static float st(float f) { return f; }
 };
-struct DnF16 {
-    typedef half T;
-    static float ld(half v) { return float(v); }
-    static half st(float f) { return half(f); }
-};
-struct DnBF16 {
-    typedef ushort T;
-    static float ld(ushort v) { return as_type<float>(uint(v) << 16); }
-    // Round to nearest even (no NaN special case).
-    static ushort st(float f) {
-        uint b = as_type<uint>(f);
-        return ushort((b + 0x7FFFu + ((b >> 16) & 1u)) >> 16);
-    }
-};
 
 // One-token causal conv of channel `c` over [state rows, x], shifting x into the state; then SiLU.
 static inline float dn_conv_silu(device const float* x, device const float* w, device float* cs,
@@ -174,5 +160,3 @@ template <typename S>
 }
 
 template [[host_name("deltanet_step_f32")]] [[kernel]] decltype(deltanet_step<DnF32>) deltanet_step<DnF32>;
-template [[host_name("deltanet_step_f16")]] [[kernel]] decltype(deltanet_step<DnF16>) deltanet_step<DnF16>;
-template [[host_name("deltanet_step_bf16")]] [[kernel]] decltype(deltanet_step<DnBF16>) deltanet_step<DnBF16>;

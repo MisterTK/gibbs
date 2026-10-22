@@ -5,8 +5,7 @@
 //! `CausalConv1dCached -> SiLU -> last-axis Slice q|k|v -> DeltaRule(beta, log_decay) -> RmsNorm(·, g[val_dim])
 //! -> Mul(·, gate)` with `beta = Sigmoid(b)`, `log_decay = w * Softplus([a + bias])` and
 //! `gate = SiLU|Sigmoid(z)` by one [`DeltaNetStep`]. Gate pieces another step already absorbed (a GEMV
-//! epilogue) stay inputs. Exact up to fp reassociation, so on by default; `GIBBS_DELTANET_STATE=f16|bf16`
-//! stores the recurrent state in half / bfloat (f32 arithmetic).
+//! epilogue) stay inputs. Exact up to fp reassociation, so on by default.
 
 use super::super::{fusion_enabled, numel, set_bytes, Planned, Session};
 use super::{Enc, ExtStep};
@@ -16,46 +15,13 @@ use std::collections::HashMap;
 
 pub(super) const MSL: &str = include_str!("deltanet.metal");
 /// Compute functions in `deltanet.metal`.
-pub(super) const KERNELS: &[&str] = &[
-    "deltanet_step_f32",
-    "deltanet_step_f16",
-    "deltanet_step_bf16",
-];
+pub(super) const KERNELS: &[&str] = &["deltanet_step_f32"];
 
 /// Threads per threadgroup and the kernel's fixed-size limits (`DN_*` in `deltanet.metal`).
 pub(in super::super) const THREADS: usize = 1024;
 const MAX_KD: usize = 256;
 const MAX_VD: usize = 256;
 const MAX_RPT: usize = 16;
-
-/// Storage type of the recurrent state; arithmetic is always f32.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StateDtype {
-    F32,
-    F16,
-    BF16,
-}
-
-impl StateDtype {
-    fn kernel(self) -> &'static str {
-        match self {
-            StateDtype::F32 => "deltanet_step_f32",
-            StateDtype::F16 => "deltanet_step_f16",
-            StateDtype::BF16 => "deltanet_step_bf16",
-        }
-    }
-}
-
-// ponytail: a half/bfloat state is opaque to the host: `StateStore::snapshot`/`restore` round-trip its
-// bytes, but `sync_metal_to_cpu` or a CPU-seeded state read it as f32. Hence opt-in only; an unfused
-// stateful `DeltaRule` (which reads f32) fails the plan instead (`check_state_dtype`).
-/// `GIBBS_DELTANET_STATE=f16|bf16` (read once); default f32.
-static STATE_DTYPE: std::sync::LazyLock<StateDtype> =
-    std::sync::LazyLock::new(|| match std::env::var("GIBBS_DELTANET_STATE").as_deref() {
-        Ok("f16" | "half") => StateDtype::F16,
-        Ok("bf16") => StateDtype::BF16,
-        _ => StateDtype::F32,
-    });
 
 /// The fused decode step (`deltanet_step_*`); writes `conv_state` and `state` in place.
 #[derive(Debug, Clone)]
@@ -80,7 +46,6 @@ pub struct DeltaNetStep {
     /// 0: `z` is the gate, 1: SiLU(z), 2: sigmoid(z).
     pub z_act: u32,
     pub beta_sigmoid: bool,
-    pub state_dtype: StateDtype,
 }
 
 /// `(cw, rgroups, rpt)` thread layout of the state, `None` when the kernel's limits are exceeded.
@@ -115,7 +80,7 @@ fn is_add(op: &Op) -> bool {
 /// Replaces every matched decode (`n == 1`) chain by one fused step at the chain's last step.
 pub(in super::super) fn fuse(g: &Graph, steps: &mut Vec<Planned>) -> Result<(), String> {
     if !fusion_enabled() || crate::graph::disabled("deltanet") {
-        return check_state_dtype(steps, *STATE_DTYPE);
+        return Ok(());
     }
     let mut readers: HashMap<ValueId, Vec<usize>> = HashMap::new();
     for (i, n) in g.nodes.iter().enumerate() {
@@ -125,7 +90,7 @@ pub(in super::super) fn fuse(g: &Graph, steps: &mut Vec<Planned>) -> Result<(), 
     }
     let step_of: HashMap<ValueId, usize> =
         steps.iter().enumerate().map(|(i, s)| (s.out, i)).collect();
-    let found = chains(g, steps, &readers, &step_of, *STATE_DTYPE)?;
+    let found = chains(g, steps, &readers, &step_of)?;
     let mut drop = Vec::new();
     for (at, rm, st) in found {
         // `rm[0]` is the DeltaRule step: profiles and plan dumps show the fused step under its name.
@@ -142,22 +107,9 @@ pub(in super::super) fn fuse(g: &Graph, steps: &mut Vec<Planned>) -> Result<(), 
     for i in drop.into_iter().rev() {
         steps.remove(i);
     }
-    check_state_dtype(steps, *STATE_DTYPE)
+    Ok(())
 }
 
-/// A non-f32 state is only written by the fused kernel: any stateful `DeltaRule` left unfused would
-/// read it as f32.
-fn check_state_dtype(steps: &[Planned], dtype: StateDtype) -> Result<(), String> {
-    match steps.iter().find(|s| {
-        matches!(s.op, super::super::Step::DeltaRule { state: Some(_), .. })
-    }) {
-        Some(s) if dtype != StateDtype::F32 => Err(format!(
-            "node '{}': GIBBS_DELTANET_STATE={dtype:?} needs every stateful DeltaRule fused, and this one is not",
-            s.name
-        )),
-        _ => Ok(()),
-    }
-}
 
 /// The `deltanet-chain` rules. Facts are value / node / step ids: `DR` a decode `DeltaRule` step
 /// with a state and a kernel layout, `Sl` a last-axis Slice, `Un`/`Bi` one/two-input SiLU(1),
@@ -241,7 +193,6 @@ fn chains(
     steps: &[Planned],
     readers: &HashMap<ValueId, Vec<usize>>,
     step_of: &HashMap<ValueId, usize>,
-    state_dtype: StateDtype,
 ) -> Result<Vec<(usize, Vec<usize>, DeltaNetStep)>, String> {
     use super::super::fuse::{err, loaded, relation};
     use egglog::{Core as _, Write as _};
@@ -462,7 +413,6 @@ fn chains(
             eps,
             z_act: z[1] as u32,
             beta_sigmoid: b[1] == 1,
-            state_dtype,
         };
         found.push((at as usize, rm, st));
     }
@@ -504,12 +454,11 @@ pub(super) fn encode(
             s.name
         )
     })?;
-    let pso = sess.rt.pso(st.state_dtype.kernel())?;
+    let pso = sess.rt.pso("deltanet_step_f32")?;
     if (pso.max_total_threads_per_threadgroup() as usize) < THREADS {
         return Err(format!(
-            "node '{}': {} allows {} threads per threadgroup, needs {THREADS}",
+            "node '{}': deltanet_step_f32 allows {} threads per threadgroup, needs {THREADS}",
             s.name,
-            st.state_dtype.kernel(),
             pso.max_total_threads_per_threadgroup()
         ));
     }
@@ -579,7 +528,6 @@ mod tests {
     use super::super::super::testutil::{rand, rel_err, rt};
     use super::super::super::{kernel_kind, plan, Session, Step as Core};
     use super::super::ExtStep;
-    use super::StateDtype;
     use crate::graph::{cpu, DType, Graph, Op, StateStore, Tensor, UnaryKind, ValueId, Weights};
 
     /// `(key_heads, val_heads, key_dim, val_dim, conv taps)`.
@@ -735,7 +683,6 @@ mod tests {
             assert_eq!(steps.len(), if projected { 3 } else { 1 });
             assert_eq!(last.out, g.outputs[0]);
             assert!(st.beta_sigmoid);
-            assert_eq!(st.state_dtype, StateDtype::F32);
             // Projected: SiLU(z) is the z GEMV's epilogue and `+ dt_bias` the `a` Linear's residual.
             let z_act = match (projected, sigmoid_gate) {
                 (true, _) => 0,
@@ -770,14 +717,12 @@ mod tests {
     }
 
     #[test]
-    fn oversized_heads_stay_unfused_and_refuse_reduced_state() {
+    fn oversized_heads_stay_unfused() {
         // key_dim 128 over val_dim 256 needs 32 state rows per thread (> MAX_RPT).
         let (g, _, _) = layer((1, 1, 128, 256, 4), false, false);
         let names = listing(&g);
         assert!(names.iter().any(|n| n.ends_with(" DeltaRule")), "{names:?}");
-        let (steps, _) = plan(&g).unwrap();
-        assert!(super::check_state_dtype(&steps, StateDtype::F32).is_ok());
-        assert!(super::check_state_dtype(&steps, StateDtype::F16).is_err());
+        assert!(!names.iter().any(|n| n.ends_with(" DeltaNetStep")), "{names:?}");
     }
 
     fn cosine(a: &[f32], b: &[f32]) -> f64 {
@@ -790,22 +735,17 @@ mod tests {
     /// storing its state as `dtype`; returns per-token (rel err, cosine) and the final state rel err.
     fn run(
         (dims, sigmoid_gate, projected): (Dims, bool, bool),
-        dtype: StateDtype,
         tokens: usize,
     ) -> (Vec<(f32, f64)>, f32) {
         let (g, w, _) = layer(dims, sigmoid_gate, projected);
         let s = Session::new(rt(), &w).unwrap();
-        let mut prep = s.prepare_plan(&g).unwrap();
-        let fused: Vec<_> = prep
+        let prep = s.prepare_plan(&g).unwrap();
+        let fused = prep
             .steps
-            .iter_mut()
-            .filter_map(|st| match &mut st.op {
-                Core::Ext(ExtStep::DeltaNet(f)) => Some(f),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(fused.len(), 1, "chain not fused");
-        fused.into_iter().for_each(|f| f.state_dtype = dtype);
+            .iter()
+            .filter(|st| matches!(st.op, Core::Ext(ExtStep::DeltaNet(_))))
+            .count();
+        assert_eq!(fused, 1, "chain not fused");
         let (mut cs, mut ms) = (StateStore::new(), StateStore::new());
         let mut errs = Vec::new();
         for t in 0..tokens as u64 {
@@ -846,7 +786,7 @@ mod tests {
     #[test]
     fn fused_chain_matches_cpu_over_decode_steps() {
         for case in CASES {
-            let (errs, state_err) = run(case, StateDtype::F32, 20);
+            let (errs, state_err) = run(case, 20);
             for (t, &(e, _)) in errs.iter().enumerate() {
                 assert!(e < 1e-4, "{case:?} token {t}: rel err {e}");
             }
@@ -854,15 +794,4 @@ mod tests {
         }
     }
 
-    #[test]
-    fn reduced_precision_state_tracks_f32_reference() {
-        // ponytail: bf16 bound is a margin guess (8-bit mantissa, round-to-nearest-even), not measured.
-        for (dtype, min_cos) in [(StateDtype::F16, 0.9999), (StateDtype::BF16, 0.999)] {
-            for case in [CASES[0], CASES[1]] {
-                let (errs, _) = run(case, dtype, 32);
-                let worst = errs.iter().map(|e| e.1).fold(1.0f64, f64::min);
-                assert!(worst >= min_cos, "{dtype:?} {case:?}: min cosine {worst}");
-            }
-        }
-    }
 }
