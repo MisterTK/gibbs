@@ -1118,6 +1118,16 @@ fn every_kernel_source_compiles() {
                 &codegen::gemv_packed_name(c, p),
             );
         }
+        for b in [2, 4, 8] {
+            let p = GemvParams {
+                batch: b,
+                ..Default::default()
+            };
+            build(
+                &format!("{head}{common}{}", codegen::gemv_packed(c, p)),
+                &codegen::gemv_packed_name(c, p),
+            );
+        }
         build(
             &format!("{head}{}", codegen::dequant_packed(c)),
             &codegen::dequant_packed_name(c),
@@ -2187,6 +2197,357 @@ fn gemm_packed_in_tile_dequant_matches_cpu() {
             }
         }
     }
+}
+
+#[test]
+fn multi_row_gemv_matches_cpu() {
+    use crate::model::layers::{encode_rows, gguf_block_codec};
+    let rt = rt();
+    let (n, k) = (101usize, 512usize);
+    let mut seed = 0x243F6A8885A308D3u64;
+    let mut next_u32 = move || {
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (seed >> 33) as u32
+    };
+    let f16_scale = |next: &mut dyn FnMut() -> u32| -> [u8; 2] {
+        let exp = 10 + (next() % 6) as u16;
+        (((next() & 1) as u16) << 15 | exp << 10 | (next() & 0x3FF) as u16).to_le_bytes()
+    };
+    for fmt in [
+        QuantFormat::GGUF_Q4_0,
+        QuantFormat::GGUF_Q4_K_M,
+        QuantFormat::GGUF_IQ2_XXS,
+        QuantFormat::GGUF_TQ2_0,
+    ] {
+        let mut w = Weights::new();
+        let raw = match fmt {
+            QuantFormat::GGUF_Q4_0 | QuantFormat::GGUF_Q4_K_M => {
+                encode_rows(&rand(n * k, 10 + fmt as u64), k, fmt).expect("encode_rows")
+            }
+            _ => {
+                let (be, bb, dequant) = gguf_block_codec(fmt).expect("CPU dequantizer");
+                let scale_off = if fmt == QuantFormat::GGUF_TQ2_0 { 64 } else { 0 };
+                let mut raw: Vec<u8> = (0..n * (k / be) * bb)
+                    .map(|_| (next_u32() >> 4) as u8)
+                    .collect();
+                let mut decoded = vec![0.0f32; be];
+                for blk in raw.chunks_exact_mut(bb) {
+                    blk[scale_off..scale_off + 2].copy_from_slice(&f16_scale(&mut next_u32));
+                    dequant(blk, &mut decoded);
+                    if !decoded.iter().all(|v| v.is_finite()) {
+                        blk.fill(0);
+                    }
+                }
+                raw
+            }
+        };
+        w.insert(
+            "w",
+            Tensor::Mat(crate::model::weights::Mat::from_packed_bytes(fmt, raw, n, k)),
+        );
+        w.insert("b", Tensor::F32(rand(n, 20)));
+        let session = Session::new(rt.clone(), &w).unwrap();
+        let x_15 = rand(15 * k, 30);
+        let r_15 = rand(15 * n, 40);
+        for m in [2usize, 3, 5, 8, 15] {
+            for case in 0..3 {
+                let mut g = Graph::new();
+                let x = g.input("x", vec![m, k], DType::F32);
+                let r = g.input("r", vec![m, n], DType::F32);
+                let wv = g.weight("w", vec![n, k], DType::Quant(fmt));
+                let bv = g.weight("b", vec![n], DType::F32);
+                let ins = if case == 0 {
+                    vec![x, wv]
+                } else {
+                    vec![x, wv, bv]
+                };
+                let lin = g.add("lin", Op::Linear, &ins, vec![m, n], DType::F32);
+                let out = match case {
+                    0 | 1 => lin,
+                    _ => g.add(
+                        "res",
+                        Op::Binary {
+                            kind: crate::graph::BinaryKind::Add,
+                        },
+                        &[r, lin],
+                        vec![m, n],
+                        DType::F32,
+                    ),
+                };
+                g.output(out);
+                let inp = vec![
+                    Tensor::F32(x_15[..m * k].to_vec()),
+                    Tensor::F32(r_15[..m * n].to_vec()),
+                ];
+                let want = cpu::run_stateless(&g, &w, inp.clone())
+                    .unwrap()
+                    .remove(0)
+                    .into_f32()
+                    .unwrap();
+                let mut plan = session.prepare_plan(&g).unwrap();
+                for s in &mut plan.steps {
+                    if let Step::GemmBatchedPacked {
+                        x,
+                        w,
+                        bias,
+                        res,
+                        epi,
+                        m,
+                        n,
+                        k,
+                        format,
+                    } = s.op
+                    {
+                        s.op = Step::GemvPacked {
+                            x,
+                            w,
+                            weight_name: "w".into(),
+                            bias,
+                            res,
+                            epi,
+                            m,
+                            rows: n,
+                            cols: k,
+                            format,
+                            variant: GemvVariant::generated(2),
+                        };
+                    }
+                }
+                let got = session
+                    .run_prepared(&g, &plan, None, inp)
+                    .unwrap()
+                    .remove(0)
+                    .into_f32()
+                    .unwrap();
+                let err = rel_err(&want, &got);
+                assert!(
+                    err < 1e-4,
+                    "{fmt:?} m={m} case={case}: multi-row GemvPacked differs from CPU by {err:e}"
+                );
+            }
+        }
+    }
+}
+
+/// Compares multi-row `GemvPacked` (`B = 8`) vs P3.1 `GemmBatchedPacked` at `m = 8..=15`
+/// on `[m, 2048, 2048]`, `[m, 8192, 2048]`, `[m, 2048, 8192]` in Q4_K and IQ2_M.
+#[test]
+#[ignore = "bandwidth measurement"]
+fn multi_row_gemv_vs_gemm() {
+    use crate::model::layers::gguf_block_codec;
+    let rt = rt();
+    for fmt in [QuantFormat::GGUF_Q4_K_M, QuantFormat::GGUF_IQ2_M] {
+        let (be, bb, _) = gguf_block_codec(fmt).unwrap();
+        for (n, k) in [(2048usize, 2048usize), (8192, 2048), (2048, 8192)] {
+            let bytes = n * (k / be) * bb;
+            let copies = ((96usize << 20) / bytes).clamp(4, 32);
+            let raw = vec![0u8; copies * bytes];
+            let map = Arc::new(crate::model::loaders::gguf::GgufData::Buf(raw));
+            let mut weights = Weights::new();
+            for c in 0..copies {
+                let p = crate::model::weights::Packed {
+                    map: map.clone(),
+                    off: c * bytes,
+                    format: fmt,
+                    shape: vec![n, k],
+                };
+                weights.insert(
+                    format!("w{c}"),
+                    Tensor::Mat(crate::model::weights::Mat::from_packed(p, n, k)),
+                );
+            }
+            let session = Session::new(rt.clone(), &weights).unwrap();
+            for m in 8..=15 {
+                let mut g = Graph::new();
+                let x = g.input("x", vec![m, k], DType::F32);
+                for c in 0..copies {
+                    let w = g.weight(&format!("w{c}"), vec![n, k], DType::Quant(fmt));
+                    let y = g.add(
+                        &format!("lin{c}"),
+                        Op::Linear,
+                        &[x, w],
+                        vec![m, n],
+                        DType::F32,
+                    );
+                    g.output(y);
+                }
+                let plan_base = session.prepare_plan(&g).unwrap();
+                let mut plan_gemv = plan_base.clone();
+                for s in &mut plan_gemv.steps {
+                    if let Step::GemmBatchedPacked {
+                        x,
+                        w,
+                        bias,
+                        res,
+                        epi,
+                        m,
+                        n,
+                        k,
+                        format,
+                    } = s.op
+                    {
+                        s.op = Step::GemvPacked {
+                            x,
+                            w,
+                            weight_name: String::new(),
+                            bias,
+                            res,
+                            epi,
+                            m,
+                            rows: n,
+                            cols: k,
+                            format,
+                            variant: GemvVariant::generated(2),
+                        };
+                    }
+                }
+                let mut plan_gemm = plan_base;
+                for s in &mut plan_gemm.steps {
+                    if let Step::GemvPacked {
+                        x,
+                        w,
+                        bias,
+                        res,
+                        epi,
+                        m,
+                        rows: n,
+                        cols: k,
+                        format,
+                        ..
+                    } = s.op
+                    {
+                        s.op = Step::GemmBatchedPacked {
+                            x,
+                            w,
+                            bias,
+                            res,
+                            epi,
+                            m,
+                            n,
+                            k,
+                            format,
+                        };
+                    }
+                }
+                let inp = vec![Tensor::F32(vec![0.5; m * k])];
+                let time_plan = |p: &PreparedPlan| -> f64 {
+                    let mut best = f64::INFINITY;
+                    for rep in 0..6 {
+                        session.run_prepared(&g, p, None, inp.clone()).unwrap();
+                        if rep > 0 {
+                            best = best.min(session.last_gpu_seconds());
+                        }
+                    }
+                    best / copies as f64
+                };
+                let t_gemv = time_plan(&plan_gemv);
+                let t_gemm = time_plan(&plan_gemm);
+                println!(
+                    "{fmt:?} [{m}, {n}, {k}]: gemv_b8={:.1} us ({:.0} GB/s) vs gemm={:.1} us ({:.0} GB/s) -> {}",
+                    t_gemv * 1e6,
+                    bytes as f64 / t_gemv / 1e9,
+                    t_gemm * 1e6,
+                    bytes as f64 / t_gemm / 1e9,
+                    if t_gemm < t_gemv { "GEMM wins" } else { "GEMV wins" }
+                );
+            }
+        }
+    }
+}
+
+/// Verifies that GPU time at `m = 8` is <= 1.6x GPU time at `m = 1` across
+/// `[m, 2048, 2048]`, `[m, 8192, 2048]`, `[m, 2048, 8192]` in Q4_K and IQ2_M.
+#[test]
+#[ignore = "bandwidth measurement"]
+fn multi_row_gemv_bandwidth() {
+    use crate::model::layers::gguf_block_codec;
+    let rt = rt();
+    let mut bad = Vec::new();
+    for fmt in [QuantFormat::GGUF_Q4_K_M, QuantFormat::GGUF_IQ2_M] {
+        let (be, bb, _) = gguf_block_codec(fmt).unwrap();
+        let pso_b1 = rt
+            .gen_pso(fmt, crate::graph::codegen::GemvParams::default())
+            .unwrap();
+        let pso_b8 = rt
+            .gen_pso(
+                fmt,
+                crate::graph::codegen::GemvParams {
+                    batch: 8,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        println!(
+            "{fmt:?} PSO max_total_threads_per_threadgroup: b1={} b8={}",
+            pso_b1.max_total_threads_per_threadgroup(),
+            pso_b8.max_total_threads_per_threadgroup()
+        );
+        for (n, k) in [(2048usize, 2048usize), (8192, 2048), (2048, 8192)] {
+            let bytes = n * (k / be) * bb;
+            let copies = ((96usize << 20) / bytes).clamp(4, 32);
+            let raw = vec![0u8; copies * bytes];
+            let map = Arc::new(crate::model::loaders::gguf::GgufData::Buf(raw));
+            let mut weights = Weights::new();
+            for c in 0..copies {
+                let p = crate::model::weights::Packed {
+                    map: map.clone(),
+                    off: c * bytes,
+                    format: fmt,
+                    shape: vec![n, k],
+                };
+                weights.insert(
+                    format!("w{c}"),
+                    Tensor::Mat(crate::model::weights::Mat::from_packed(p, n, k)),
+                );
+            }
+            let session = Session::new(rt.clone(), &weights).unwrap();
+            let time_m = |m: usize| -> f64 {
+                let mut g = Graph::new();
+                let x = g.input("x", vec![m, k], DType::F32);
+                for c in 0..copies {
+                    let w = g.weight(&format!("w{c}"), vec![n, k], DType::Quant(fmt));
+                    let y = g.add(
+                        &format!("lin{c}"),
+                        Op::Linear,
+                        &[x, w],
+                        vec![m, n],
+                        DType::F32,
+                    );
+                    g.output(y);
+                }
+                let plan = session.prepare_plan(&g).unwrap();
+                let inp = vec![Tensor::F32(vec![0.5; m * k])];
+                let mut best = f64::INFINITY;
+                for rep in 0..9 {
+                    session.run_prepared(&g, &plan, None, inp.clone()).unwrap();
+                    if rep > 0 {
+                        best = best.min(session.last_gpu_seconds());
+                    }
+                }
+                best / copies as f64
+            };
+            let t1 = time_m(1);
+            let t8 = time_m(8);
+            let ratio = t8 / t1;
+            println!(
+                "{fmt:?} [{n}, {k}]: m=1 {:.1} us ({:.0} GB/s), m=8 {:.1} us ({:.0} GB/s), ratio={ratio:.2}x",
+                t1 * 1e6,
+                bytes as f64 / t1 / 1e9,
+                t8 * 1e6,
+                bytes as f64 / t8 / 1e9,
+            );
+            if ratio > 1.6 {
+                bad.push(format!(
+                    "{fmt:?} [{n}, {k}]: m=8 time ({:.1} us) > 1.6x m=1 time ({:.1} us), ratio={ratio:.2}x",
+                    t8 * 1e6,
+                    t1 * 1e6
+                ));
+            }
+        }
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
 }
 #[test]
 fn test_metal_batched_prefill_throughput() {
