@@ -43,6 +43,11 @@ pub trait Drafter: Send + Sync {
     fn max_k(&self) -> usize {
         4
     }
+    /// True when the drafter proposes token ids without a probability distribution (`pick` is
+    /// never called), so it applies only to greedy decoding (`temp <= 1e-4`).
+    fn greedy_only(&self) -> bool {
+        false
+    }
 }
 
 /// Top-k the scheduler samples with (see `ExecutableModel::sample`).
@@ -80,6 +85,10 @@ impl SpecSeq {
 
     pub(super) fn max_k(&self) -> usize {
         self.drafter.max_k()
+    }
+
+    pub(super) fn greedy_only(&self) -> bool {
+        self.drafter.greedy_only()
     }
 }
 
@@ -141,6 +150,11 @@ pub(super) fn decode(
     spec.pending.extend(m.take_taps(kv));
     let valid = |n: usize| if vocab > 0 { n.min(vocab) } else { n };
     let greedy = temp <= 1e-4;
+    let k = if !greedy && spec.drafter.greedy_only() {
+        0
+    } else {
+        k
+    };
     let mut qs = Vec::new();
     let drafts = if k == 0 {
         Vec::new()
