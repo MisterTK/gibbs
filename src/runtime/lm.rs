@@ -88,6 +88,7 @@ pub struct Seq {
     /// Recurrent-state snapshots after each position from `ckpt_from` (the last `forward_all`).
     ckpt: Vec<HashMap<String, Tensor>>,
     ckpt_from: usize,
+    recurrent_ahead: bool,
 }
 
 impl Seq {
@@ -106,6 +107,7 @@ impl Seq {
             tapped: Vec::new(),
             ckpt: Vec::new(),
             ckpt_from: 0,
+            recurrent_ahead: false,
         }
     }
 
@@ -364,8 +366,7 @@ impl SpecLm {
         let weights = model.store.materialize(&program_weights)?;
         let program = GraphProgram::compile_reshapable(decode.graph.clone(), weights, mode)?;
         let recurrent = program.recurrent_states();
-        let streams = recurrent.is_empty()
-            && decode.output_index("logits") == Some(0)
+        let streams = decode.output_index("logits") == Some(0)
             && decode
                 .inputs
                 .iter()
@@ -470,6 +471,19 @@ impl SpecLm {
         Ok((e, rows))
     }
 
+    fn drain_stream(&self, seq: &mut Seq) -> Result<(), String> {
+        if seq.state.stream.0.is_some() {
+            let mut p = self.program.lock();
+            std::mem::swap(&mut p.state, &mut seq.state);
+            let out = p.stream_end();
+            std::mem::swap(&mut p.state, &mut seq.state);
+            if out? && !self.recurrent.is_empty() {
+                seq.recurrent_ahead = true;
+            }
+        }
+        Ok(())
+    }
+
     /// Runs `tokens` from `start`; see [`Mode`].
     fn run(
         &self,
@@ -479,6 +493,13 @@ impl SpecLm {
         mode: Mode,
     ) -> Result<Tensor, String> {
         let seq = Self::seq(state)?;
+        self.drain_stream(seq)?;
+        if seq.recurrent_ahead {
+            return Err(format!(
+                "recurrent state ran past position {} in a decode stream; start a new sequence",
+                seq.len
+            ));
+        }
         if tokens.is_empty() {
             return Err("forward needs at least one token".into());
         }
@@ -761,7 +782,12 @@ impl NativeLm for SpecLm {
         state: &mut SeqState,
     ) -> Result<Option<u32>, String> {
         let seq = Self::seq(state)?;
-        if !self.streams || !seq.taps.is_empty() || start_pos != seq.asked || seq.len != seq.asked {
+        if !self.streams
+            || seq.recurrent_ahead
+            || !seq.taps.is_empty()
+            || start_pos != seq.asked
+            || seq.len != seq.asked
+        {
             return Ok(None);
         }
         let mut p = self.program.lock();
@@ -779,11 +805,7 @@ impl NativeLm for SpecLm {
 
     fn stream_end(&self, state: &mut SeqState) -> Result<(), String> {
         let seq = Self::seq(state)?;
-        let mut p = self.program.lock();
-        std::mem::swap(&mut p.state, &mut seq.state);
-        let out = p.stream_end();
-        std::mem::swap(&mut p.state, &mut seq.state);
-        out
+        self.drain_stream(seq)
     }
 
     fn forward_all(
@@ -797,6 +819,13 @@ impl NativeLm for SpecLm {
 
     fn truncate(&self, state: &mut SeqState, len: usize) -> Result<(), String> {
         let seq = Self::seq(state)?;
+        self.drain_stream(seq)?;
+        if seq.recurrent_ahead {
+            return Err(format!(
+                "recurrent state ran past position {} in a decode stream; start a new sequence",
+                seq.len
+            ));
+        }
         if len > seq.asked {
             return Err(format!("cannot truncate {} positions to {len}", seq.asked));
         }
@@ -1068,12 +1097,14 @@ mod tests {
           {name: "token_ids", dtype: "u32", shape: ["rows"]},
           {name: "positions", dtype: "u32", shape: ["rows"]},
           {name: "visible_end", dtype: "u32", shape: ["rows"], when: "rows > 1"},
-          {name: "pos_f", dtype: "f32", shape: ["rows", 1], gen: "iota", args: {n: "rows", dtype: "'f32'", start: "pos0"}},
+          {name: "pos_f", dtype: "f32", shape: ["rows", 1], gen: "iota", args: {n: "rows", dtype: "'f32'", start: "pos0"}, when: "!conv"},
         ],
         body: [
           {op: "Embedding", in: ["w:emb", "i:token_ids"], out: "x"},
-          {op: "Unary", args: {kind: {Scale: 0.01}}, in: ["i:pos_f"], out: "pf"},
-          {op: "Binary", args: {kind: "Add"}, in: ["x", "pf"], out: "x"},
+          {block: [
+            {op: "Unary", args: {kind: {Scale: 0.01}}, in: ["i:pos_f"], out: "pf"},
+            {op: "Binary", args: {kind: "Add"}, in: ["x", "pf"], out: "x"},
+          ], when: "!conv"},
           {repeat: "i", over: "layers", body: [
             {state: "kv.{i}.k", shape: ["ctx", "kv_heads*hd"]},
             {state: "kv.{i}.v", shape: ["ctx", "kv_heads*hd"]},
@@ -1211,6 +1242,58 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A toy spec with a `CausalConv1dCached` recurrent state streams on Metal: 12 streamed
+    /// greedy tokens equal 12 per-token `forward` + argmax tokens; ending a stream with a token
+    /// in flight marks `recurrent_ahead` so `forward` and `truncate` return an error.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn stream_decode_recurrent_matches_per_token_greedy() {
+        if !crate::hardware::available_devices().contains(&Device::Metal) {
+            return;
+        }
+        let lm = toy(Device::Metal, true, 64);
+        assert!(lm.streams);
+        let mut s_ref = fresh(&lm, &[PROMPT[0]]);
+        let mut tok = PROMPT[0];
+        let mut want = Vec::new();
+        for pos in 0..12 {
+            let l = lm.forward(&[tok], pos, &mut s_ref).unwrap();
+            tok = argmax_first(&l[..V]) as u32;
+            want.push(tok);
+        }
+
+        let mut s = fresh(&lm, &[PROMPT[0]]);
+        let mut got = Vec::new();
+        for pos in 0..12 {
+            let last = if pos == 0 { PROMPT[0] } else { got[pos - 1] };
+            let t = lm
+                .stream_greedy_token(last, pos, 12 - pos, &mut s)
+                .unwrap()
+                .expect("recurrent model streams on Metal");
+            got.push(t);
+        }
+        lm.stream_end(&mut s).unwrap();
+        assert_eq!(got, want);
+        assert!(lm.forward(&[got[11]], 12, &mut s).is_ok());
+
+        let mut s2 = fresh(&lm, &[PROMPT[0]]);
+        let t0 = lm
+            .stream_greedy_token(PROMPT[0], 0, 5, &mut s2)
+            .unwrap()
+            .unwrap();
+        lm.stream_end(&mut s2).unwrap();
+        let err = lm.forward(&[t0], 1, &mut s2).unwrap_err();
+        assert!(
+            err.contains("recurrent state ran past position 1 in a decode stream; start a new sequence"),
+            "{err}"
+        );
+        let err = lm.truncate(&mut s2, 1).unwrap_err();
+        assert!(
+            err.contains("recurrent state ran past position 1 in a decode stream; start a new sequence"),
+            "{err}"
+        );
     }
 
     /// Taps record every layer's residual per position, independent of the pass shape.

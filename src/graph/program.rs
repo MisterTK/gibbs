@@ -392,7 +392,7 @@ impl GraphProgram {
         valid: usize,
     ) -> Result<Option<u32>, String> {
         use crate::graph::metal::Session;
-        if crate::graph::metal::profile_requested() {
+        if crate::graph::metal::profile_requested() && self.recurrent_states().is_empty() {
             self.stream_end()?;
             return Ok(None);
         }
@@ -435,8 +435,15 @@ impl GraphProgram {
                 .state_vars
                 .iter()
                 .filter_map(|&(v, _)| {
-                    let sh = &g.value(v).shape;
-                    (sh.len() == 2).then_some(sh[0])
+                    let val = g.value(v);
+                    let rec = matches!(
+                        val.kind,
+                        crate::graph::ValueKind::State {
+                            recurrent: true,
+                            ..
+                        }
+                    );
+                    (!rec && val.shape.len() == 2).then_some(val.shape[0])
                 })
                 .max();
             let next = (pos as usize + 1).next_multiple_of(4096);
@@ -462,14 +469,17 @@ impl GraphProgram {
     }
 
     /// Ends this state's greedy decode stream: waits for its in-flight tokens and drops it.
+    /// `true` when draining discarded a submitted token that [`Self::stream_next`] never returned.
     #[cfg(target_os = "macos")]
-    pub fn stream_end(&mut self) -> Result<(), String> {
+    pub fn stream_end(&mut self) -> Result<bool, String> {
+        let mut discarded = false;
         if let Some(mut s) = self.state.stream.0.take() {
+            discarded = s.in_flight() > 0;
             if let CompiledSegment::Metal { session, .. } = &self.segment {
                 session.drain_fed(&mut s);
             }
         }
-        Ok(())
+        Ok(discarded)
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -484,8 +494,8 @@ impl GraphProgram {
     }
 
     #[cfg(not(target_os = "macos"))]
-    pub fn stream_end(&mut self) -> Result<(), String> {
-        Ok(())
+    pub fn stream_end(&mut self) -> Result<bool, String> {
+        Ok(false)
     }
 }
 
