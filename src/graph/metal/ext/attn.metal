@@ -164,6 +164,142 @@ ATTNF_KERNEL(4)
 ATTNF_KERNEL(8)
 ATTNF_KERNEL(16)
 
+// Few-query (`nq < 8`) split-key attention: one threadgroup (ATTNF_NSG = 8 simdgroups) per
+// `(query_row, head)`. Simdgroup `sg` processes every 8th key chunk in `[lo, hi)` with its own
+// online-softmax `(m, l, acc[NJ])`, then the 8 partials are merged through threadgroup memory.
+template <uint NJ>
+static inline void attn_flash_split(device const float* q, device const float* k, device const float* v,
+                                    device const float* bias, device float* out,
+                                    constant AttnFlashParams& p,
+                                    threadgroup float* sm_m, threadgroup float* sm_l,
+                                    threadgroup float* sm_acc,
+                                    uint2 tgp, uint sg, uint lane) {
+    const uint hd = p.head_dim;
+    const uint head = tgp.y;
+    const uint kvh = head / (p.heads / p.kv_heads);
+    const uint qi = tgp.x;
+    if (qi >= p.nq) return;
+    const ulong qstride = (ulong)p.heads * hd;
+    const ulong kvstride = (ulong)p.kv_heads * hd;
+    const bool has_cap = (p.flags & 4u) != 0;
+
+    uint lo = 0, hi = 0;
+    attn_key_range(qi, p, lo, hi);
+
+    float qr[NJ];
+    float acc[NJ];
+    for (uint j = 0; j < NJ; ++j) {
+        const uint d = lane + 32 * j;
+        qr[j] = (d < hd) ? q[(ulong)qi * qstride + (ulong)head * hd + d] : 0.0f;
+        acc[j] = 0.0f;
+    }
+    ulong brow = 0;
+    if (p.bias_mode == 2) brow = (ulong)qi * p.nk;
+    else if (p.bias_mode == 3) brow = ((ulong)head * p.nq + qi) * p.nk;
+
+    float m = -FLT_MAX;
+    float l = 0.0f;
+    for (uint t = lo + sg * 4; t < hi; t += ATTNF_NSG * 4) {
+        float s[4];
+        for (uint u = 0; u < 4; ++u) {
+            float x = 0.0f;
+            if (t + u < hi) {
+                device const float* kr = k + (ulong)(t + u) * kvstride + (ulong)kvh * hd;
+                for (uint j = 0; j < NJ; ++j) {
+                    const uint d = lane + 32 * j;
+                    if (d < hd) x += qr[j] * kr[d];
+                }
+            }
+            s[u] = x;
+        }
+        float m_new = m;
+        for (uint u = 0; u < 4; ++u) {
+            float x = simd_sum(s[u]) * p.scale;
+            if (t + u < hi) {
+                if (has_cap) x = p.soft_cap * tanh(x / p.soft_cap);
+                if (p.bias_mode != 0) x += bias[brow + t + u];
+            } else {
+                x = -INFINITY;
+            }
+            s[u] = x;
+            m_new = max(m_new, x);
+        }
+        const float corr = exp(m - m_new);
+        l *= corr;
+        for (uint j = 0; j < NJ; ++j) acc[j] *= corr;
+        for (uint u = 0; u < 4; ++u) {
+            const float e = exp(s[u] - m_new);
+            l += e;
+            if (t + u < hi) {
+                device const float* vr = v + (ulong)(t + u) * kvstride + (ulong)kvh * hd;
+                for (uint j = 0; j < NJ; ++j) {
+                    const uint d = lane + 32 * j;
+                    if (d < hd) acc[j] += e * vr[d];
+                }
+            }
+        }
+        m = m_new;
+    }
+
+    if (lane == 0) {
+        sm_m[sg] = m;
+        sm_l[sg] = l;
+    }
+    for (uint j = 0; j < NJ; ++j) {
+        const uint d = lane + 32 * j;
+        if (d < hd) sm_acc[sg * (32 * NJ) + d] = acc[j];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (sg == 0) {
+        float m_tot = -FLT_MAX;
+        for (uint s_idx = 0; s_idx < ATTNF_NSG; ++s_idx) {
+            if (sm_l[s_idx] > 0.0f) m_tot = max(m_tot, sm_m[s_idx]);
+        }
+        float l_tot = 0.0f;
+        float w_sg[ATTNF_NSG];
+        for (uint s_idx = 0; s_idx < ATTNF_NSG; ++s_idx) {
+            float w = (sm_l[s_idx] > 0.0f) ? exp(sm_m[s_idx] - m_tot) : 0.0f;
+            w_sg[s_idx] = w;
+            l_tot += sm_l[s_idx] * w;
+        }
+        device float* o = out + (ulong)qi * qstride + (ulong)head * hd;
+        const float inv = l_tot > 0.0f ? (1.0f / l_tot) : 0.0f;
+        for (uint j = 0; j < NJ; ++j) {
+            const uint d = lane + 32 * j;
+            if (d < hd) {
+                float sum = 0.0f;
+                for (uint s_idx = 0; s_idx < ATTNF_NSG; ++s_idx) {
+                    sum += sm_acc[s_idx * (32 * NJ) + d] * w_sg[s_idx];
+                }
+                o[d] = sum * inv;
+            }
+        }
+    }
+}
+
+#define ATTNF_SPLIT_KERNEL(NJ)                                                                   \
+kernel void attn_flash_split_nj##NJ(device const float* q [[buffer(0)]],                         \
+                                    device const float* k [[buffer(1)]],                         \
+                                    device const float* v [[buffer(2)]],                         \
+                                    device const float* bias [[buffer(3)]],                      \
+                                    device float* out [[buffer(4)]],                             \
+                                    constant AttnFlashParams& p [[buffer(5)]],                   \
+                                    uint2 tgp [[threadgroup_position_in_grid]],                  \
+                                    uint sg [[simdgroup_index_in_threadgroup]],                  \
+                                    uint lane [[thread_index_in_simdgroup]]) {                   \
+    threadgroup float sm_m[ATTNF_NSG];                                                           \
+    threadgroup float sm_l[ATTNF_NSG];                                                           \
+    threadgroup float sm_acc[ATTNF_NSG * 32 * NJ];                                               \
+    attn_flash_split<NJ>(q, k, v, bias, out, p, sm_m, sm_l, sm_acc, tgp, sg, lane);              \
+}
+
+ATTNF_SPLIT_KERNEL(2)
+ATTNF_SPLIT_KERNEL(3)
+ATTNF_SPLIT_KERNEL(4)
+ATTNF_SPLIT_KERNEL(8)
+ATTNF_SPLIT_KERNEL(16)
+
 #if defined(GIBBS_MPP)
 // Tiled flash attention on the matrix units (`mpp::tensor_ops::matmul2d`): one threadgroup (4
 // simdgroups = 128 threads) per (query block of QB rows, query head). For f32 K/V (`Op::Attention`

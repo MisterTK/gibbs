@@ -19,6 +19,11 @@ pub(super) const KERNELS: &[&str] = &[
     "attn_flash_nj4",
     "attn_flash_nj8",
     "attn_flash_nj16",
+    "attn_flash_split_nj2",
+    "attn_flash_split_nj3",
+    "attn_flash_split_nj4",
+    "attn_flash_split_nj8",
+    "attn_flash_split_nj16",
     "rel_pos_bias_f32",
     "state_reorder_f32",
     "rope_mrope_f32",
@@ -251,12 +256,17 @@ fn plan_attention(g: &Graph, node: &Node) -> Result<PlanOut<Step>, String> {
         scale: scale.unwrap_or(1.0 / (head_dim as f32).sqrt()),
         soft_cap: soft_cap.unwrap_or(1.0),
     };
-    let kernel = match head_dim.div_ceil(32) {
-        0..=2 => "attn_flash_nj2",
-        3 => "attn_flash_nj3",
-        4 => "attn_flash_nj4",
-        5..=8 => "attn_flash_nj8",
-        _ => "attn_flash_nj16",
+    let kernel = match (nq < QB, head_dim.div_ceil(32)) {
+        (true, 0..=2) => "attn_flash_split_nj2",
+        (true, 3) => "attn_flash_split_nj3",
+        (true, 4) => "attn_flash_split_nj4",
+        (true, 5..=8) => "attn_flash_split_nj8",
+        (true, _) => "attn_flash_split_nj16",
+        (false, 0..=2) => "attn_flash_nj2",
+        (false, 3) => "attn_flash_nj3",
+        (false, 4) => "attn_flash_nj4",
+        (false, 5..=8) => "attn_flash_nj8",
+        (false, _) => "attn_flash_nj16",
     };
     Ok(PlanOut::Step(
         Step::Attention {
@@ -460,6 +470,8 @@ pub(super) fn encode(sess: &Session, e: &Enc, s: &Planned, st: &Step) -> Result<
                     129..=256 => ("flash_attn_mm_256", 32, 128),
                     _ => ("flash_attn_mm_512", 16, 128),
                 }
+            } else if params.nq < QB as u32 {
+                (kernel, 1, QB as u64 * 32)
             } else {
                 (kernel, QB as u64, QB as u64 * 32)
             };
@@ -802,6 +814,31 @@ mod tests {
             ..Case::new(41, 41, 6, 3, 40)
         };
         check(&all);
+    }
+
+    #[test]
+    fn few_query_split_key_matches_cpu() {
+        for nq in [1, 3, 7] {
+            for nk in [1, 77, 512, 4096] {
+                for bias in [Bias::None, Bias::Keys, Bias::Rows, Bias::Heads] {
+                    for causal in [false, true] {
+                        check(&Case {
+                            causal,
+                            bias,
+                            ..Case::new(nq, nk, 8, 8, 64)
+                        });
+                    }
+                }
+            }
+        }
+        for hd in [40, 96, 128, 256, 512] {
+            check(&Case {
+                window: Some(128),
+                cap: Some(30.0),
+                bias: Bias::Heads,
+                ..Case::new(3, 257, 6, 2, hd)
+            });
+        }
     }
 
     #[test]
