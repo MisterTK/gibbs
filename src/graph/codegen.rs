@@ -234,6 +234,7 @@ pub fn gemm_packed(codec: &Codec, epi: u32, indexed: bool) -> String {
     };
     let (be, subs) = (codec.block_elems, codec.block_elems / 8);
     if indexed {
+        let (sa_ty, relaxed) = ("float", false);
         let br = block_ref(
             codec,
             "w",
@@ -301,7 +302,14 @@ kernel void {name}(
             const uint col = n0 + feat;
             const uint gk = k0 + chunk * 8;
             threadgroup {sa_ty}* dst = sa + feat * 32 + chunk * 8;
-            if (col < p.rows && gk < p.cols) {{
+            if (col < p.rows && gk + 8 <= p.cols) {{
+                const uint s = gk / 8;
+                {decl}
+                float v[8];
+                {dec}(b, {sub}s % {subs}, v);
+                *((threadgroup float4*)dst) = float4(v[0], v[1], v[2], v[3]);
+                *((threadgroup float4*)(dst + 4)) = float4(v[4], v[5], v[6], v[7]);
+            }} else if (col < p.rows && gk < p.cols) {{
                 const uint s = gk / 8;
                 {decl}
                 float v[8];
@@ -320,7 +328,13 @@ kernel void {name}(
             const uint chunk = work % 4;
             const uint gk = k0 + chunk * 8;
             threadgroup float* dst = sb + r * 32 + chunk * 8;
-            if (r < tile_m && gk < p.cols) {{
+            if (r < tile_m && gk + 8 <= p.cols) {{
+                const uint slot = elist[r];
+                const uint x_row = p.x_per_slot != 0 ? slot : (slot / p.top_k);
+                device const float* xr = x + (ulong)x_row * p.cols + gk;
+                *((threadgroup float4*)dst) = *((device const float4*)xr);
+                *((threadgroup float4*)(dst + 4)) = *((device const float4*)(xr + 4));
+            }} else if (r < tile_m && gk < p.cols) {{
                 const uint slot = elist[r];
                 const uint x_row = p.x_per_slot != 0 ? slot : (slot / p.top_k);
                 device const float* xr = x + (ulong)x_row * p.cols + gk;

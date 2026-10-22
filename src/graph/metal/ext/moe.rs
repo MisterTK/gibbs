@@ -626,10 +626,7 @@ pub(super) fn encode(sess: &Session, e: &Enc, s: &Planned, st: &Step) -> Result<
             if *slots >= MOE_GEMM_MIN_SLOTS && rt.profile.mpp.is_ok() {
                 let need = (*experts + *experts * *slots) * 4;
                 let mut guard = sess.argmax_scratch.lock();
-                if guard
-                    .as_ref()
-                    .is_none_or(|b| (b.length() as usize) < need)
-                {
+                if guard.as_ref().is_none_or(|b| (b.length() as usize) < need) {
                     *guard = Some(new_shared_buffer(&rt.device, need)?);
                 }
                 let scratch = guard.as_ref().expect("allocated above");
@@ -665,7 +662,7 @@ pub(super) fn encode(sess: &Session, e: &Enc, s: &Planned, st: &Step) -> Result<
                         *x_per_slot as u32,
                     ],
                 );
-                let shmem = if c.format == QuantFormat::FP32 { 24576 } else { 20480 };
+                let shmem = 24576;
                 enc.set_threadgroup_memory_length(0, shmem);
                 enc.dispatch_thread_groups(
                     MTLSize::new(
@@ -1334,7 +1331,6 @@ mod tests {
         super::TEST_SIMDGROUPS.set(0);
     }
 
-
     #[test]
     fn moe_linear_shapes_and_routing_match_cpu() {
         let mut s = 7u64;
@@ -1844,7 +1840,11 @@ mod tests {
             let s = Session::new(rt(), &w).unwrap();
             let plan = s.prepare_plan(&g).unwrap();
             let xs = Tensor::F32(vec![0.25; x_rows * cols]);
-            let legs = [("r2_sg8", 2usize, 8usize), ("r4_sg8", 4, 8), ("r4_sg2", 4, 2)];
+            let legs = [
+                ("r2_sg8", 2usize, 8usize),
+                ("r4_sg8", 4, 8),
+                ("r4_sg2", 4, 2),
+            ];
             let run_leg = |&(_, r, sg): &(&str, usize, usize), n: usize| -> f64 {
                 super::TEST_ROWS_PER_SG.set(r);
                 super::TEST_SIMDGROUPS.set(sg);
