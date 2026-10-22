@@ -110,6 +110,8 @@ pub struct ModelBenchResult {
     pub prefill_tok_s: Option<f64>,
     pub rss_gb: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub rss_now_gb: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub top_kernels: Option<Vec<String>>,
 }
 
@@ -314,6 +316,7 @@ fn measure_loaded_with(
         weights_ms: bytes_per_token as f64 / 1e9 / ceiling_gbps * 1e3,
         prefill_tok_s,
         rss_gb: get_peak_rss_gb(),
+        rss_now_gb: get_current_rss_gb(),
         top_kernels: None,
     })
 }
@@ -327,6 +330,44 @@ fn get_peak_rss_gb() -> f64 {
     }
     #[cfg(not(target_os = "macos"))]
     0.0
+}
+
+fn get_current_rss_gb() -> Option<f64> {
+    #[cfg(target_os = "macos")]
+    unsafe {
+        #[repr(C)]
+        struct MachTaskBasicInfo {
+            virtual_size: u64,
+            resident_size: u64,
+            resident_size_max: u64,
+            user_time: [u32; 2],
+            system_time: [u32; 2],
+            policy: i32,
+            suspend_count: i32,
+        }
+        extern "C" {
+            fn mach_task_self() -> u32;
+            fn task_info(
+                target_task: u32,
+                flavor: u32,
+                task_info_out: *mut MachTaskBasicInfo,
+                task_info_out_cnt: *mut u32,
+            ) -> i32;
+        }
+        const MACH_TASK_BASIC_INFO: u32 = 20;
+        let mut info: MachTaskBasicInfo = std::mem::zeroed();
+        let mut count = (std::mem::size_of::<MachTaskBasicInfo>() / 4) as u32;
+        (task_info(
+            mach_task_self(),
+            MACH_TASK_BASIC_INFO,
+            &mut info,
+            &mut count,
+        ) == 0
+            && info.resident_size > 0)
+            .then(|| info.resident_size as f64 / 1e9)
+    }
+    #[cfg(not(target_os = "macos"))]
+    None
 }
 
 /// Bytes of the weights file (or checkpoint directory): the roofline numerator of last resort.

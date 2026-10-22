@@ -18,6 +18,13 @@ pub enum ReencodePolicy {
     LowBitNative,
     #[serde(alias = "bitexact", alias = "exact", alias = "BitExact")]
     BitExact,
+    #[serde(
+        rename = "min-size",
+        alias = "max-compress",
+        alias = "minsize",
+        alias = "MinSize"
+    )]
+    MinSize,
 }
 
 impl ReencodePolicy {
@@ -27,6 +34,7 @@ impl ReencodePolicy {
             Self::MaxSpeed => "max-speed",
             Self::LowBitNative => "low-bit-native",
             Self::BitExact => "bit-exact",
+            Self::MinSize => "min-size",
         }
     }
 
@@ -35,6 +43,7 @@ impl ReencodePolicy {
             Self::MaxSpeed => Self::LowBitNative,
             Self::LowBitNative => Self::BitExact,
             Self::BitExact => Self::MaxSpeed,
+            Self::MinSize => Self::MaxSpeed,
         }
     }
 }
@@ -58,6 +67,7 @@ impl std::str::FromStr for ReencodePolicy {
             "max-speed" | "maxspeed" | "speed" => Ok(Self::MaxSpeed),
             "low-bit-native" | "lowbitnative" | "lowbit" => Ok(Self::LowBitNative),
             "bit-exact" | "bitexact" | "exact" => Ok(Self::BitExact),
+            "min-size" | "max-compress" | "minsize" => Ok(Self::MinSize),
             _ => Err(format!("unknown reencode policy '{s}'")),
         }
     }
@@ -126,6 +136,11 @@ const PROBE_TOKENS: usize = 48;
 const PROBE_TEXT: &str = "The engine measures each weight format on this machine before it serves \
     the model. It keeps the fastest format whose predictions stay close to full precision, because \
     a format that is fast but wrong does not help anyone who reads the answers it writes.";
+const PROBE_TEXT_LONG: &str = " A quantized linear layer maps an input vector x in R^d to y = W x \
+    by reading packed blocks of 32 or 256 weights: for block b in 0..k/256 { let d = f16(blk[b].d); \
+    acc += d * fma(q[i], x[i]); } At 293.4 GB/s ceiling, 128 positions (42, 3.14159, 0x100, -7, \
+    99.9%) test whether 3-bit feed-forward projections and 4-bit attention projections preserve the \
+    model's next-token distribution across prose, numbers, and code.";
 
 /// How a GPU load re-encodes its weights (S3.5).
 #[derive(Clone, Default)]
@@ -203,7 +218,10 @@ pub fn parse_quant(s: &str) -> Result<crate::hardware::QuantFormat, String> {
         other => Q::from_str_lenient(other).ok_or_else(|| format!("Unknown --quant '{other}'"))?,
     };
     if !crate::model::reencode::encodable(f) {
-        return Err(format!("--quant {s}: weights cannot be encoded as {}", f.name()));
+        return Err(format!(
+            "--quant {s}: weights cannot be encoded as {}",
+            f.name()
+        ));
     }
     Ok(f)
 }
@@ -211,6 +229,7 @@ pub fn parse_quant(s: &str) -> Result<crate::hardware::QuantFormat, String> {
 fn gate_limits(policy: ReencodePolicy, max_kl: Option<f64>) -> (f64, f64) {
     let (kl, top1) = match policy {
         ReencodePolicy::MaxSpeed => (0.10, 0.90),
+        ReencodePolicy::MinSize => (0.25, 0.80),
         _ => (MAX_MEAN_KL, 0.99),
     };
     (max_kl.unwrap_or(kl), top1)
@@ -231,13 +250,19 @@ pub fn native_kl_gate(
     source: &dyn crate::model::native::NativeLm,
     candidate: &dyn crate::model::native::NativeLm,
 ) -> Result<GateReport, String> {
+    let min_size = ReencodeConfig::effective().policy == ReencodePolicy::MinSize;
+    let probe_tokens = if min_size { 128 } else { PROBE_TOKENS };
     let tok = source.tokenizer();
     let vocab = tok.vocab_size().max(1) as u32;
-    let mut ids = tok.encode(PROBE_TEXT);
+    let mut ids = if min_size {
+        tok.encode(&format!("{PROBE_TEXT}{PROBE_TEXT_LONG}"))
+    } else {
+        tok.encode(PROBE_TEXT)
+    };
     if ids.is_empty() {
-        ids = (1..=PROBE_TOKENS as u32).collect();
+        ids = (1..=probe_tokens as u32).collect();
     }
-    let n = PROBE_TOKENS
+    let n = probe_tokens
         .min(source.context_len().min(candidate.context_len()))
         .max(2);
     let tokens: Vec<u32> = ids.iter().cycle().take(n).map(|t| t % vocab).collect();
@@ -252,23 +277,22 @@ pub fn native_kl_gate(
             })
             .collect()
     };
-    let (want, got) = (run(source)?, run(candidate)?);
+    let want = run(source)?;
+    let (_, mut state) = candidate.prepare(vec![tokens[0]], &[])?;
+    let mut kl_sum = 0.0f64;
+    let mut top1_hits = 0usize;
+    for (pos, (&t, p)) in tokens.iter().zip(&want).enumerate() {
+        let logits = candidate.forward(&[t], pos, &mut state)?;
+        let q = log_softmax(&logits[..logits.len().min(vocab as usize)]);
+        kl_sum += kl_divergence(p, &q);
+        if argmax(p) == argmax(&q) {
+            top1_hits += 1;
+        }
+    }
     let nf = n as f64;
-    let mean_kl = want
-        .iter()
-        .zip(&got)
-        .map(|(p, q)| kl_divergence(p, q))
-        .sum::<f64>()
-        / nf;
-    let top1 = want
-        .iter()
-        .zip(&got)
-        .filter(|(p, q)| argmax(p) == argmax(q))
-        .count() as f64
-        / nf;
     Ok(GateReport {
-        mean_kl,
-        top1,
+        mean_kl: kl_sum / nf,
+        top1: top1_hits as f64 / nf,
         tokens: n,
     })
 }
@@ -318,8 +342,14 @@ mod tests {
     #[test]
     fn quant_names_map_to_formats() {
         use crate::hardware::QuantFormat as Q;
-        for (name, f) in [("nvfp4", Q::GGUF_NVFP4), ("q8_0", Q::GGUF_Q8_0), ("f16", Q::FP16), ("bf16", Q::BF16),
-            ("uncompressed", Q::FP32), ("q4_k_m", Q::GGUF_Q4_K_M)] {
+        for (name, f) in [
+            ("nvfp4", Q::GGUF_NVFP4),
+            ("q8_0", Q::GGUF_Q8_0),
+            ("f16", Q::FP16),
+            ("bf16", Q::BF16),
+            ("uncompressed", Q::FP32),
+            ("q4_k_m", Q::GGUF_Q4_K_M),
+        ] {
             assert_eq!(parse_quant(name), Ok(f), "{name}");
         }
         assert!(parse_quant("q2_k").is_err() && parse_quant("exl3").is_err());
@@ -327,7 +357,11 @@ mod tests {
 
     #[test]
     fn gate_thresholds_per_policy() {
-        let r = |mean_kl: f64, top1: f64| GateReport { mean_kl, top1, tokens: 8 };
+        let r = |mean_kl: f64, top1: f64| GateReport {
+            mean_kl,
+            top1,
+            tokens: 8,
+        };
         use ReencodePolicy::*;
         assert!(gate_passes(MaxSpeed, None, &r(0.10, 0.90)));
         assert!(!gate_passes(MaxSpeed, None, &r(0.1001, 0.95)));
@@ -337,5 +371,10 @@ mod tests {
         assert!(!gate_passes(MaxSpeed, None, &r(f64::NAN, 1.0)));
         assert!(gate_passes(LowBitNative, Some(0.05), &r(0.04, 0.99)));
         assert!(!gate_passes(MaxSpeed, Some(0.02), &r(0.05, 1.0)));
+        assert!(gate_passes(MinSize, None, &r(0.25, 0.80)));
+        assert!(!gate_passes(MinSize, None, &r(0.2501, 0.90)));
+        assert!(!gate_passes(MinSize, None, &r(0.10, 0.7999)));
+        assert!(gate_passes(MinSize, Some(0.15), &r(0.15, 0.80)));
+        assert!(!gate_passes(MinSize, Some(0.15), &r(0.16, 0.95)));
     }
 }

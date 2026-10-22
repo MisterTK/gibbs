@@ -105,7 +105,7 @@ fn parse_slash(raw: &str) -> Option<Result<SlashCmd, String>> {
             .map(|p| SlashCmd::Reencode(Some(p)))
             .map_err(|_| {
                 format!(
-                    "unknown reencode policy '{arg}'; valid: max-speed, low-bit-native, bit-exact"
+                    "unknown reencode policy '{arg}'; valid: max-speed, min-size, low-bit-native, bit-exact"
                 )
             }),
         "/variant" if arg.is_empty() => Ok(SlashCmd::Variant(None)),
@@ -672,7 +672,7 @@ impl TuiApp {
                      · Esc        : Unfocus component / cancel prompt / return to Dashboard\n\
                      · Ctrl+C     : Exit Gibbs engine\n\n\
                      Slash Commands:\n\
-                     · /reencode [max-speed|low-bit-native|bit-exact] : Set the weight re-encode policy (no argument cycles) and reload the active model under it\n\
+                     · /reencode [max-speed|min-size|low-bit-native|bit-exact] : Set the weight re-encode policy (no argument cycles) and reload the active model under it\n\
                      · /variant [fastest|fastest-4bit|best-quality] : Set the variant policy of the picker and downloads (no argument cycles) and reload the active model\n\
                      · /settings  : Show the policy settings modal (F4) and the current policies\n\
                      · /profile on|off|sort <time|bandwidth|share> : Sample one decode token every 5 s, step by step, into the KERNELS panel; sort its rows (key s cycles)\n\
@@ -3037,6 +3037,7 @@ mod tests {
             weights_ms: 5.0,
             prefill_tok_s: None,
             rss_gb: 1.0,
+            rss_now_gb: None,
             top_kernels: None,
         };
         let text = bench_report(&r);
@@ -3197,10 +3198,16 @@ mod tests {
             ("max-speed", R::MaxSpeed),
             ("low-bit-native", R::LowBitNative),
             ("bit-exact", R::BitExact),
+            ("min-size", R::MinSize),
         ] {
             assert_eq!(s.parse::<R>().ok(), Some(p));
             assert_eq!(p.name(), s);
         }
+        for a in ["max-compress", "minsize", "MinSize"] {
+            assert_eq!(a.parse::<R>().ok(), Some(R::MinSize));
+        }
+        assert_eq!(R::MinSize.next(), R::MaxSpeed);
+        assert_eq!(R::BitExact.next(), R::MaxSpeed);
         for (s, p) in [
             ("fastest", V::Fastest),
             ("fastest-4bit", V::Fastest4Bit),

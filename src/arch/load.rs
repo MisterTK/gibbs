@@ -2378,11 +2378,18 @@ pub fn gated<T>(
     use crate::model::reencode::{native_stats, reset_native_stats, set_native_applied};
     use crate::model::weight_format::{
         gate_passes, reencode_override, set_reencode_override,
-        ReencodePolicy::{BitExact, LowBitNative, MaxSpeed},
+        ReencodePolicy::{BitExact, LowBitNative, MaxSpeed, MinSize},
     };
     let user = ReencodeConfig::effective();
     let attempts: &[(&str, ReencodePolicy, bool)] = match user.policy {
         _ if !on_metal => &[("bit-exact", BitExact, false)],
+        MinSize => &[
+            ("min-size", MinSize, false),
+            ("min-size (FFN only)", MinSize, true),
+            ("max-speed", MaxSpeed, false),
+            ("low-bit-native", LowBitNative, false),
+            ("bit-exact", BitExact, false),
+        ],
         MaxSpeed => &[
             ("max-speed", MaxSpeed, false),
             ("max-speed (FFN only)", MaxSpeed, true),
@@ -2453,7 +2460,14 @@ pub fn gated<T>(
         }
         if reference.is_none() {
             match load_as(BitExact, false) {
-                Some(Ok(r)) => reference = Some(r),
+                Some(Ok(r)) => {
+                    reference = Some(r);
+                    set_reencode_override(Some(ReencodeConfig {
+                        policy,
+                        ffn_only,
+                        ..user.clone()
+                    }));
+                }
                 other => {
                     log(format!(
                         "reencode: no bit-exact reference to gate against ({}); using bit-exact",
@@ -3302,7 +3316,7 @@ mod tests {
     #[ignore = "sets the process-global re-encode override and native stats; run alone with --ignored"]
     fn gate_ladder_order_and_fallbacks() {
         use crate::model::weight_format::{reencode_override, set_reencode_override};
-        use ReencodePolicy::{BitExact as BE, LowBitNative as LB, MaxSpeed as MS};
+        use ReencodePolicy::{BitExact as BE, LowBitNative as LB, MaxSpeed as MS, MinSize as MZ};
         let previous = reencode_override();
         set_reencode_override(Some(ReencodeConfig {
             policy: MS,
@@ -3335,6 +3349,46 @@ mod tests {
                 (BE, false)
             ]
         );
+        // MinSize ladder: min-size, (bit-exact reference), min-size (FFN only), max-speed, low-bit, bit-exact.
+        set_reencode_override(Some(ReencodeConfig {
+            policy: MZ,
+            ..Default::default()
+        }));
+        let r = gated(true, load, |_, _| {
+            assert!(matches!(
+                ReencodeConfig::effective().policy,
+                MZ | MS | LB
+            ));
+            Ok(report(1e9))
+        });
+        assert_eq!(r, Some(Ok(6)));
+        assert_eq!(
+            take(),
+            [
+                (MZ, false),
+                (BE, false),
+                (MZ, true),
+                (MS, false),
+                (LB, false),
+                (BE, false)
+            ]
+        );
+        assert_eq!(
+            gated(true, load, |_, _| {
+                assert_eq!(
+                    ReencodeConfig::effective().policy,
+                    MZ,
+                    "first candidate's kl runs with candidate's policy active"
+                );
+                Ok(report(0.0))
+            }),
+            Some(Ok(1))
+        );
+        assert_eq!(take(), [(MZ, false), (BE, false)]);
+        set_reencode_override(Some(ReencodeConfig {
+            policy: MS,
+            ..Default::default()
+        }));
         // The first candidate passes.
         assert_eq!(gated(true, load, |_, _| Ok(report(0.0))), Some(Ok(1)));
         assert_eq!(take(), [(MS, false), (BE, false)]);

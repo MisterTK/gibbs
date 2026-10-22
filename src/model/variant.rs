@@ -236,6 +236,37 @@ impl WeightHeader {
         let Some(src) = t.fmt else {
             return (None, t.bytes);
         };
+        if policy == ReencodePolicy::MinSize {
+            if t.ndim != 2 {
+                return (Some(src), t.bytes);
+            }
+            let cols = t.cols as usize;
+            let rule_f = if reencode::is_lm_head_name(&t.name)
+                || ["embed", "token_embd", "wte"]
+                    .iter()
+                    .any(|s| t.name.contains(s))
+            {
+                Q::GGUF_Q6_K
+            } else if reencode::is_ffn_name(&t.name) {
+                if cols % 256 == 0 {
+                    Q::GGUF_Q3_K
+                } else {
+                    Q::GGUF_Q4_0
+                }
+            } else if cols % 256 == 0 {
+                Q::GGUF_Q4_K_M
+            } else {
+                Q::GGUF_Q4_0
+            };
+            if reencode::has_gpu_codec(src) && src.bits_per_weight() <= rule_f.bits_per_weight() {
+                return (Some(src), t.bytes);
+            }
+            let f = reencode::fit(rule_f, cols, Q::BF16);
+            if reencode::has_gpu_codec(src) && f.bits_per_weight() >= src.bits_per_weight() {
+                return (Some(src), t.bytes);
+            }
+            return (Some(f), f.tensor_bytes(t.numel as usize) as u64);
+        }
         match reencode::rule(policy, src) {
             Target::Native => (Some(src), t.bytes),
             Target::Encode(f) => {
@@ -692,6 +723,14 @@ mod tests {
         );
         assert!(
             h.resident_bytes(ReencodePolicy::MaxSpeed) < h.resident_bytes(ReencodePolicy::BitExact)
+        );
+        // MinSize: FFN -> Q3_K (110 B / 256 = 3.4375 bpw).
+        assert!(
+            (tok(ReencodePolicy::MinSize) / tok(ReencodePolicy::BitExact) - 16.0 / 3.4375).abs()
+                < 1e-9
+        );
+        assert!(
+            h.resident_bytes(ReencodePolicy::MinSize) < h.resident_bytes(ReencodePolicy::MaxSpeed)
         );
     }
 
