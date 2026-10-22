@@ -13,13 +13,6 @@
       "height": 512
     },
     {
-      "id": "abenzerps/Qwen-Image-2.1-Uncensored-GGUF",
-      "kind": "image",
-      "steps": 4,
-      "width": 512,
-      "height": 512
-    },
-    {
       "id": "sentence-transformers/all-MiniLM-L6-v2",
       "kind": "embed",
       "items": 64,

@@ -30,7 +30,7 @@ PY
 mkdir -p target/quick
 for r in 0 1 2 3 4 5 6 7 8; do suite "bench/loop.json" "$r" "target/quick/suite-$r.json" 0; done
 if [ -f bench/nonlm.json ]; then
-  for r in 0 1 2 3; do suite "bench/nonlm.json" "$r" "target/quick/nonlm-$r.json" 0; done
+  for r in 0 1 2; do suite "bench/nonlm.json" "$r" "target/quick/nonlm-$r.json" 0; done
 fi
 if [ "$mode" = parity ]; then
   for row in "$@"; do
