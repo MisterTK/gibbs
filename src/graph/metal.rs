@@ -304,6 +304,15 @@ impl WeightFormat {
         })
     }
 
+    /// Format identifier for [`Runtime::gemm_pso`], including `BF16` and `F16`.
+    fn gemm_format(self) -> Option<QuantFormat> {
+        match self {
+            WeightFormat::BF16 => Some(QuantFormat::BF16),
+            WeightFormat::F16 => Some(QuantFormat::FP16),
+            other => other.codec_format(),
+        }
+    }
+
     /// Name of the hand-written GEMV kernel, when this format has one.
     fn hand_kernel(self) -> Option<&'static str> {
         Some(match self {
@@ -664,6 +673,8 @@ pub struct Runtime {
     profile_path: std::path::PathBuf,
     /// Generated GEMV pipelines by (codec format, rows per simdgroup, simdgroups), compiled on first use.
     gen_psos: Mutex<HashMap<(QuantFormat, u8, u8), ComputePipelineState>>,
+    /// Generated in-tile dequantization GEMM pipelines by (codec/float format, epilogue).
+    gemm_psos: Mutex<HashMap<(QuantFormat, u8), ComputePipelineState>>,
     /// Measured GEMV variant winners ([`tune`]) and where they persist.
     tune: Mutex<tune::TuneCache>,
     tune_path: std::path::PathBuf,
@@ -735,6 +746,7 @@ impl Runtime {
             report: String::new(),
             profile_path: std::path::PathBuf::new(),
             gen_psos: Mutex::new(HashMap::new()),
+            gemm_psos: Mutex::new(HashMap::new()),
             tune: Mutex::new(tune::TuneCache::default()),
             tune_path: std::path::PathBuf::new(),
         };
@@ -1164,6 +1176,10 @@ impl Runtime {
     fn compile_generated(&self, src: &str, name: &str) -> Result<ComputePipelineState, String> {
         let opts = CompileOptions::new();
         opts.set_fast_math_enabled(false);
+        if self.profile.mpp.is_ok() {
+            // SAFETY: `setLanguageVersion:` takes an NSUInteger enum; 0x40000 is MTLLanguageVersion4_0.
+            let () = unsafe { msg_send![&*opts, setLanguageVersion: MSL_4_0] };
+        }
         let lib = self
             .device
             .new_library_with_source(src, &opts)
@@ -1188,6 +1204,26 @@ impl Runtime {
         src.push_str(&crate::graph::codegen::dequant_packed(c));
         let pso = self.compile_generated(&src, &crate::graph::codegen::dequant_packed_name(c))?;
         self.gen_psos.lock().insert(key, pso.clone());
+        Ok(pso)
+    }
+
+    /// The generated in-tile dequantization GEMM pipeline for `f` and `epi`, compiled on first use.
+    fn gemm_pso(&self, f: QuantFormat, epi: Epi) -> Result<ComputePipelineState, String> {
+        let c = crate::graph::codegen::gemm_codec(f)
+            .ok_or_else(|| format!("no GEMM codec for {f:?}"))?;
+        let epi_u32 = epi.as_u32();
+        let key = (c.format, epi_u32 as u8);
+        if let Some(p) = self.gemm_psos.lock().get(&key) {
+            return Ok(p.clone());
+        }
+        let mut src = String::from(
+            "#define GIBBS_MPP 1\n#include <metal_stdlib>\n#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>\nusing namespace metal;\n",
+        );
+        src.push_str(crate::graph::codegen::gemm_common(&KERNELS_MSL));
+        src.push_str(&crate::graph::codegen::gemm_packed(c, epi_u32));
+        let name = crate::graph::codegen::gemm_packed_name(c, epi_u32);
+        let pso = self.compile_generated(&src, &name)?;
+        self.gemm_psos.lock().insert(key, pso.clone());
         Ok(pso)
     }
 
@@ -3069,14 +3105,41 @@ impl Session {
                 k,
                 format,
             } => {
-                let hand = match format {
+                if rt.profile.mpp.is_ok() && k % 8 == 0 {
+                    let f = format.gemm_format().ok_or_else(|| {
+                        format!("Metal executor: unsupported batched packed format {format:?}")
+                    })?;
+                    let pso = rt.gemm_pso(f, epi)?;
+                    enc.set_compute_pipeline_state(&pso);
+                    bind(0, x);
+                    bind(1, w);
+                    if let Some(b) = bias {
+                        bind(2, b);
+                    } else {
+                        bind(2, s.out);
+                    }
+                    if let Some(r) = res {
+                        bind(3, r);
+                    } else {
+                        bind(3, s.out);
+                    }
+                    bind(4, s.out);
+                    #[repr(C)]
+                    struct GemmParams(u32, u32, u32, u32);
+                    let p = GemmParams(u32_of(m)?, u32_of(n)?, u32_of(k)?, bias.is_some() as u32);
+                    set_bytes(enc, 5, &p);
+                    enc.set_threadgroup_memory_length(0, 4096);
+                    enc.dispatch_thread_groups(
+                        MTLSize::new((m as u64).div_ceil(128), (n as u64).div_ceil(64), 1),
+                        MTLSize::new(TG4, 1, 1),
+                    );
+                } else if let Some(fmt_name) = match format {
                     WeightFormat::BF16 => Some("bf16"),
                     WeightFormat::F16 => Some("f16"),
                     WeightFormat::Q4_0 => Some("q4_0"),
                     WeightFormat::Q8_0 => Some("q8_0"),
                     _ => None,
-                };
-                if let Some(fmt_name) = hand {
+                } {
                     let suffix = match epi {
                         Epi::None => "none",
                         Epi::Gelu => "gelu",
