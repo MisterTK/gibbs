@@ -46,7 +46,7 @@ pub struct GraphProgram {
     pub state: StateStore,
     pub graph_inputs: Vec<ValueId>,
     pub graph_outputs: Vec<ValueId>,
-    /// [`Self::run_greedy`]'s graph and plan, with the `valid` they were built for.
+    /// [`Self::stream_next`]'s argmax graph and plan, with the `valid` they were built for.
     #[cfg(target_os = "macos")]
     argmax: Option<(usize, Graph, crate::graph::metal::PreparedPlan)>,
     /// [`Self::run_reshaped`]'s plans, keyed by the graph's node count and input shapes.
@@ -54,16 +54,6 @@ pub struct GraphProgram {
     reshaped: Vec<((usize, usize), Vec<Vec<usize>>, crate::graph::metal::PreparedPlan)>,
 }
 
-/// Rows narrower than this keep the host argmax in [`GraphProgram::run_greedy`].
-pub const GPU_ARGMAX_MIN_VOCAB: usize = 150_000;
-
-/// `GIBBS_GPU_ARGMAX=1`: greedy decode steps pick the token on the device, read once.
-fn gpu_argmax() -> bool {
-    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        std::env::var("GIBBS_GPU_ARGMAX").is_ok_and(|v| matches!(v.as_str(), "1" | "on" | "true"))
-    });
-    *ON
-}
 
 /// `graph` with output 0 (one f32 row) replaced by the `[.., 1]` u32 index of the first largest of
 /// its first `valid` entries (0 = all), NaN ranking lowest: a prefix `Slice` then `TopK { k: 1 }`.
@@ -385,48 +375,13 @@ impl GraphProgram {
         }
     }
 
-    /// [`Self::run`] for a greedy decode step whose token is the first largest of the first `valid`
-    /// entries of output 0 (0 = all). With `GIBBS_GPU_ARGMAX=1` on a single Metal segment whose
-    /// output 0 is one f32 row of at least [`GPU_ARGMAX_MIN_VOCAB`], the device picks it and output 0
-    /// comes back as `U32([token])` (one u32 read back instead of the row); otherwise exactly `run`.
-    pub fn run_greedy(&mut self, inputs: Vec<Tensor>, valid: usize) -> Result<Vec<Tensor>, String> {
-        #[cfg(target_os = "macos")]
-        if let (CompiledSegment::Metal { graph, session, .. }, true) =
-            (&self.segment, gpu_argmax())
-        {
-            let wide = graph.outputs.first().is_some_and(|&o| {
-                graph.value(o).shape.last().copied().unwrap_or(0) >= GPU_ARGMAX_MIN_VOCAB
-            });
-            if wide && self.argmax.as_ref().map(|a| a.0) != Some(valid) {
-                self.argmax = match argmax_head(graph, valid) {
-                    Some(g) => {
-                        let plan = session.prepare_plan(&g)?;
-                        Some((valid, g, plan))
-                    }
-                    None => None,
-                };
-            }
-            if let (true, Some((_, g, plan))) = (wide, &self.argmax) {
-                if inputs.len() != g.inputs.len() {
-                    return Err(format!(
-                        "program expects {} inputs, got {}",
-                        g.inputs.len(),
-                        inputs.len()
-                    ));
-                }
-                return session.run_prepared(g, plan, Some(&mut self.state), inputs);
-            }
-        }
-        let _ = valid;
-        self.run(inputs)
-    }
 
     /// The next token of a greedy decode stream: `last` is the input token at position `pos` (the
     /// previous call's result after the first), at most `max_new` tokens are queued, and the pick
     /// is the first largest of the first `valid` logits. Each call keeps the next token's command
     /// buffers queued on the device (the picked id feeds the next token there), so the host never
     /// idles the GPU between tokens. `None` when the program cannot stream (then use
-    /// [`Self::run_greedy`]); a pending one-shot kernel profile ends the stream with `None`.
+    /// [`Self::run`]); a pending one-shot kernel profile ends the stream with `None`.
     /// A stream leaves one speculative token written past the last returned position.
     #[cfg(target_os = "macos")]
     pub fn stream_next(

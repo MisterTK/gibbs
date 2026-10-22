@@ -119,7 +119,6 @@ impl Seq {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
     Last,
-    Greedy,
     All,
 }
 
@@ -540,7 +539,7 @@ impl SpecLm {
         seq.ids.extend_from_slice(ids);
         let refs: Vec<&str> = self.recurrent.iter().map(String::as_str).collect();
         let head = if mode == Mode::All { "all" } else { "last" };
-        let (mut logits, mut picked) = (Vec::new(), None);
+        let mut logits = Vec::new();
         let mut at = from;
         while at < stop {
             let mut e = (at + cap).min(stop);
@@ -569,19 +568,14 @@ impl SpecLm {
                 .iter()
                 .map(|d| input(d, &pass))
                 .collect::<Result<Vec<_>, _>>()?;
-            let greedy = mode == Mode::Greedy && e == stop && stop == end && li == 0;
             // The compiled program is the decode instance; every other shape runs reshaped.
             let mut out = if rows == 1 && head == "last" && seq.taps.is_empty() && nm == 0 {
-                match greedy {
-                    true => p.run_greedy(inputs, self.tok.vocab_size())?,
-                    false => p.run(inputs)?,
-                }
+                p.run(inputs)?
             } else {
                 p.run_reshaped(&inst.graph, inputs)?
             };
             // Moved out, not copied: a vocabulary row per decode token.
             match out.get_mut(li).map(|t| std::mem::replace(t, Tensor::U32(Vec::new()))) {
-                Some(Tensor::U32(t)) => picked = t.first().copied(),
                 Some(Tensor::F32(v)) if mode == Mode::All => logits.extend_from_slice(&v),
                 Some(Tensor::F32(v)) => logits = v,
                 _ => return Err("the text component returned no f32 logits".into()),
@@ -614,10 +608,7 @@ impl SpecLm {
         if stop > end {
             seq.ahead.clone_from(&logits);
         }
-        Ok(match picked {
-            Some(t) => Tensor::U32(vec![t]),
-            None => Tensor::F32(logits),
-        })
+        Ok(Tensor::F32(logits))
     }
 }
 
@@ -744,15 +735,6 @@ impl NativeLm for SpecLm {
         state: &mut SeqState,
     ) -> Result<Vec<f32>, String> {
         logits_of(self.run(tokens, start_pos, state, Mode::Last)?)
-    }
-
-    fn forward_greedy(
-        &self,
-        tokens: &[u32],
-        start_pos: usize,
-        state: &mut SeqState,
-    ) -> Result<Tensor, String> {
-        self.run(tokens, start_pos, state, Mode::Greedy)
     }
 
     fn stream_greedy_token(
@@ -1180,10 +1162,8 @@ mod tests {
             }
             let mut s = fresh(&chunked, &PROMPT);
             chunked.forward(&PROMPT[..11], 0, &mut s).unwrap();
-            let t = match chunked.forward_greedy(&PROMPT[11..], 11, &mut s).unwrap() {
-                Tensor::U32(t) => t[0],
-                t => sample_logits(&logits_of(t).unwrap(), &[], 0.0, 50, 1.0, 1.0),
-            };
+            let l = chunked.forward(&PROMPT[11..], 11, &mut s).unwrap();
+            let t = sample_logits(&l, &[], 0.0, 50, 1.0, 1.0);
             assert_eq!(t, sample_logits(&b, &[], 0.0, 50, 1.0, 1.0), "{dev:?}");
             assert!(chunked.forward(&PROMPT[..1], 3, &mut s).is_err());
         }

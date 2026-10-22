@@ -307,13 +307,8 @@ fn fwd(m: &dyn NativeLm, toks: &[u32], pos: usize, st: &mut SeqState) -> Vec<f32
     m.forward(toks, pos, st).unwrap()
 }
 
-/// `forward_greedy` step: the device-picked token, or the argmax of the logits.
 fn greedy(m: &dyn NativeLm, toks: &[u32], pos: usize, st: &mut SeqState) -> u32 {
-    match m.forward_greedy(toks, pos, st).unwrap() {
-        gibbs_engine::graph::Tensor::U32(t) => t[0],
-        gibbs_engine::graph::Tensor::F32(l) => argmax(&l),
-        _ => panic!("forward_greedy returned neither a token nor logits"),
-    }
+    argmax(&m.forward(toks, pos, st).unwrap())
 }
 
 /// The decode protocol shared by the text decoders: 7-token prefill, 3 decode steps, verify 4

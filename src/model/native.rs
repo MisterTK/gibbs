@@ -28,8 +28,7 @@ pub struct PrepareCtx {
     pub cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
-/// The logits of a forward result; a device-picked token (`U32`, [`NativeLm::forward_greedy`])
-/// where logits are expected is an error, never a one-element row.
+/// The logits of a forward result.
 pub fn logits_of(t: crate::graph::Tensor) -> Result<Vec<f32>, String> {
     match t {
         crate::graph::Tensor::F32(v) => Ok(v),
@@ -82,18 +81,6 @@ pub trait NativeLm: Send + Sync {
         start_pos: usize,
         state: &mut SeqState,
     ) -> Result<Vec<f32>, String>;
-    /// [`Self::forward`] for a greedy step: `U32([token])` when the device picked the first largest
-    /// logit within the tokenizer's vocabulary ([`crate::graph::program::GraphProgram::run_greedy`]),
-    /// else `F32(logits)`.
-    fn forward_greedy(
-        &self,
-        tokens: &[u32],
-        start_pos: usize,
-        state: &mut SeqState,
-    ) -> Result<crate::graph::Tensor, String> {
-        self.forward(tokens, start_pos, state)
-            .map(crate::graph::Tensor::F32)
-    }
 
     /// The next token of a greedy device decode stream (see
     /// [`crate::graph::program::GraphProgram::stream_next`]): `last` at `start_pos`, at most

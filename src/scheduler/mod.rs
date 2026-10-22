@@ -74,16 +74,7 @@ impl ExecutableModel {
         state: &mut Option<SeqState>,
     ) -> Result<(u32, Option<TokenLogprobInfo>), String> {
         let state = state.as_mut().ok_or(NO_STATE)?;
-        // Greedy (as `sample_logits` decides it) without logprobs: the model may pick the token
-        // on the device. `pos` counts `last_token` itself.
-        let logits = if temp <= 1e-4 && logprobs.is_none() {
-            match self.0.forward_greedy(&[last_token], pos - 1, state)? {
-                crate::graph::Tensor::U32(t) if t.len() == 1 => return Ok((t[0], None)),
-                t => crate::model::native::logits_of(t)?,
-            }
-        } else {
-            self.0.forward(&[last_token], pos - 1, state)?
-        };
+        let logits = self.0.forward(&[last_token], pos - 1, state)?;
         let chosen = self.sample(&logits, recent(all_tokens), temp, top_p);
         Ok((chosen, logprobs.map(|k| logprob_info(&logits, chosen, k))))
     }

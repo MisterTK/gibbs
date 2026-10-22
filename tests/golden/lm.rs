@@ -3,9 +3,7 @@
 
 use crate::util::*;
 use gibbs_engine::arch::LoadOpts;
-use gibbs_engine::graph::Tensor;
 use gibbs_engine::hardware::{Device, HardwareCapability};
-use gibbs_engine::model::native::logits_of;
 use gibbs_engine::model::weight_format::{ReencodeConfig, ReencodePolicy};
 use gibbs_engine::scheduler::ExecutableModel;
 use serde_json::{json, Value};
@@ -179,10 +177,8 @@ fn run_lm(m: &ExecutableModel, dev: Device) -> Out {
     lm.forward(&ids[..ids.len() - 1], 0, &mut st).unwrap();
     for _ in 0..8 {
         let n = ids.len();
-        let t = match lm.forward_greedy(&ids[n - 1..], n - 1, &mut st).unwrap() {
-            Tensor::U32(t) => t[0],
-            t => argmax(&logits_of(t).unwrap()[..V]),
-        };
+        let l = lm.forward(&ids[n - 1..], n - 1, &mut st).unwrap();
+        let t = argmax(&l[..V]);
         ids.push(t);
     }
     // The greedy path (device argmax after the first token) agrees with the logits' argmax.
