@@ -285,6 +285,8 @@ fn flow_in(specs: &[Spec], cols: &[Rect]) -> Plan {
         *cur += grow;
     }
     // Pass 2: proportional flexbox grow from `pref_h` (`basis`) toward `max_h` per column.
+    // Pass 3: when the column still has spare height (`col_used < h`), distribute 100% of the
+    // remaining vertical space across the column's placed items (`flex: 1 1 auto` to 100% height).
     for col_idx in 0..cols.len() {
         let indices: Vec<usize> = (0..placed.len())
             .filter(|&i| placed[i].1 == col_idx)
@@ -301,8 +303,21 @@ fn flow_in(specs: &[Spec], cols: &[Rect]) -> Plan {
                 Flex::new(cur, cur, max_h, grow, 1)
             })
             .collect();
-        for (idx, (_, sz)) in indices.into_iter().zip(flex(h, 0, &items)) {
+        for (&idx, (_, sz)) in indices.iter().zip(flex(h, 0, &items)) {
             placed[idx].2 = sz;
+        }
+        let col_used: u16 = indices.iter().map(|&i| placed[i].2).sum();
+        if col_used < h {
+            let uncapped: Vec<Flex> = indices
+                .iter()
+                .map(|&i| {
+                    let (s, _, cur) = placed[i];
+                    Flex::new(cur, cur, u16::MAX, s.pref_h.max(1), 1)
+                })
+                .collect();
+            for (idx, (_, sz)) in indices.into_iter().zip(flex(h, 0, &uncapped)) {
+                placed[idx].2 = sz;
+            }
         }
     }
     let mut y = vec![first.y; cols.len()];
@@ -528,11 +543,30 @@ mod tests {
                         for (c, rc) in &plan.placed {
                             let s = specs.iter().find(|s| s.comp == *c).unwrap();
                             assert!(rc.height >= s.min_h, "{c:?} {w}x{h}");
-                            assert!(rc.height <= s.max_h.max(s.pref_h));
                             assert!(
                                 r.sidebar.iter().any(|col| inside(*rc, *col)),
                                 "{c:?} {w}x{h}"
                             );
+                        }
+                        for col in &r.sidebar {
+                            let col_rects: Vec<Rect> = plan
+                                .placed
+                                .iter()
+                                .map(|p| p.1)
+                                .filter(|rc| rc.x == col.x && rc.width == col.width)
+                                .collect();
+                            if !col_rects.is_empty() {
+                                let sum_h: u16 = col_rects.iter().map(|rc| rc.height).sum();
+                                assert_eq!(
+                                    sum_h, col.height,
+                                    "sidebar column in {w}x{h} did not fill 100% height"
+                                );
+                                assert_eq!(
+                                    col_rects.last().unwrap().bottom(),
+                                    col.bottom(),
+                                    "sidebar column bottom mismatch in {w}x{h}"
+                                );
+                            }
                         }
                         assert!(disjoint(&rects), "{w}x{h}: {rects:?}");
                         // The one-call form over a single area obeys the same invariants.

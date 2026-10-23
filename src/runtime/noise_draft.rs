@@ -495,6 +495,11 @@ impl NoiseBlockHead {
 
     /// Folds an arbitrary-width target tap vector + anchor token ID into $\mathbb{R}^{d_b}$.
     pub fn fold_features(&self, tap_row: &[f32], anchor_tok: u32) -> Vec<f32> {
+        self.fold_token_context(tap_row, &[anchor_tok])
+    }
+
+    /// Folds an arbitrary-width target tap vector + up to the last 4 context tokens into $\mathbb{R}^{d_b}$.
+    pub fn fold_token_context(&self, tap_row: &[f32], context_tokens: &[u32]) -> Vec<f32> {
         let d_b = self.d_b;
         let mut x = vec![0.0f32; d_b];
         if !tap_row.is_empty() {
@@ -505,12 +510,18 @@ impl NoiseBlockHead {
                 }
             }
         }
-        // Add deterministic Rademacher hash embedding of `anchor_tok`.
-        let tok_seed = (anchor_tok as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        for (i, dst) in x.iter_mut().enumerate() {
-            let h = splitmix64(tok_seed ^ (i as u64));
-            let emb = ((h as u32 as f32) / (u32::MAX as f32) - 0.5) * 1.5;
-            *dst += emb;
+        let window = &context_tokens[context_tokens.len().saturating_sub(4)..];
+        for (pos, &tok) in window.iter().rev().enumerate() {
+            let stride_seed = (pos as u64).wrapping_mul(0x517C_C1B7_2722_0A95);
+            let tok_seed = (tok as u64)
+                .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                .wrapping_add(stride_seed);
+            let scale = 1.5 / ((pos + 1) as f32).sqrt();
+            for (i, dst) in x.iter_mut().enumerate() {
+                let h = splitmix64(tok_seed ^ (i as u64));
+                let emb = ((h as u32 as f32) / (u32::MAX as f32) - 0.5) * scale;
+                *dst += emb;
+            }
         }
         rms_norm_in_place(&mut x, &self.rms_gain);
         x
@@ -743,20 +754,14 @@ pub struct OnlineNoiseDrafter {
 
 impl OnlineNoiseDrafter {
     pub fn new(
-        layers: usize,
-        hidden: usize,
+        _layers: usize,
+        _hidden: usize,
         vocab: usize,
         knobs: Arc<LiveDraftKnobs>,
     ) -> Arc<Self> {
-        let taps = match layers {
-            0 | 1 => vec![0],
-            2 => vec![0, 1],
-            n => vec![n / 2, n - 1],
-        };
-        let tap_width = taps.len() * hidden.max(1);
         Arc::new(Self {
-            taps,
-            tap_width,
+            taps: Vec::new(),
+            tap_width: 0,
             vocab: vocab.max(1),
             knobs,
             lattice: RwLock::new(SuffixLattice::new()),
@@ -776,6 +781,7 @@ impl OnlineNoiseDrafter {
 impl Drafter for OnlineNoiseDrafter {
     fn label(&self) -> String {
         match self.knobs.snapshot().mode {
+            DraftMode::Auto => "auto → online-noise+suffix".to_string(),
             DraftMode::Suffix => "suffix-lattice".to_string(),
             _ => "online-noise+suffix".to_string(),
         }
@@ -817,7 +823,7 @@ impl Drafter for OnlineNoiseDrafter {
             .ok_or("draft state was not built by OnlineNoiseDrafter")?;
         let knobs = self.knobs.snapshot();
         let k = k.min(knobs.max_k).min(NOISE_MAX_K);
-        if tokens.is_empty() || k == 0 || knobs.mode == DraftMode::Off {
+        if tokens.is_empty() {
             return Ok(Vec::new());
         }
 
@@ -830,7 +836,7 @@ impl Drafter for OnlineNoiseDrafter {
             self.lattice.write().observe_tokens(slice);
 
             if let Some((prev_c, prev_tap, prev_anchor, prev_pos)) = s.prev_context.take() {
-                if tokens.len() > prev_pos {
+                if tokens.len() > prev_pos && knobs.mode != DraftMode::Off {
                     let committed = &tokens[prev_pos..];
                     self.noise_head.lock().update_online(
                         &prev_c,
@@ -842,7 +848,10 @@ impl Drafter for OnlineNoiseDrafter {
                         s.step,
                     );
                 }
-            } else if tokens.len() >= 2 && knobs.mode != DraftMode::Suffix {
+            } else if tokens.len() >= 2
+                && knobs.mode != DraftMode::Suffix
+                && knobs.mode != DraftMode::Off
+            {
                 // Seed shortlist with prompt tokens so the block head can propose immediately.
                 let mut head = self.noise_head.lock();
                 for &t in tokens.iter().rev().take(64) {
@@ -863,7 +872,26 @@ impl Drafter for OnlineNoiseDrafter {
         let anchor = *tokens.last().unwrap();
         s.step = s.step.wrapping_add(1);
 
-        // 2. Query SuffixLattice (local prompt lattice first, then global cross-sequence lattice).
+        // 2. If not Suffix-only or Off, compute NoiseBlockHead context and record `prev_context`
+        // even on `k == 0` steps so online learning tracks committed tokens continuously.
+        let (context_c, head_updates) =
+            if knobs.mode != DraftMode::Suffix && knobs.mode != DraftMode::Off {
+                let head = self.noise_head.lock();
+                let folded_ctx = head.fold_token_context(last_tap, tokens);
+                let c = head.forward_context(&folded_ctx, anchor);
+                let updates = head.updates;
+                drop(head);
+                s.prev_context = Some((c.clone(), folded_ctx, anchor, tokens.len()));
+                (Some(c), updates)
+            } else {
+                (None, 0)
+            };
+
+        if k == 0 || knobs.mode == DraftMode::Off {
+            return Ok(Vec::new());
+        }
+
+        // 3. Query SuffixLattice (local prompt lattice first, then global cross-sequence lattice).
         let suffix_drafts = s
             .local_lattice
             .propose(tokens, k, knobs.suffix_min_match)
@@ -872,15 +900,6 @@ impl Drafter for OnlineNoiseDrafter {
                     .read()
                     .propose(tokens, k, knobs.suffix_min_match)
             });
-
-        // 3. If not Suffix-only, compute NoiseBlockHead context and per-offset shortlist predictions.
-        let context_c = if knobs.mode != DraftMode::Suffix {
-            let c = self.noise_head.lock().forward_context(last_tap, anchor);
-            s.prev_context = Some((c.clone(), last_tap.to_vec(), anchor, tokens.len()));
-            Some(c)
-        } else {
-            None
-        };
 
         // In Suffix-only mode without a suffix match, return empty drafts (plain decode).
         if knobs.mode == DraftMode::Suffix && suffix_drafts.is_none() {
@@ -897,9 +916,11 @@ impl Drafter for OnlineNoiseDrafter {
         for offset in 0..k {
             logits.fill(-20.0);
             let mut has_candidate = false;
+            let mut top_prob = 0.0f32;
 
             if let Some(c) = &context_c {
-                let (shortlist, _conf) = self.noise_head.lock().predict_offset(c, offset);
+                let (shortlist, conf) = self.noise_head.lock().predict_offset(c, offset);
+                top_prob = conf;
                 for (tok, l) in shortlist {
                     if (tok as usize) < self.vocab {
                         logits[tok as usize] = l;
@@ -908,13 +929,24 @@ impl Drafter for OnlineNoiseDrafter {
                 }
             }
 
-            if let Some(&suf_tok) = suf_slice.get(offset) {
+            let has_suffix = if let Some(&suf_tok) = suf_slice.get(offset) {
                 if (suf_tok as usize) < self.vocab {
                     // Suffix match boosts the candidate logit strongly while keeping valid distribution support.
                     logits[suf_tok as usize] = logits[suf_tok as usize].max(0.0) + 14.0;
                     has_candidate = true;
                 }
-            } else if knobs.mode == DraftMode::Suffix {
+                true
+            } else {
+                false
+            };
+
+            if knobs.mode == DraftMode::Suffix && !has_suffix {
+                break;
+            }
+            if knobs.mode == DraftMode::Auto
+                && !has_suffix
+                && !(head_updates >= 4 && top_prob >= knobs.target_acceptance)
+            {
                 break;
             }
 

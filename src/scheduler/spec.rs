@@ -93,6 +93,7 @@ pub(super) struct Step {
     /// The step's time is representative of its `k` (see [`KTuner::record`]): the drafter was in
     /// sync, or the step did not draft.
     pub synced: bool,
+    pub logprobs: Vec<super::TokenLogprobInfo>,
 }
 
 /// The target-side hooks, per backend (see the matching [`NativeLm`] methods).
@@ -137,6 +138,7 @@ pub(super) fn decode(
     top_p: f32,
     vocab: usize,
     k: usize,
+    top_logprobs: Option<usize>,
 ) -> Result<Step, String> {
     let last = *all.last().ok_or("empty sequence")?;
     let start = all.len() - 1;
@@ -145,6 +147,10 @@ pub(super) fn decode(
     let greedy = temp <= 1e-4;
     let mut qs = Vec::new();
     let drafts = if k == 0 {
+        let _ = spec
+            .drafter
+            .propose(&mut spec.draft, all, &spec.pending, 0, &mut |_| 0);
+        spec.pending.clear();
         Vec::new()
     } else {
         let rng = &mut spec.rng;
@@ -176,16 +182,15 @@ pub(super) fn decode(
     };
     if drafts.is_empty() {
         // Plain decode (no checkpoints); the drafter catches up on these taps next time.
-        let t = m
-            .step_token_with_kv(all, last, all.len(), temp, top_p, None, kv)
-            .map(|(t, _)| t)?;
+        let (t, lp) = m.step_token_with_kv(all, last, all.len(), temp, top_p, top_logprobs, kv)?;
         spec.pending.extend(m.take_taps(kv));
         spec.synced = false;
         return Ok(Step {
             tokens: vec![t],
             drafted: 0,
             accepted: 0,
-            synced: true,
+            synced: k == 0,
+            logprobs: lp.into_iter().collect(),
         });
     }
     let synced = std::mem::replace(&mut spec.synced, true);
@@ -202,10 +207,14 @@ pub(super) fn decode(
     }
     let width = logits.len() / input.len();
     let mut out = Vec::with_capacity(input.len());
+    let mut logprobs = Vec::new();
     for (j, row) in logits.chunks_exact(width).enumerate() {
         let l = &row[..valid(width)];
         if greedy {
             let t = m.sample(l, recent(all), temp, top_p);
+            if let Some(k_lp) = top_logprobs {
+                logprobs.push(super::logprob_info(l, t, k_lp));
+            }
             out.push(t);
             if drafts.get(j) != Some(&t) {
                 break;
@@ -214,15 +223,26 @@ pub(super) fn decode(
         }
         let p = dist(l, temp, top_p);
         let Some(&x) = drafts.get(j) else {
-            out.push(draw(&p, spec.rng.uniform()));
+            let t = draw(&p, spec.rng.uniform());
+            if let Some(k_lp) = top_logprobs {
+                logprobs.push(super::logprob_info(l, t, k_lp));
+            }
+            out.push(t);
             break;
         };
         let (px, qx) = (prob(&p, x), prob(&qs[j], x));
         if spec.rng.uniform() * qx as f64 <= px as f64 {
+            if let Some(k_lp) = top_logprobs {
+                logprobs.push(super::logprob_info(l, x, k_lp));
+            }
             out.push(x);
             continue;
         }
-        out.push(draw(&residual(&p, &qs[j]), spec.rng.uniform()));
+        let t = draw(&residual(&p, &qs[j]), spec.rng.uniform());
+        if let Some(k_lp) = top_logprobs {
+            logprobs.push(super::logprob_info(l, t, k_lp));
+        }
+        out.push(t);
         break;
     }
     // The target keeps `last` and the accepted drafts; the final token has not run yet.
@@ -235,6 +255,7 @@ pub(super) fn decode(
         drafted: drafts.len(),
         tokens: out,
         synced,
+        logprobs,
     })
 }
 

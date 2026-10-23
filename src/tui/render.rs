@@ -229,11 +229,23 @@ impl TuiApp {
 
     fn render_console(&self, f: &mut Frame, area: Rect, th: &Theme) {
         let dim = th.fg(Token::Dim);
-        let hint = match self.focus {
-            Focus::Prompt => {
-                " enter run · esc cancel chat / back · ctrl-x cancel · pgup/pgdn scroll "
+        let hint: String = if let Some(i) = self.prompt_history_idx {
+            format!(
+                " history {}/{} · enter retry · edit · ↓ newer · esc cancel/back ",
+                i + 1,
+                self.prompt_history.len()
+            )
+        } else {
+            match self.focus {
+                Focus::Prompt => {
+                    " enter run · ↑↓ history · F4 options · esc cancel/back · trackpad/pgup/pgdn scroll "
+                        .into()
+                }
+                _ => {
+                    " /chat /image /decide <q> | a, b /embed /classify <t> [|| pair] /connect /agent "
+                        .into()
+                }
             }
-            _ => " /chat /image /decide <q> | a, b /embed /classify <t> [|| pair] /connect /agent ",
         };
         let block = instrument("Console", None, self.focus == Focus::Prompt, th)
             .title_bottom(Span::styled(hint, dim));
@@ -315,22 +327,16 @@ impl TuiApp {
                 ("i", "prompt"),
                 ("m", "models"),
                 ("F2", "templates"),
-                ("^R", "roofline"),
-                ("^P", "logprobs"),
-                ("^T", "tokens"),
-                ("^L", "latency"),
-                ("^K", "kernels"),
-                ("↑↓", "scroll"),
+                ("F4", "options"),
+                ("↑↓", "history"),
                 ("q", "quit"),
             ],
             Focus::Prompt => &[
                 ("enter", "run"),
-                ("^R", "roofline"),
-                ("^P", "logprobs"),
-                ("^T", "tokens"),
-                ("^L", "latency"),
-                ("^K", "kernels"),
-                ("esc/ctrl-x", "cancel chat"),
+                ("↑↓", "history"),
+                ("F2", "templates"),
+                ("F4", "options"),
+                ("esc/ctrl-x", "cancel/back"),
                 ("ctrl-c", "quit"),
             ],
             Focus::Picker => &[
@@ -403,11 +409,16 @@ impl TuiApp {
     fn render_settings_modal(&self, f: &mut Frame, area: Rect, th: &Theme) {
         let popup = centered(
             area,
-            (area.width * 60 / 100).max(50),
-            (area.height * 50 / 100).max(14),
+            (area.width * 74 / 100).max(58),
+            (area.height * 60 / 100).max(16),
         );
         f.render_widget(Clear, popup);
-        let block = instrument("Policy Settings (F4)", None, true, th);
+        let block = instrument(
+            "Policy & Speed Options (F4 — defaults = fastest for model)",
+            None,
+            true,
+            th,
+        );
         let inner = block.inner(popup);
         f.render_widget(block, popup);
 
@@ -421,22 +432,74 @@ impl TuiApp {
         } else {
             Span::styled("DISABLED", th.fg(Token::Crimson))
         };
+        let reencode_val = format!(
+            "{:?}{}",
+            self.reencode_policy,
+            if self.reencode_policy == crate::model::weight_format::ReencodePolicy::MaxSpeed {
+                " [FASTEST]"
+            } else {
+                ""
+            }
+        );
+        let variant_val = format!(
+            "{:?}{}",
+            self.variant_policy,
+            if self.variant_policy == crate::model::weight_format::VariantPolicy::Fastest {
+                " [FASTEST]"
+            } else {
+                ""
+            }
+        );
+        let resolved_drafter = self
+            .scheduler
+            .as_ref()
+            .and_then(|sc| sc.view().spec)
+            .map(|sv| {
+                sv.label
+                    .strip_prefix("auto → ")
+                    .unwrap_or(&sv.label)
+                    .to_string()
+            })
+            .unwrap_or_else(|| "online-noise+suffix".to_string());
+        let draft_val = if self.draft_knobs.mode == crate::runtime::noise_draft::DraftMode::Auto {
+            format!("AUTO → {resolved_drafter} [FASTEST]")
+        } else {
+            self.draft_knobs.mode.name().to_uppercase()
+        };
+        let compact_val = format!(
+            "{}{}",
+            self.compact_config.mode.name().to_uppercase(),
+            if self.compact_config.mode == crate::compact::CompactionMode::Auto {
+                " [FASTEST]"
+            } else {
+                ""
+            }
+        );
         let lines = vec![
             Line::from(""),
             Line::from(vec![
                 Span::styled(" [1] Re-encode Policy:   ", label),
-                Span::styled(format!("{:?}", self.reencode_policy), value),
-                Span::styled("  (1: toggle max-speed / low-bit / bit-exact)", dim),
+                Span::styled(reencode_val, value),
+                Span::styled(
+                    " — highest-GB/s GPU codec for host ceiling (KL ≤ 0.05)  (1: max-speed / low-bit / bit-exact)",
+                    dim,
+                ),
             ]),
             Line::from(vec![
                 Span::styled(" [2] Variant Policy:     ", label),
-                Span::styled(format!("{:?}", self.variant_policy), value),
-                Span::styled("  (2: toggle fastest / fastest-4bit / quality)", dim),
+                Span::styled(variant_val, value),
+                Span::styled(
+                    " — ranks checkpoints by predicted decode tok/s  (2: fastest / fastest-4bit / quality)",
+                    dim,
+                ),
             ]),
             Line::from(vec![
                 Span::styled(" [3] Roofline HUD:       ", label),
                 hud,
-                Span::styled("  (3: toggle live HUD overlay)", dim),
+                Span::styled(
+                    " — live bandwidth/compute roofline telemetry  (3: toggle)",
+                    dim,
+                ),
             ]),
             Line::from(vec![
                 Span::styled(" [4] Context Limit:      ", label),
@@ -444,11 +507,15 @@ impl TuiApp {
                     format!("{} tokens", self.ctx_limit),
                     th.fg(Token::Parchment),
                 ),
+                Span::styled("  (4: cycle 4096 / 8192 / 16384 / 32768)", dim),
             ]),
             Line::from(vec![
                 Span::styled(" [5] Spec Draft Mode:    ", label),
-                Span::styled(self.draft_knobs.mode.name().to_uppercase(), value),
-                Span::styled("  (5: cycle auto / noise / suffix / model / off)", dim),
+                Span::styled(draft_val, value),
+                Span::styled(
+                    " — MTP if in checkpoint, else zero-tap online-noise+suffix with KTuner k=0 plain fallback  (5: cycle auto / noise / suffix / model / off)",
+                    dim,
+                ),
             ]),
             Line::from(vec![
                 Span::styled(" [6] Spec Max K:         ", label),
@@ -465,8 +532,11 @@ impl TuiApp {
             ]),
             Line::from(vec![
                 Span::styled(" [8] Auto Compaction:    ", label),
-                Span::styled(self.compact_config.mode.name().to_uppercase(), value),
-                Span::styled("  (8: cycle auto / light / aggressive / off)", dim),
+                Span::styled(compact_val, value),
+                Span::styled(
+                    " — 4-tier trim at 85%→60% ctx preserving Paged-Radix KV prefix  (8: cycle auto / light / aggressive / off)",
+                    dim,
+                ),
             ]),
             Line::from(""),
             Line::from(Span::styled(

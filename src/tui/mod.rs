@@ -35,7 +35,10 @@ use crate::runtime::encoder::system1::{ChoiceOption, JevSystem1Model};
 use crate::runtime::encoder::{Activation, LabelScore};
 use crate::scheduler::{finish_outcome, ContinuousBatchScheduler, SamplingParams};
 use crate::telemetry::{EngineTelemetry, KernelRow};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, MouseEvent, MouseEventKind,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -454,6 +457,9 @@ pub struct TuiApp {
     /// Multi-turn conversation history (`("user" | "assistant", content)` pairs).
     pub chat_history: Vec<(String, String)>,
     pub input: String,
+    pub prompt_history: Vec<String>,
+    pub prompt_history_idx: Option<usize>,
+    pub prompt_draft: String,
     focus: Focus,
     picker: Picker,
     load: Option<Load>,
@@ -566,6 +572,9 @@ impl TuiApp {
             history: Vec::new(),
             chat_history: Vec::new(),
             input: String::new(),
+            prompt_history: Vec::new(),
+            prompt_history_idx: None,
+            prompt_draft: String::new(),
             focus: Focus::Dashboard,
             picker,
             load: None,
@@ -681,6 +690,11 @@ impl TuiApp {
         if raw.is_empty() {
             return;
         }
+        if self.prompt_history.last() != Some(&raw) {
+            self.prompt_history.push(raw.clone());
+        }
+        self.prompt_history_idx = None;
+        self.prompt_draft.clear();
         let (cmd, rest) = raw.split_once(char::is_whitespace).unwrap_or((&raw, ""));
         let answer = match cmd {
             "/connect" => Some(
@@ -765,10 +779,11 @@ impl TuiApp {
                     "GIBBS ENGINE COMMAND & KEY REFERENCE:\n\
                      Keybindings:\n\
                      · m / Esc    : Switch between Dashboard & Model Picker (there r / f cycle the re-encode / variant policy and reload the model)\n\
+                     · ↑ / ↓      : Cycle prior prompt entries for retry or editing\n\
                      · F2         : System Prompt / Chat Template Selector\n\
-                     · F4         : Policy settings modal (changes apply to the next load)\n\
-                     · Ctrl+R/P/T/L/K: Focus ROOFLINE / LOGPROBS / TOKENS / LATENCY / KERNELS for detail (←/→ scrub logprobs)\n\
-                     · Esc        : Unfocus component / cancel prompt / return to Dashboard\n\
+                     · F4         : Policy & Speed Options modal (defaults = fastest for model)\n\
+                     · Trackpad / Mouse Wheel / PgUp / PgDn : Scroll console\n\
+                     · Esc / ^X   : Cancel running prompt / return to Dashboard\n\
                      · Ctrl+C     : Exit Gibbs engine\n\n\
                      Slash Commands:\n\
                      · /reencode [max-speed|min-size|low-bit-native|bit-exact] : Set the weight re-encode policy (no argument cycles) and reload the active model under it\n\
@@ -2077,30 +2092,7 @@ impl TuiApp {
             self.cancel_chat();
             return false;
         }
-        for (ch, comp) in [
-            ('p', layout::Comp::Logprobs),
-            ('r', layout::Comp::Roofline),
-            ('l', layout::Comp::Latency),
-            ('t', layout::Comp::Tokens),
-            ('k', layout::Comp::Kernels),
-        ] {
-            if ctrl
-                && key.code == KeyCode::Char(ch)
-                && matches!(self.focus, Focus::Dashboard | Focus::Prompt)
-            {
-                self.detail = if self.detail == Some(comp) {
-                    None
-                } else {
-                    Some(comp)
-                };
-                if self.detail == Some(layout::Comp::Roofline)
-                    && self.roofline_probe_result.is_none()
-                {
-                    self.trigger_background_roofline_probe();
-                }
-                return false;
-            }
-        }
+        // (Ctrl+R/P/T/L/K removed from keybar; use /roofline, /profile, F4 options)
         if self.placement_modal.is_some() {
             if matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q')) {
                 self.placement_modal = None;
@@ -2177,6 +2169,14 @@ impl TuiApp {
                 KeyCode::Char('3') => {
                     self.show_roofline_hud = !self.show_roofline_hud;
                 }
+                KeyCode::Char('4') => {
+                    self.ctx_limit = match self.ctx_limit {
+                        0..=4096 => 8192,
+                        4097..=8192 => 16384,
+                        8193..=16384 => 32768,
+                        _ => 4096,
+                    };
+                }
                 KeyCode::Char('5') => {
                     let next = self.draft_knobs.mode.next();
                     let _ = self.apply_spec_cmd(SpecArg::Mode(next));
@@ -2244,6 +2244,8 @@ impl TuiApp {
                         self.focus = Focus::Dashboard;
                     }
                 }
+                KeyCode::Up => self.navigate_prompt_history(true),
+                KeyCode::Down => self.navigate_prompt_history(false),
                 KeyCode::Enter => self.submit_prompt(),
                 KeyCode::Backspace => {
                     self.input.pop();
@@ -2266,18 +2268,79 @@ impl TuiApp {
                     self.focus = Focus::Picker;
                 }
                 KeyCode::Char('s') => self.kernel_sort = self.kernel_sort.next(),
-                KeyCode::Char('k') => self.scroll_console(KeyCode::Up),
-                KeyCode::Char('j') => self.scroll_console(KeyCode::Down),
+                KeyCode::Up => self.navigate_prompt_history(true),
+                KeyCode::Down => self.navigate_prompt_history(false),
+                KeyCode::Char('k') => self.scroll = self.scroll.saturating_add(1),
+                KeyCode::Char('j') => self.scroll = self.scroll.saturating_sub(1),
                 code => self.scroll_console(code),
             },
         }
         false
     }
 
+    fn navigate_prompt_history(&mut self, up: bool) {
+        if up {
+            if self.prompt_history.is_empty() {
+                return;
+            }
+            self.focus = Focus::Prompt;
+            let idx = match self.prompt_history_idx {
+                None => {
+                    self.prompt_draft = std::mem::take(&mut self.input);
+                    self.prompt_history.len() - 1
+                }
+                Some(cur) => cur.saturating_sub(1),
+            };
+            self.prompt_history_idx = Some(idx);
+            self.input = self.prompt_history[idx].clone();
+        } else if let Some(cur) = self.prompt_history_idx {
+            self.focus = Focus::Prompt;
+            if cur + 1 < self.prompt_history.len() {
+                let next = cur + 1;
+                self.prompt_history_idx = Some(next);
+                self.input = self.prompt_history[next].clone();
+            } else {
+                self.input = std::mem::take(&mut self.prompt_draft);
+                self.prompt_history_idx = None;
+            }
+        }
+    }
+
+    pub fn handle_mouse(&mut self, mouse: MouseEvent) {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                if let Some((_, scroll)) = &mut self.placement_modal {
+                    *scroll = scroll.saturating_sub(3);
+                } else if self.focus == Focus::Picker {
+                    for _ in 0..3 {
+                        let _ = self
+                            .picker
+                            .handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+                    }
+                } else {
+                    self.scroll = self.scroll.saturating_add(3);
+                }
+            }
+            MouseEventKind::ScrollDown => {
+                if let Some((rows, scroll)) = &mut self.placement_modal {
+                    let last = rows.len() + 2;
+                    *scroll = (*scroll + 3).min(last);
+                } else if self.focus == Focus::Picker {
+                    for _ in 0..3 {
+                        let _ = self
+                            .picker
+                            .handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+                    }
+                } else {
+                    self.scroll = self.scroll.saturating_sub(3);
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn scroll_console(&mut self, code: KeyCode) {
         self.scroll = match code {
-            KeyCode::Up => self.scroll + 1,
-            KeyCode::Down => self.scroll.saturating_sub(1),
             KeyCode::PageUp => self.scroll + 10,
             KeyCode::PageDown => self.scroll.saturating_sub(10),
             KeyCode::Home => usize::MAX / 2,
@@ -2291,8 +2354,7 @@ impl TuiApp {
         self.telemetry.is_tui_active.store(true, Ordering::Relaxed);
         crate::telemetry::TUI_OWNS_TERMINAL.store(true, Ordering::Relaxed);
         enable_raw_mode()?;
-        execute!(io::stdout(), EnterAlternateScreen)?;
-        // A panic on this thread must not leave the terminal in raw mode; other threads' panics
+        execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
         // go to the log (the default hook would print over the alternate screen).
         let ui_thread = std::thread::current().id();
         let previous: Arc<dyn Fn(&std::panic::PanicHookInfo<'_>) + Send + Sync> =
@@ -2352,10 +2414,14 @@ impl TuiApp {
             if event::poll(wait)? {
                 // Apply every queued event before one redraw (fast typing, pastes, resizes).
                 loop {
-                    if let Event::Key(key) = event::read()? {
-                        if key.kind != KeyEventKind::Release && self.handle_key(key) {
-                            return Ok(());
+                    match event::read()? {
+                        Event::Key(key) => {
+                            if key.kind != KeyEventKind::Release && self.handle_key(key) {
+                                return Ok(());
+                            }
                         }
+                        Event::Mouse(mouse) => self.handle_mouse(mouse),
+                        _ => {}
                     }
                     if !event::poll(Duration::ZERO)? {
                         break;
@@ -2425,7 +2491,7 @@ impl TuiApp {
 
 fn restore_terminal() {
     let _ = disable_raw_mode();
-    let _ = execute!(io::stdout(), LeaveAlternateScreen);
+    let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
 }
 
 /// `/decide <state> | option, option`: zero-shot choice by embedding similarity.
@@ -2945,22 +3011,13 @@ mod tests {
         );
 
         assert_eq!(app.detail, None);
-        let ctrl_p = KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL);
 
-        // 1. Toggle on Dashboard
-        app.handle_key(ctrl_p);
-        assert_eq!(app.detail, Some(layout::Comp::Logprobs));
-
-        // 2. Esc closes it
+        // 1. Detail view on Dashboard closes with Esc
+        app.detail = Some(layout::Comp::Logprobs);
         app.handle_key(key(KeyCode::Esc));
         assert_eq!(app.detail, None);
 
-        // 3. In Picker focus, Ctrl-P does NOT open inspector
-        app.focus = Focus::Picker;
-        app.handle_key(ctrl_p);
-        assert_eq!(app.detail, None);
-
-        // 4. Transmit real TokenLogprobInfo on channel and verify tick() receives it
+        // 2. Transmit real TokenLogprobInfo on channel and verify tick() receives it
         let info = crate::scheduler::TokenLogprobInfo {
             chosen_id: 11751,
             chosen_prob: 0.642,
@@ -2974,10 +3031,9 @@ mod tests {
         assert_eq!(app.latest_logprobs, Some(info));
         assert_eq!(app.logprob_history.len(), 1);
 
-        // 5. Test scrub index navigation with Left / Right
+        // 3. Test scrub index navigation with Left / Right
         app.focus = Focus::Dashboard;
-        app.handle_key(ctrl_p);
-        assert_eq!(app.detail, Some(layout::Comp::Logprobs));
+        app.detail = Some(layout::Comp::Logprobs);
         app.handle_key(key(KeyCode::Left));
         assert_eq!(app.logprob_scrub_idx, 0);
         app.handle_key(key(KeyCode::Right));
@@ -3007,15 +3063,7 @@ mod tests {
             assert!(probe.is_err());
         }
 
-        // 3. Ctrl+R focuses the roofline component, Esc unfocuses it
-        assert_eq!(app.detail, None);
-        let ctrl_r = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL);
-        app.handle_key(ctrl_r);
-        assert_eq!(app.detail, Some(layout::Comp::Roofline));
-        app.handle_key(key(KeyCode::Esc));
-        assert_eq!(app.detail, None);
-
-        // 4. /roofline command opens modal
+        // 3. /roofline command opens detail view, Esc unfocuses it
         app.input = "/roofline".into();
         app.submit_prompt();
         assert_eq!(app.detail, Some(layout::Comp::Roofline));
@@ -3133,10 +3181,72 @@ mod tests {
         assert!(!app.show_roofline_hud);
         app.handle_key(key(KeyCode::Char('3')));
         assert!(app.show_roofline_hud);
+        // 6. '4' cycles ctx_limit: 8192 -> 16384 -> 32768 -> 4096 -> 8192
+        assert_eq!(app.ctx_limit, 8192);
+        app.handle_key(key(KeyCode::Char('4')));
+        assert_eq!(app.ctx_limit, 16384);
+        app.handle_key(key(KeyCode::Char('4')));
+        assert_eq!(app.ctx_limit, 32768);
+        app.handle_key(key(KeyCode::Char('4')));
+        assert_eq!(app.ctx_limit, 4096);
+        app.handle_key(key(KeyCode::Char('4')));
+        assert_eq!(app.ctx_limit, 8192);
 
-        // 6. Esc closes modal
+        // 7. Rendered F4 modal shows [FASTEST] defaults and bottom keybar shows F4 options & ↑↓ history
+        let _g = truecolor();
+        let modal_text = lines_of(&snapshot::render_buffer(&app, 140, 40)).join("\n");
+        assert!(
+            modal_text.contains("[FASTEST]") && modal_text.contains("POLICY & SPEED OPTIONS"),
+            "{modal_text}"
+        );
+        assert!(
+            modal_text.contains("⟦F4⟧ options") && modal_text.contains("⟦↑↓⟧ history"),
+            "{modal_text}"
+        );
+        assert!(!modal_text.contains("⟦^R⟧"), "{modal_text}");
+
+        // 8. Esc closes modal
         app.handle_key(key(KeyCode::Esc));
         assert!(!app.show_settings_modal);
+
+        // 9. Up / Down arrow keys cycle prior prompt entries for retry/editing, mouse wheel scrolls
+        type_and_run(&mut app, "/quant");
+        type_and_run(&mut app, "/help");
+        app.focus = Focus::Prompt;
+        app.input = "draft in progress".into();
+        app.handle_key(key(KeyCode::Up));
+        assert_eq!(app.input, "/help");
+        assert_eq!(app.prompt_history_idx, Some(app.prompt_history.len() - 1));
+        app.handle_key(key(KeyCode::Up));
+        assert_eq!(app.input, "/quant");
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(app.input, "/help");
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(app.input, "draft in progress");
+        assert_eq!(app.prompt_history_idx, None);
+
+        // Edit a recalled history entry and submit it
+        app.handle_key(key(KeyCode::Up));
+        assert_eq!(app.input, "/help");
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.prompt_history_idx, None);
+
+        // Mouse wheel scrolls console
+        let scroll_before = app.scroll;
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 10,
+            row: 10,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.scroll, scroll_before + 3);
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 10,
+            row: 10,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.scroll, scroll_before);
     }
     #[test]
     fn test_s7_3_qos_par_tasks_and_background_probe() {

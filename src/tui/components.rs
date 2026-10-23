@@ -572,16 +572,26 @@ impl TuiApp {
             ),
         ];
         if let Some(sv) = self.scheduler.as_ref().and_then(|sc| sc.view().spec) {
+            let spec_text = if s.spec_forwards > 0 {
+                let k_tag = sv.k.map_or_else(
+                    || format!("0..{}", self.draft_knobs.max_k),
+                    |k| k.to_string(),
+                );
+                format!(
+                    "SPEC {:.0}% · {:.2} tok/fwd · {} (k={})",
+                    s.spec_accept_rate * 100.0,
+                    s.spec_tokens_per_forward,
+                    sv.label,
+                    k_tag
+                )
+            } else {
+                format!(
+                    "SPEC {} · ready (k=0..{})",
+                    sv.label, self.draft_knobs.max_k
+                )
+            };
             lines.push(Line::from(Span::styled(
-                trunc(
-                    &format!(
-                        "SPEC {:.0}% · {:.2} tok/fwd · {}",
-                        s.spec_accept_rate * 100.0,
-                        s.spec_tokens_per_forward,
-                        sv.label
-                    ),
-                    w,
-                ),
+                trunc(&spec_text, w),
                 th.fg(Token::Gold),
             )));
         }
@@ -824,12 +834,51 @@ impl TuiApp {
         ))];
         let policy = match &self.quant_override {
             Some(f) => format!("--quant {}", f.name()),
-            None => format!(
-                "reencode {:?} · variant {:?}",
-                self.reencode_policy, self.variant_policy
-            ),
+            None => {
+                let fastest = if self.reencode_policy
+                    == crate::model::weight_format::ReencodePolicy::MaxSpeed
+                    && self.variant_policy == crate::model::weight_format::VariantPolicy::Fastest
+                {
+                    " [fastest: max GB/s codec, KL≤0.05]"
+                } else {
+                    ""
+                };
+                format!(
+                    "reencode {:?} · variant {:?}{fastest}",
+                    self.reencode_policy, self.variant_policy
+                )
+            }
         };
         lines.push(Line::from(Span::styled(trunc(&policy, iw), dim)));
+        let active_drafter = self
+            .scheduler
+            .as_ref()
+            .and_then(|sc| sc.view().spec)
+            .map(|sv| {
+                sv.label
+                    .strip_prefix("auto → ")
+                    .unwrap_or(&sv.label)
+                    .to_string()
+            })
+            .unwrap_or_else(|| {
+                if self.draft_knobs.mode == crate::runtime::noise_draft::DraftMode::Off {
+                    "off".to_string()
+                } else {
+                    "online-noise+suffix".to_string()
+                }
+            });
+        let draft_line = format!(
+            "draft {} → {} (k=0..{}, KTuner plain k=0 fallback)",
+            self.draft_knobs.mode.name(),
+            active_drafter,
+            self.draft_knobs.max_k
+        );
+        lines.push(Line::from(Span::styled(trunc(&draft_line, iw), dim)));
+        let compact_line = format!(
+            "compact {} (85%→60% ctx) · Paged-Radix KV prefix reuse",
+            self.compact_config.mode.name()
+        );
+        lines.push(Line::from(Span::styled(trunc(&compact_line, iw), dim)));
         f.render_widget(Paragraph::new(lines), inner);
     }
 

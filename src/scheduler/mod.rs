@@ -623,7 +623,7 @@ fn resolve_drafter(
             ) {
                 m.0.online_drafter(knobs.clone()).or_else(|| m.0.drafter())
             } else {
-                m.0.drafter()
+                m.0.drafter().or_else(|| m.0.online_drafter(knobs.clone()))
             }
         }
     }
@@ -680,10 +680,20 @@ impl ContinuousBatchScheduler {
             logprob_tx: Arc::new(RwLock::new(None)),
             work_signal: (Mutex::new(false), Condvar::new()),
         };
+        s.sync_spec_view();
         if has_model {
             s.log_drafter();
         }
         s
+    }
+
+    /// Updates `self.view.lock().spec` immediately when the active drafter or model changes.
+    fn sync_spec_view(&self) {
+        let spec = self.drafter.read().as_ref().map(|d| SpecView {
+            label: d.label(),
+            k: self.k_tuner.lock().best(),
+        });
+        self.view.lock().spec = spec;
     }
 
     /// Says which drafter new sequences speculate with, if any.
@@ -794,6 +804,7 @@ impl ContinuousBatchScheduler {
         *self.prefill_tuner.lock() = PrefillTuner::default();
         *self.k_tuner.lock() = KTuner::default();
         self.kv_pool.radix_cache.clear();
+        self.sync_spec_view();
         self.log_drafter();
     }
 
@@ -802,6 +813,7 @@ impl ContinuousBatchScheduler {
     pub fn set_drafter(&self, drafter: Option<Arc<dyn Drafter>>) {
         *self.drafter.write() = drafter.filter(|_| spec_enabled());
         *self.k_tuner.lock() = KTuner::default();
+        self.sync_spec_view();
         self.log_drafter();
     }
 
@@ -829,6 +841,7 @@ impl ContinuousBatchScheduler {
         } else if prev.max_k != next.max_k {
             *self.k_tuner.lock() = KTuner::default();
         }
+        self.sync_spec_view();
     }
 
     /// Per-`k` `(k, tok_per_sec, accept_rate)` summary from [`KTuner`].
@@ -1146,7 +1159,7 @@ impl ContinuousBatchScheduler {
                 .match_prefix_with_snapshot(&seq.prompt_tokens);
             let max_reusable = seq.prompt_tokens.len().saturating_sub(1);
             let mut restored_tokens = 0usize;
-            if drafter.is_none() && max_reusable > 0 {
+            if drafter.as_ref().is_none_or(|d| d.tap_layers().is_empty()) && max_reusable > 0 {
                 if let (Some(m), Some(snap)) = (model.as_ref(), snapshot.as_ref()) {
                     let usable = if snap.has_recurrent {
                         if snap.token_len <= max_reusable {
@@ -1287,7 +1300,7 @@ impl ContinuousBatchScheduler {
                         }
                     }
 
-                    if seq.prefilled_tokens == 0 && seq.spec.is_none() {
+                    if seq.spec.is_none() {
                         if let Some(d) = &drafter {
                             let nanos = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
@@ -1388,38 +1401,51 @@ impl ContinuousBatchScheduler {
                 }
 
                 let started = Instant::now();
+                let logprobs = seq.params.top_logprobs;
                 let result = match (spec_k, seq.spec.as_mut()) {
                     (Some(k), Some(sp)) => {
                         let vocab = tokenizer.vocab_size();
-                        spec::decode(m, sp, &all, &mut seq.kv_cache, temp, top_p, vocab, k).map(
-                            |s| {
-                                if s.synced {
-                                    let msg = self.k_tuner.lock().record_with_knobs(
-                                        k,
-                                        s.tokens.len(),
-                                        s.drafted,
-                                        s.accepted,
-                                        started.elapsed(),
-                                        &knobs_snap,
-                                    );
-                                    if let Some(msg) = msg {
-                                        self.telemetry.log_info(&msg);
+                        spec::decode(
+                            m,
+                            sp,
+                            &all,
+                            &mut seq.kv_cache,
+                            temp,
+                            top_p,
+                            vocab,
+                            k,
+                            logprobs,
+                        )
+                        .map(|s| {
+                            if s.synced {
+                                let msg = self.k_tuner.lock().record_with_knobs(
+                                    k,
+                                    s.tokens.len(),
+                                    s.drafted,
+                                    s.accepted,
+                                    started.elapsed(),
+                                    &knobs_snap,
+                                );
+                                if let Some(msg) = msg {
+                                    self.telemetry.log_info(&msg);
+                                }
+                            }
+                            if s.drafted > 0 {
+                                self.telemetry
+                                    .record_spec(s.drafted, s.accepted, s.tokens.len());
+                            }
+                            if !s.logprobs.is_empty() {
+                                if let Some(tx) = self.logprob_tx.read().as_ref() {
+                                    for info in s.logprobs {
+                                        let _ = tx.send(info);
                                     }
                                 }
-                                if s.drafted > 0 {
-                                    self.telemetry.record_spec(
-                                        s.drafted,
-                                        s.accepted,
-                                        s.tokens.len(),
-                                    );
-                                }
-                                s.tokens
-                            },
-                        )
+                            }
+                            s.tokens
+                        })
                     }
                     _ => {
                         let last = all.last().copied().unwrap_or(1);
-                        let logprobs = seq.params.top_logprobs;
                         let streamed = if logprobs.is_none() {
                             m.stream_token(
                                 last,
@@ -2034,11 +2060,15 @@ mod tests {
         let want = run_to_completion(&plain_sched, rx_plain);
         assert_eq!(want.len(), 16);
 
-        for mode in [DraftMode::Noise, DraftMode::Suffix] {
+        for mode in [DraftMode::Auto, DraftMode::Noise, DraftMode::Suffix] {
             let spec_sched = ContinuousBatchScheduler::new(
                 "",
                 Arc::new(PagedKVPool::new(512)),
                 Some(cpu_exec(SHORT)),
+            );
+            assert!(
+                spec_sched.view().spec.is_some(),
+                "DraftMode::Auto should automatically prepare OnlineNoiseDrafter on load"
             );
             spec_sched.set_draft_knobs(DraftKnobs {
                 mode,
@@ -2046,7 +2076,7 @@ mod tests {
                 suffix_min_match: 2,
                 ..DraftKnobs::default()
             });
-            assert!(spec_sched.view().spec.is_none());
+            assert!(spec_sched.view().spec.is_some());
             let (_, rx_spec, ..) = spec_sched.submit_with_params(params, |_| prompt.clone());
             let got = run_to_completion(&spec_sched, rx_spec);
             assert_eq!(got, want, "mode {mode:?} diverged from plain greedy decode");
