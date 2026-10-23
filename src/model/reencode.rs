@@ -339,11 +339,99 @@ pub fn native_applied() -> Option<(ReencodePolicy, u64, Option<Q>)> {
     *NATIVE_APPLIED.lock()
 }
 
-/// Whether `name` (an HF-style tensor name) is a feed-forward projection.
-pub(crate) fn is_ffn_name(name: &str) -> bool {
-    ["mlp", "ffn", "feed_forward"]
+/// Functional role of a weight tensor for mixed-precision sensitivity gating.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TensorRole {
+    Router,
+    LmHead,
+    BoundaryAttn,
+    AttnOrSsm,
+    FfnDown,
+    FfnGateUp,
+    Other,
+}
+
+fn parse_layer_idx(name: &str) -> Option<usize> {
+    let mut it = name.split('.');
+    while let Some(part) = it.next() {
+        if matches!(part, "layers" | "blk" | "h") {
+            if let Some(idx) = it.next().and_then(|s| s.parse::<usize>().ok()) {
+                return Some(idx);
+            }
+        }
+    }
+    None
+}
+
+/// Classifies `name` into its [`TensorRole`]. MoE routers (`*.mlp.gate.weight`, `*router*`,
+/// `*shared_expert_gate*`, `*ffn_gate_inp*`) are always [`TensorRole::Router`], never FFN.
+pub fn classify_tensor(
+    name: &str,
+    layer: Option<usize>,
+    total_layers: Option<usize>,
+) -> TensorRole {
+    if name.ends_with(".mlp.gate.weight")
+        || name.ends_with(".block_sparse_moe.gate.weight")
+        || name.contains("router")
+        || name.contains("shared_expert_gate")
+        || name.contains("ffn_gate_inp")
+    {
+        return TensorRole::Router;
+    }
+    if is_lm_head_name(name) {
+        return TensorRole::LmHead;
+    }
+    let ffn_sub = ["mlp", "ffn", "feed_forward"]
+        .iter()
+        .any(|s| name.contains(s));
+    if ffn_sub {
+        if [
+            "down",
+            "w2",
+            "c_proj",
+            "fc2",
+            "dense_4h_to_h",
+            "output_linear",
+        ]
         .iter()
         .any(|s| name.contains(s))
+        {
+            return TensorRole::FfnDown;
+        }
+        return TensorRole::FfnGateUp;
+    }
+    if [
+        "attn",
+        "attention",
+        "linear_attn",
+        "ssm",
+        "mamba",
+        "shortconv",
+    ]
+    .iter()
+    .any(|s| name.contains(s))
+    {
+        let l = layer.or_else(|| parse_layer_idx(name));
+        let is_boundary = match (l, total_layers) {
+            (Some(0), _) => true,
+            (Some(i), Some(n)) if n > 1 && i + 1 == n => true,
+            _ => false,
+        };
+        return if is_boundary {
+            TensorRole::BoundaryAttn
+        } else {
+            TensorRole::AttnOrSsm
+        };
+    }
+    TensorRole::Other
+}
+
+/// Whether `name` (an HF-style tensor name) is a feed-forward projection (excludes MoE routers).
+pub(crate) fn is_ffn_name(name: &str) -> bool {
+    matches!(
+        classify_tensor(name, None, None),
+        TensorRole::FfnDown | TensorRole::FfnGateUp
+    )
 }
 
 /// Whether `name` is the LM head (or a tied embedding's projection copy).
@@ -428,26 +516,30 @@ pub fn reencode_values(
     )
 }
 
-/// The format the policy re-stores `name` (stored as `src`, `cols` wide) in, if any.
-fn target(
-    cfg: &crate::model::weight_format::ReencodeConfig,
+/// Pure format selection for `(policy, name, src, cols)` shared by [`target`] and `variant::WeightHeader::after`.
+pub fn target_for_policy(
+    policy: ReencodePolicy,
     name: &str,
     src: Q,
     cols: usize,
-    float_src: bool,
+    treat_as_lm_head: bool,
+    ffn_override: Option<bool>,
+    fallback_float: Q,
 ) -> Option<Q> {
-    let ffn = match &cfg.ffn_weights {
-        Some(pats) => pats.iter().any(|p| crate::arch::glob(p, name)),
-        None => is_ffn_name(name),
-    };
-    if is_gather_table(name, float_src) || (cfg.ffn_only && !ffn) {
+    let role = classify_tensor(name, None, None);
+    if role == TensorRole::Router {
+        if matches!(policy, ReencodePolicy::MaxSpeed | ReencodePolicy::MinSize) {
+            if has_gpu_codec(src) {
+                return None;
+            }
+            let f = fit(Q::GGUF_Q8_0, cols, fallback_float);
+            return (f != src && encodable(f)).then_some(f);
+        }
         return None;
     }
-    let mut stats = NATIVE_STATS.lock();
-    stats.tensors += 1;
-    drop(stats);
-    if cfg.policy == ReencodePolicy::MinSize {
-        let rule_f = if is_lm_head_name(name) {
+    let ffn = ffn_override.unwrap_or_else(|| is_ffn_name(name));
+    if policy == ReencodePolicy::MinSize {
+        let rule_f = if treat_as_lm_head || role == TensorRole::LmHead {
             Q::GGUF_Q6_K
         } else if ffn {
             if cols % 256 == 0 {
@@ -463,17 +555,48 @@ fn target(
         if has_gpu_codec(src) && src.bits_per_weight() <= rule_f.bits_per_weight() {
             return None;
         }
-        let f = fit(rule_f, cols, Q::FP32);
+        let f = fit(rule_f, cols, fallback_float);
         return (f != src
             && encodable(f)
             && (!has_gpu_codec(src) || f.bits_per_weight() < src.bits_per_weight()))
         .then_some(f);
     }
-    let Target::Encode(f) = rule(cfg.policy, src) else {
+    let Target::Encode(f) = rule(policy, src) else {
         return None;
     };
-    let f = fit(f, cols, Q::FP32);
+    let f = fit(f, cols, fallback_float);
     (f != src && encodable(f)).then_some(f)
+}
+
+/// The format the policy re-stores `name` (stored as `src`, `cols` wide) in, if any.
+fn target(
+    cfg: &crate::model::weight_format::ReencodeConfig,
+    name: &str,
+    src: Q,
+    cols: usize,
+    float_src: bool,
+) -> Option<Q> {
+    let role = classify_tensor(name, None, None);
+    let ffn = role != TensorRole::Router
+        && match &cfg.ffn_weights {
+            Some(pats) => pats.iter().any(|p| crate::arch::glob(p, name)),
+            None => is_ffn_name(name),
+        };
+    if is_gather_table(name, float_src) || (cfg.ffn_only && !ffn) {
+        return None;
+    }
+    let mut stats = NATIVE_STATS.lock();
+    stats.tensors += 1;
+    drop(stats);
+    target_for_policy(
+        cfg.policy,
+        name,
+        src,
+        cols,
+        is_lm_head_name(name),
+        Some(ffn),
+        Q::FP32,
+    )
 }
 
 /// Re-encodes `raw` (`src`'s `rows x cols` weights as `(elems, block_bytes, decode)` blocks) into
@@ -525,7 +648,14 @@ fn encode_blocks(
         (rmse_of(err), blocks)
     };
     let (mut f, mut rmse) = (f, encode(f, false).0);
-    let limit = rmse_limit(policy);
+    let role = classify_tensor(name, None, None);
+    let limit = match (policy, role) {
+        (ReencodePolicy::MaxSpeed, TensorRole::LmHead) => rmse_limit(policy).min(0.05),
+        (ReencodePolicy::MaxSpeed, TensorRole::FfnDown | TensorRole::BoundaryAttn) => {
+            rmse_limit(policy).min(0.06)
+        }
+        _ => rmse_limit(policy),
+    };
     while rmse > limit {
         let Some(next) = bump(f).map(|n| fit(n, cols, Q::FP32)) else {
             break;
@@ -588,6 +718,69 @@ pub type PendingReencode = (String, BTreeMap<String, PendingTensor>);
 
 static PENDING_REENCODE: Mutex<Option<PendingReencode>> = Mutex::new(None);
 
+static RETAINED_PENDING: Mutex<Option<(ReencodePolicy, PendingReencode)>> = Mutex::new(None);
+
+/// Retains encoded tensors from a rejected KL-gate rung so subsequent rungs (`ffn_only`) reuse them.
+pub fn retain_pending_reencode(policy: ReencodePolicy, pending: Option<PendingReencode>) {
+    let Some((key, map)) = pending else {
+        return;
+    };
+    let mut guard = RETAINED_PENDING.lock();
+    match guard.as_mut() {
+        Some((p, (k, existing))) if *p == policy && *k == key => {
+            for (name, pt) in map {
+                existing.entry(name).or_insert(pt);
+            }
+        }
+        _ => *guard = Some((policy, (key, map))),
+    }
+}
+
+pub fn clear_retained_pending() {
+    *RETAINED_PENDING.lock() = None;
+}
+
+/// Reuses a tensor already encoded on an earlier rung of [`crate::arch::load::gated`] when the
+/// current rung's `cfg` selects the same policy for `name`.
+pub fn reuse_retained_pending(
+    key: &str,
+    cfg: &crate::model::weight_format::ReencodeConfig,
+    name: &str,
+    src: Q,
+    rows: usize,
+    cols: usize,
+) -> Option<PendingTensor> {
+    let pt = {
+        let guard = RETAINED_PENDING.lock();
+        let (policy, (rkey, map)) = guard.as_ref()?;
+        if *policy != cfg.policy || rkey != key {
+            return None;
+        }
+        let pt = map.get(name)?.clone();
+        if pt.rows != rows || pt.cols != cols {
+            return None;
+        }
+        pt
+    };
+    // Check whether the current rung's config (`ffn_only`, etc.) actually wants to re-encode `name`.
+    let _ = target(cfg, name, src, cols, is_float(src))?;
+    let mut stats = NATIVE_STATS.lock();
+    stats.reencoded += 1;
+    stats.bytes_before += (rows * src.tensor_bytes(cols)) as u64;
+    stats.bytes_after += pt.bytes as u64;
+    drop(stats);
+    record_pending_tensor(
+        key,
+        name,
+        pt.format,
+        pt.map.clone(),
+        pt.off,
+        pt.bytes,
+        rows,
+        cols,
+    );
+    Some(pt)
+}
 #[cfg(test)]
 thread_local! {
     static TEST_CACHE_DIR: std::cell::RefCell<Option<PathBuf>> =
@@ -1294,6 +1487,51 @@ mod tests {
         assert_eq!(
             reencode_native(&cfg, "layers.0.mlp.up.weight", src, rows, cols, &raw),
             want
+        );
+    }
+
+    #[test]
+    fn moe_router_is_never_classified_as_ffn() {
+        assert_eq!(
+            classify_tensor("model.layers.0.mlp.gate.weight", Some(0), Some(28)),
+            TensorRole::Router
+        );
+        assert_eq!(
+            classify_tensor(
+                "model.layers.0.mlp.shared_expert_gate.weight",
+                Some(0),
+                Some(28)
+            ),
+            TensorRole::Router
+        );
+        assert_eq!(
+            classify_tensor("blk.0.ffn_gate_inp.weight", Some(0), Some(28)),
+            TensorRole::Router
+        );
+        assert!(!is_ffn_name("model.layers.0.mlp.gate.weight"));
+        assert!(is_ffn_name("model.layers.0.mlp.gate_proj.weight"));
+        assert_eq!(
+            classify_tensor("model.layers.0.mlp.down_proj.weight", Some(0), Some(28)),
+            TensorRole::FfnDown
+        );
+        assert_eq!(
+            classify_tensor("model.layers.0.self_attn.q_proj.weight", Some(0), Some(28)),
+            TensorRole::BoundaryAttn
+        );
+        let min_cfg = crate::model::weight_format::ReencodeConfig {
+            policy: MinSize,
+            ..Default::default()
+        };
+        assert_eq!(
+            target(
+                &min_cfg,
+                "model.layers.0.mlp.gate.weight",
+                Q::BF16,
+                256,
+                true
+            ),
+            None,
+            "MoE router stays native under MinSize when GPU codec exists"
         );
     }
 }

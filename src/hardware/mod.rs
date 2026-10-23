@@ -41,6 +41,16 @@ pub enum Device {
     Cpu,
     /// Apple GPU through Metal.
     Metal,
+    /// NVIDIA GPU through CUDA Driver + NVRTC (`libcuda` / `libnvrtc`).
+    Cuda,
+    /// AMD GPU through ROCm HIP + hipRTC (`libamdhip64` / `libhiprtc`).
+    Rocm,
+    /// XLA PJRT device (Cloud TPU / GPU / CPU PJRT plugin via StableHLO MLIR).
+    Xla,
+    /// Intel Arc / Data Center Max XPU through OpenCL / Level Zero (`libOpenCL` / `libze_loader`).
+    IntelXpu,
+    /// Extropic Thermodynamic Sampling Unit (`TSU` / `XTR-0` or Gibbs-Boltzmann Langevin engine).
+    Extropic,
 }
 
 impl Device {
@@ -49,6 +59,11 @@ impl Device {
         match self {
             Device::Cpu => "cpu",
             Device::Metal => "metal",
+            Device::Cuda => "cuda",
+            Device::Rocm => "rocm",
+            Device::Xla => "xla",
+            Device::IntelXpu => "intel-xpu",
+            Device::Extropic => "extropic",
         }
     }
 }
@@ -62,11 +77,16 @@ impl fmt::Display for Device {
 impl std::str::FromStr for Device {
     type Err = String;
     fn from_str(s: &str) -> Result<Self, String> {
-        match s.to_ascii_lowercase().as_str() {
+        match s.trim().to_ascii_lowercase().as_str() {
             "cpu" => Ok(Device::Cpu),
             "metal" => Ok(Device::Metal),
+            "cuda" | "nvidia" => Ok(Device::Cuda),
+            "rocm" | "hip" | "amd" => Ok(Device::Rocm),
+            "xla" | "tpu" | "stablehlo" | "pjrt" => Ok(Device::Xla),
+            "intel-xpu" | "xpu" | "intel_xpu" | "sycl" | "opencl" => Ok(Device::IntelXpu),
+            "extropic" | "tsu" | "xtr0" => Ok(Device::Extropic),
             other => Err(format!(
-                "unknown --backend '{other}' (expected auto, cpu, or metal)"
+                "unknown --backend '{other}' (expected auto, cpu, metal, cuda, rocm, xla, intel-xpu, or extropic)"
             )),
         }
     }
@@ -127,6 +147,21 @@ pub fn available_devices() -> Vec<Device> {
         if metal::Device::system_default().is_some() {
             devices.push(Device::Metal);
         }
+    }
+    if crate::graph::cuda::is_available() {
+        devices.push(Device::Cuda);
+    }
+    if crate::graph::rocm::is_available() {
+        devices.push(Device::Rocm);
+    }
+    if crate::graph::xla::is_available() {
+        devices.push(Device::Xla);
+    }
+    if crate::graph::intel_xpu::is_available() {
+        devices.push(Device::IntelXpu);
+    }
+    if crate::graph::extropic::is_available() {
+        devices.push(Device::Extropic);
     }
     devices
 }
@@ -513,4 +548,3 @@ pub(crate) mod sysctl {
         (!s.is_empty()).then(|| s.into_owned())
     }
 }
-

@@ -60,10 +60,10 @@
   transforms: [
     // HF per-expert matrices -> [experts, rows, cols] banks.
     {tensor: "model.layers.{l}.mlp.experts.{e}.{n:*}_proj.weight", op: "stack_experts",
-     args: {out: "model.layers.{l}.mlp.experts.{n}_proj.weight"}},
+     args: {out: "model.layers.{l}.mlp.experts.{n}_proj.weight", flatten_2d: true}},
     {tensor: "model.layers.{i}.mlp.experts.{n:*}_proj.weight", op: "reshape",
      when: "len(shape(fmt('model.layers.{i}.mlp.experts.{n}_proj.weight'))) == 3",
-     args: {shape: ["experts * at(shape(fmt('model.layers.{i}.mlp.experts.{n}_proj.weight')), 1)", "at(shape(fmt('model.layers.{i}.mlp.experts.{n}_proj.weight')), 2)"]}},
+     args: {shape: [-1, "at(shape(fmt('model.layers.{i}.mlp.experts.{n}_proj.weight')), 2)"]}},
     // `qwen3_vl` ViT (lib `qwen_vit`): Conv3d patch embed as a Linear, f32 position table.
     {tensor: "model.visual.patch_embed.proj.weight", op: "conv_to_linear", when: "has_vision"},
     {tensor: "model.visual.pos_embed.weight", op: "to_f32", when: "has_vision"},
@@ -115,9 +115,7 @@
           ], when: "first(media, 0) > 0 && i < deepstack_layers"},
           {tap: "layer.{i}", in: "x"},
         ]},
-        {use: "last_row", in: ["x"], out: "x", name: "last", when: "head == 'last'"},
-        {use: "rms_norm", args: {w: "'model.norm'"}, in: ["x"], out: "hidden", name: "final_norm"},
-        {use: "lm_head", args: {w: "head_w"}, in: ["hidden"], out: "logits", name: "lm_head", when: "head != 'hidden'"},
+        {use: "decoder_tail", name: "", args: {norm: "'model.norm'", w: "head_w"}, in: ["x"], out: ["logits", "hidden"]},
       ],
       outputs: [{name: "logits", when: "head != 'hidden'"}, {name: "hidden", when: "head == 'hidden'"}],
     },

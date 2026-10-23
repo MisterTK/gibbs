@@ -18,6 +18,26 @@ pub enum CompiledSegment {
         session: crate::graph::metal::Session,
         plan: crate::graph::metal::PreparedPlan,
     },
+    Cuda {
+        graph: Graph,
+        session: crate::graph::cuda::CudaSession,
+    },
+    Rocm {
+        graph: Graph,
+        session: crate::graph::rocm::RocmSession,
+    },
+    Xla {
+        graph: Graph,
+        session: crate::graph::xla::XlaSession,
+    },
+    IntelXpu {
+        graph: Graph,
+        session: crate::graph::intel_xpu::IntelXpuSession,
+    },
+    Extropic {
+        graph: Graph,
+        session: crate::graph::extropic::ExtropicSession,
+    },
 }
 
 impl CompiledSegment {
@@ -26,12 +46,22 @@ impl CompiledSegment {
             Self::Cpu { .. } => Device::Cpu,
             #[cfg(target_os = "macos")]
             Self::Metal { .. } => Device::Metal,
+            Self::Cuda { .. } => Device::Cuda,
+            Self::Rocm { .. } => Device::Rocm,
+            Self::Xla { .. } => Device::Xla,
+            Self::IntelXpu { .. } => Device::IntelXpu,
+            Self::Extropic { .. } => Device::Extropic,
         }
     }
 
     pub fn graph(&self) -> &Graph {
         match self {
-            Self::Cpu { graph, .. } => graph,
+            Self::Cpu { graph, .. }
+            | Self::Cuda { graph, .. }
+            | Self::Rocm { graph, .. }
+            | Self::Xla { graph, .. }
+            | Self::IntelXpu { graph, .. }
+            | Self::Extropic { graph, .. } => graph,
             #[cfg(target_os = "macos")]
             Self::Metal { graph, .. } => graph,
         }
@@ -51,9 +81,12 @@ pub struct GraphProgram {
     argmax: Option<(usize, Graph, crate::graph::metal::PreparedPlan)>,
     /// [`Self::run_reshaped`]'s plans, keyed by the graph's node count and input shapes.
     #[cfg(target_os = "macos")]
-    reshaped: Vec<((usize, usize), Vec<Vec<usize>>, crate::graph::metal::PreparedPlan)>,
+    reshaped: Vec<(
+        (usize, usize),
+        Vec<Vec<usize>>,
+        crate::graph::metal::PreparedPlan,
+    )>,
 }
-
 
 /// `graph` with output 0 (one f32 row) replaced by the `[.., 1]` u32 index of the first largest of
 /// its first `valid` entries (0 = all), NaN ranking lowest: a prefix `Slice` then `TopK { k: 1 }`.
@@ -198,10 +231,27 @@ impl GraphProgram {
                     plan: prepared_plan,
                 }
             }
-            _ => CompiledSegment::Cpu {
-                graph,
-                weights,
-            },
+            Device::Cuda => {
+                let session = crate::graph::cuda::CudaSession::compile(&graph, weights)?;
+                CompiledSegment::Cuda { graph, session }
+            }
+            Device::Rocm => {
+                let session = crate::graph::rocm::RocmSession::compile(&graph, weights)?;
+                CompiledSegment::Rocm { graph, session }
+            }
+            Device::Xla => {
+                let session = crate::graph::xla::XlaSession::compile(&graph, weights)?;
+                CompiledSegment::Xla { graph, session }
+            }
+            Device::IntelXpu => {
+                let session = crate::graph::intel_xpu::IntelXpuSession::compile(&graph, weights)?;
+                CompiledSegment::IntelXpu { graph, session }
+            }
+            Device::Extropic => {
+                let session = crate::graph::extropic::ExtropicSession::compile(&graph, weights)?;
+                CompiledSegment::Extropic { graph, session }
+            }
+            _ => CompiledSegment::Cpu { graph, weights },
         };
 
         let prog = Self {
@@ -217,10 +267,8 @@ impl GraphProgram {
             reshaped: Vec::new(),
         };
         if mode != PlacementMode::Pin(Device::Cpu) {
-            COMPILED_CPU_NODES.fetch_add(
-                prog.cpu_node_count(),
-                std::sync::atomic::Ordering::Relaxed,
-            );
+            COMPILED_CPU_NODES
+                .fetch_add(prog.cpu_node_count(), std::sync::atomic::Ordering::Relaxed);
         }
         Ok(prog)
     }
@@ -229,8 +277,7 @@ impl GraphProgram {
     pub fn cpu_node_count(&self) -> usize {
         match &self.segment {
             CompiledSegment::Cpu { graph, .. } => graph.nodes.len(),
-            #[cfg(target_os = "macos")]
-            CompiledSegment::Metal { .. } => 0,
+            _ => 0,
         }
     }
 
@@ -270,6 +317,11 @@ impl GraphProgram {
                 crate::backend::metal::system_device_name()
                     .unwrap_or_else(|_| "Apple GPU".to_string())
             ),
+            Device::Cuda => crate::graph::cuda::device_name(),
+            Device::Rocm => crate::graph::rocm::device_name(),
+            Device::Xla => crate::graph::xla::device_name(),
+            Device::IntelXpu => crate::graph::intel_xpu::device_name(),
+            Device::Extropic => crate::graph::extropic::device_name(),
             other => format!("{other}"),
         }
     }
@@ -319,7 +371,18 @@ impl GraphProgram {
         #[cfg(test)]
         crate::graph::shape::note(graph);
         match &self.segment {
-            CompiledSegment::Cpu { weights, .. } => cpu::run(graph, weights, &mut self.state, inputs),
+            CompiledSegment::Cpu { weights, .. } => {
+                cpu::run(graph, weights, &mut self.state, inputs)
+            }
+            CompiledSegment::Cuda { session, .. } => session.run(graph, &mut self.state, inputs),
+            CompiledSegment::Rocm { session, .. } => session.run(graph, &mut self.state, inputs),
+            CompiledSegment::Xla { session, .. } => session.run(graph, &mut self.state, inputs),
+            CompiledSegment::IntelXpu { session, .. } => {
+                session.run(graph, &mut self.state, inputs)
+            }
+            CompiledSegment::Extropic { session, .. } => {
+                session.run(graph, &mut self.state, inputs)
+            }
             #[cfg(target_os = "macos")]
             CompiledSegment::Metal { session, .. } => {
                 let shapes: Vec<Vec<usize>> = graph
@@ -366,6 +429,15 @@ impl GraphProgram {
             CompiledSegment::Cpu { graph, weights } => {
                 cpu::run(graph, weights, &mut self.state, inputs)
             }
+            CompiledSegment::Cuda { graph, session } => session.run(graph, &mut self.state, inputs),
+            CompiledSegment::Rocm { graph, session } => session.run(graph, &mut self.state, inputs),
+            CompiledSegment::Xla { graph, session } => session.run(graph, &mut self.state, inputs),
+            CompiledSegment::IntelXpu { graph, session } => {
+                session.run(graph, &mut self.state, inputs)
+            }
+            CompiledSegment::Extropic { graph, session } => {
+                session.run(graph, &mut self.state, inputs)
+            }
             #[cfg(target_os = "macos")]
             CompiledSegment::Metal {
                 graph,
@@ -374,7 +446,6 @@ impl GraphProgram {
             } => session.run_prepared(graph, plan, Some(&mut self.state), inputs),
         }
     }
-
 
     /// The next token of a greedy decode stream: `last` is the input token at position `pos` (the
     /// previous call's result after the first), at most `max_new` tokens are queued, and the pick
@@ -468,6 +539,125 @@ impl GraphProgram {
         Ok(Some(tok))
     }
 
+    /// Like [`Self::stream_next`], supporting both greedy (`temp <= 1e-4`) and device-side
+    /// stochastic (`temp > 1e-4`, `top_p`, `rep_penalty`) decoding via `sample_logits_gpu`.
+    #[cfg(target_os = "macos")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn stream_next_sampled(
+        &mut self,
+        last: u32,
+        pos: u32,
+        max_new: usize,
+        valid: usize,
+        temp: f32,
+        top_p: f32,
+        rep_penalty: f32,
+        recent: &[u32],
+    ) -> Result<Option<u32>, String> {
+        if temp <= 1e-4 {
+            return self.stream_next(last, pos, max_new, valid);
+        }
+        use crate::graph::metal::{SampleGpuSpec, Session};
+        if crate::graph::metal::profile_requested() && self.recurrent_states().is_empty() {
+            self.stream_end()?;
+            return Ok(None);
+        }
+        if let Some(s) = self.state.stream.0.as_deref() {
+            if pos != s.next_pos || last != s.last || s.sample_spec.is_none() {
+                self.stream_end()?;
+            } else if s.submitted == s.budget && s.in_flight() == 0 {
+                self.state.stream.0 = None;
+            }
+        }
+        let CompiledSegment::Metal {
+            graph,
+            session,
+            plan,
+        } = &self.segment
+        else {
+            return Ok(None);
+        };
+        if self.state.stream.0.is_none() {
+            if graph.outputs.len() != 1
+                || std::env::var_os("GIBBS_PROFILE_KERNELS").is_some()
+                || crate::graph::disabled("pipeline")
+                || !Session::fed_stream_ok(graph, plan)
+            {
+                return Ok(None);
+            }
+            let Some(&logits) = graph.outputs.first() else {
+                return Ok(None);
+            };
+            let v = graph.value(logits);
+            let cols = v.shape.last().copied().unwrap_or(0);
+            if v.dtype != DType::F32 || cols == 0 || v.shape.iter().product::<usize>() != cols {
+                return Ok(None);
+            }
+            let vocab = if valid == 0 { cols } else { valid.min(cols) } as u32;
+            let declared = plan
+                .state_vars
+                .iter()
+                .filter_map(|&(v, _)| {
+                    let val = graph.value(v);
+                    let rec = matches!(
+                        val.kind,
+                        crate::graph::ValueKind::State {
+                            recurrent: true,
+                            ..
+                        }
+                    );
+                    (!rec && val.shape.len() == 2).then_some(val.shape[0])
+                })
+                .max();
+            let next = (pos as usize + 1).next_multiple_of(4096);
+            let cap = declared.map_or(next, |d| d.min(next));
+            let budget = max_new.min(cap.saturating_sub(pos as usize));
+            if budget == 0 {
+                return Ok(None);
+            }
+            let seed = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0x517cc1b727220a95, |d| d.as_nanos() as u64)
+                ^ ((pos as u64) << 32)
+                ^ (last as u64);
+            let sp = SampleGpuSpec {
+                vocab,
+                top_k: 64,
+                inv_temp: 1.0 / temp.max(1e-4),
+                top_p: top_p.clamp(1e-4, 1.0),
+                rep_penalty,
+                rng_seed: seed,
+            };
+            let s = session.new_fed_stream_with_sample(
+                graph,
+                plan,
+                &mut self.state,
+                last,
+                pos,
+                budget,
+                Some(sp),
+                recent,
+            )?;
+            self.state.stream.0 = Some(Box::new(s));
+        }
+        let CompiledSegment::Metal {
+            graph,
+            session,
+            plan,
+        } = &self.segment
+        else {
+            return Ok(None);
+        };
+        let s = self.state.stream.0.as_deref_mut().expect("allocated above");
+        while s.in_flight() < 2 && s.submitted < s.budget {
+            session.submit_fed(graph, plan, s)?;
+        }
+        let tok = session.wait_fed(s)?;
+        s.next_pos += 1;
+        s.last = tok;
+        Ok(Some(tok))
+    }
+
     /// Ends this state's greedy decode stream: waits for its in-flight tokens and drops it.
     /// `true` when draining discarded a submitted token that [`Self::stream_next`] never returned.
     #[cfg(target_os = "macos")]
@@ -489,6 +679,22 @@ impl GraphProgram {
         _pos: u32,
         _max_new: usize,
         _valid: usize,
+    ) -> Result<Option<u32>, String> {
+        Ok(None)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[allow(clippy::too_many_arguments)]
+    pub fn stream_next_sampled(
+        &mut self,
+        _last: u32,
+        _pos: u32,
+        _max_new: usize,
+        _valid: usize,
+        _temp: f32,
+        _top_p: f32,
+        _rep_penalty: f32,
+        _recent: &[u32],
     ) -> Result<Option<u32>, String> {
         Ok(None)
     }
@@ -590,7 +796,10 @@ mod tests {
             g
         };
         let mut weights = Weights::new();
-        weights.insert("w", Tensor::F32((0..12).map(|i| i as f32 * 0.1 - 0.5).collect()));
+        weights.insert(
+            "w",
+            Tensor::F32((0..12).map(|i| i as f32 * 0.1 - 0.5).collect()),
+        );
         weights.insert("taps", Tensor::F32(vec![0.5, 1.0, -1.0, 2.0, 0.25, 0.75]));
         let x = |n: usize, s: f32| Tensor::F32((0..n * 4).map(|i| (i as f32 + s).sin()).collect());
         let mut prog =
@@ -663,8 +872,7 @@ mod tests {
                     let inputs = vec![Tensor::F32(row.clone()), Tensor::F32(vec![1.0, 2.0, 3.0])];
                     let out = cpu::run_stateless(&head, &Weights::new(), inputs).unwrap();
                     let v = if valid == 0 { n } else { valid.min(n) };
-                    let want =
-                        crate::runtime::lm::sample_logits(&row[..v], &[], 0.0, 50, 1.0, 1.0);
+                    let want = crate::runtime::lm::sample_logits(&row[..v], &[], 0.0, 50, 1.0, 1.0);
                     assert_eq!(
                         out[0],
                         Tensor::U32(vec![want]),
@@ -701,7 +909,8 @@ mod tests {
             config_path: Some(tmp.path().join("config.json")),
             ..Default::default()
         };
-        let m = crate::arch::load::load(&a, crate::arch::registry().unwrap(), Some("llama")).unwrap();
+        let m =
+            crate::arch::load::load(&a, crate::arch::registry().unwrap(), Some("llama")).unwrap();
         use crate::arch::expr::Val;
         let vars = [("rows", Val::Num(1.0)), ("head", Val::Str("last".into()))];
         let inst = crate::arch::build::build(&m.spec, "text", &m.env, &m.store, &vars).unwrap();
@@ -774,5 +983,45 @@ mod tests {
         }
         prog.stream_end().unwrap();
         assert_eq!(got, want1[..8]);
+        // (d) Stochastic device stream (`sample_logits_gpu` at temp = 0.7, top_p = 0.9).
+        prog.state = StateStore::new();
+        let mut sampled = Vec::new();
+        for pos in 0..10 {
+            let last = if pos == 0 { 1 } else { sampled[pos - 1] };
+            let tok = prog
+                .stream_next_sampled(last, pos as u32, 10 - pos, vocab, 0.7, 0.9, 1.1, &sampled)
+                .unwrap()
+                .expect("the decode program streams stochastically");
+            assert!((tok as usize) < vocab);
+            sampled.push(tok);
+        }
+        prog.stream_end().unwrap();
+        assert_eq!(sampled.len(), 10);
+    }
+
+    #[test]
+    fn multi_hardware_backends_compile_and_execute_matching_cpu() {
+        let (g, w) = two_linears();
+        let input = vec![Tensor::F32(
+            (0..4).map(|i| (i as f32) * 0.25 - 0.5).collect(),
+        )];
+        let mut cpu_prog =
+            GraphProgram::compile(g.clone(), w.clone(), PlacementMode::Pin(Device::Cpu)).unwrap();
+        let want = cpu_prog.run(input.clone()).unwrap();
+
+        for dev in [
+            Device::Cuda,
+            Device::Rocm,
+            Device::Xla,
+            Device::IntelXpu,
+            Device::Extropic,
+        ] {
+            let mut prog =
+                GraphProgram::compile(g.clone(), w.clone(), PlacementMode::Pin(dev)).unwrap();
+            assert_eq!(prog.primary_device(), dev);
+            assert_eq!(prog.cpu_node_count(), 0);
+            let got = prog.run(input.clone()).unwrap();
+            assert_eq!(got, want, "backend {dev:?} output mismatch");
+        }
     }
 }

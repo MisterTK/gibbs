@@ -5,7 +5,7 @@
 
 use crate::hardware::{default_cache_dir, QuantFormat as Q};
 use crate::model::loaders::gguf::{parse_gguf_header, GgufHeader, HeaderError};
-use crate::model::reencode::{self, Target};
+use crate::model::reencode;
 use crate::model::weight_format::{ReencodePolicy, VariantPolicy};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
@@ -129,7 +129,26 @@ fn gathered(name: &str, untied_head: bool) -> bool {
         || name.contains("visual")
         || name.contains("audio")
         || name.starts_with("mm.")
+        || name.starts_with("mtp.")
+        || name.contains(".mtp.")
+        || name.starts_with("nextn.")
+        || name.contains(".nextn.")
         || (untied_head && TABLES.iter().any(|t| name.ends_with(t)))
+}
+
+/// Computes `expert_frac` (`num_experts_per_tok / num_experts`) from a `config.json` value.
+pub fn expert_frac_from_config(cfg: &serde_json::Value) -> Option<f64> {
+    let tc = cfg.get("text_config").unwrap_or(cfg);
+    let used = tc
+        .get("num_experts_per_tok")
+        .or_else(|| tc.get("num_selected_experts"))
+        .or_else(|| tc.get("top_k"))
+        .and_then(|v| v.as_f64())?;
+    let total = tc
+        .get("num_local_experts")
+        .or_else(|| tc.get("num_experts"))
+        .and_then(|v| v.as_f64())?;
+    (total > 0.0 && used > 0.0).then(|| (used / total).min(1.0))
 }
 
 impl WeightHeader {
@@ -171,6 +190,15 @@ impl WeightHeader {
 
     /// `json`: the safetensors header object (the bytes after the 8-byte length).
     pub fn from_safetensors(json: &[u8], file_bytes: u64) -> Result<Self, String> {
+        Self::from_safetensors_with_expert_frac(json, file_bytes, None)
+    }
+
+    /// [`Self::from_safetensors`] with an optional MoE active-expert fraction (`expert_frac`).
+    pub fn from_safetensors_with_expert_frac(
+        json: &[u8],
+        file_bytes: u64,
+        expert_frac: Option<f64>,
+    ) -> Result<Self, String> {
         let obj: serde_json::Map<String, serde_json::Value> =
             serde_json::from_slice(json).map_err(|e| format!("safetensors header: {e}"))?;
         let mut tensors = Vec::new();
@@ -207,7 +235,7 @@ impl WeightHeader {
         Ok(Self {
             tensors,
             file_bytes,
-            expert_frac: 1.0,
+            expert_frac: expert_frac.unwrap_or(1.0),
         })
     }
 
@@ -219,12 +247,16 @@ impl WeightHeader {
             .iter()
             .any(|t| t.name == "output.weight" || t.name.ends_with("lm_head.weight"));
         self.tensors.iter().filter(move |t| {
-            (t.ndim == 2 || (t.ndim == 3 && t.name.contains("exps"))) && !gathered(&t.name, untied)
+            (t.ndim == 2
+                || (t.ndim == 3 && (t.name.contains("exps") || t.name.contains(".experts."))))
+                && !gathered(&t.name, untied)
         })
     }
 
     fn scale(&self, t: &HeaderTensor) -> f64 {
-        if t.ndim == 3 {
+        if (t.ndim == 3 && (t.name.contains("exps") || t.name.contains(".experts.")))
+            || (t.ndim == 2 && t.name.contains(".experts."))
+        {
             self.expert_frac
         } else {
             1.0
@@ -236,43 +268,24 @@ impl WeightHeader {
         let Some(src) = t.fmt else {
             return (None, t.bytes);
         };
-        if policy == ReencodePolicy::MinSize {
-            if t.ndim != 2 {
-                return (Some(src), t.bytes);
-            }
-            let cols = t.cols as usize;
-            let rule_f = if reencode::is_lm_head_name(&t.name)
-                || ["embed", "token_embd", "wte"]
-                    .iter()
-                    .any(|s| t.name.contains(s))
-            {
-                Q::GGUF_Q6_K
-            } else if reencode::is_ffn_name(&t.name) {
-                if cols % 256 == 0 {
-                    Q::GGUF_Q3_K
-                } else {
-                    Q::GGUF_Q4_0
-                }
-            } else if cols % 256 == 0 {
-                Q::GGUF_Q4_K_M
-            } else {
-                Q::GGUF_Q4_0
-            };
-            if reencode::has_gpu_codec(src) && src.bits_per_weight() <= rule_f.bits_per_weight() {
-                return (Some(src), t.bytes);
-            }
-            let f = reencode::fit(rule_f, cols, Q::BF16);
-            if reencode::has_gpu_codec(src) && f.bits_per_weight() >= src.bits_per_weight() {
-                return (Some(src), t.bytes);
-            }
-            return (Some(f), f.tensor_bytes(t.numel as usize) as u64);
+        if policy == ReencodePolicy::MinSize && t.ndim != 2 {
+            return (Some(src), t.bytes);
         }
-        match reencode::rule(policy, src) {
-            Target::Native => (Some(src), t.bytes),
-            Target::Encode(f) => {
-                let f = reencode::fit(f, t.cols as usize, Q::BF16);
-                (Some(f), f.tensor_bytes(t.numel as usize) as u64)
-            }
+        let treat_as_lm_head = reencode::is_lm_head_name(&t.name)
+            || ["embed", "token_embd", "wte"]
+                .iter()
+                .any(|s| t.name.contains(s));
+        match reencode::target_for_policy(
+            policy,
+            &t.name,
+            src,
+            t.cols as usize,
+            treat_as_lm_head,
+            None,
+            Q::BF16,
+        ) {
+            Some(f) => (Some(f), f.tensor_bytes(t.numel as usize) as u64),
+            None => (Some(src), t.bytes),
         }
     }
 
@@ -548,7 +561,7 @@ pub fn read_local_header(path: &Path) -> Result<WeightHeader, String> {
     let size = std::fs::metadata(path)
         .map_err(|e| format!("{}: {e}", path.display()))?
         .len();
-    read_header(&path.to_string_lossy(), size, |start, len| {
+    let mut h = read_header(&path.to_string_lossy(), size, |start, len| {
         let mut f = std::fs::File::open(path).map_err(|e| e.to_string())?;
         f.seek(SeekFrom::Start(start)).map_err(|e| e.to_string())?;
         let mut buf = Vec::new();
@@ -556,7 +569,18 @@ pub fn read_local_header(path: &Path) -> Result<WeightHeader, String> {
             .read_to_end(&mut buf)
             .map_err(|e| e.to_string())?;
         Ok(buf)
-    })
+    })?;
+    if path.extension().is_some_and(|e| e == "safetensors") && h.expert_frac == 1.0 {
+        if let Some(ef) = path
+            .parent()
+            .and_then(|d| std::fs::read(d.join("config.json")).ok())
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+            .and_then(|cfg| expert_frac_from_config(&cfg))
+        {
+            h.expert_frac = ef;
+        }
+    }
+    Ok(h)
 }
 
 fn curl(args: &[String], url: &str, token: Option<&str>) -> Result<Vec<u8>, String> {
@@ -892,5 +916,30 @@ mod tests {
             wh.mean_bpw()
         );
         assert!(tok > 100.0 && tok < 5000.0);
+    }
+
+    #[test]
+    fn safetensors_moe_and_mtp_streamed_bytes() {
+        let json = br#"{"__metadata__":{"format":"pt"},
+            "model.embed_tokens.weight":{"dtype":"BF16","shape":[10,256],"data_offsets":[0,5120]},
+            "model.layers.0.mlp.experts.0.up_proj.weight":{"dtype":"BF16","shape":[128,256],"data_offsets":[5120,70656]},
+            "mtp.layers.0.mlp.up_proj.weight":{"dtype":"BF16","shape":[128,256],"data_offsets":[70656,136192]}}"#;
+        let cfg = serde_json::json!({"num_experts_per_tok": 2, "num_experts": 8});
+        let ef = expert_frac_from_config(&cfg);
+        assert_eq!(ef, Some(0.25));
+        let h = WeightHeader::from_safetensors_with_expert_frac(json, 136192, ef).unwrap();
+        // mtp.* is excluded from base-model streamed bytes; 2D .experts. scales by 0.25.
+        let names: Vec<&str> = h.streamed().map(|t| t.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "model.embed_tokens.weight",
+                "model.layers.0.mlp.experts.0.up_proj.weight"
+            ]
+        );
+        assert_eq!(
+            h.streamed_bytes_per_token(ReencodePolicy::BitExact),
+            5120 + (65536 / 4)
+        );
     }
 }

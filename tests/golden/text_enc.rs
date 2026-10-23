@@ -30,8 +30,11 @@ pub(crate) fn weights(seed: u64, p: &str, qk_norm: bool, layers: usize) -> Weigh
             .w(format!("{a}.v_proj.weight"), &[KV * HD, H])
             .w(format!("{a}.o_proj.weight"), &[H, HEADS * HD]);
         if qk_norm {
-            w.norm(format!("{a}.q_norm.weight"), HD, 1.0)
-                .norm(format!("{a}.k_norm.weight"), HD, 1.0);
+            w.norm(format!("{a}.q_norm.weight"), HD, 1.0).norm(
+                format!("{a}.k_norm.weight"),
+                HD,
+                1.0,
+            );
         } else {
             w.s(format!("{a}.q_proj.bias"), &[HEADS * HD], 0.2)
                 .s(format!("{a}.k_proj.bias"), &[KV * HD], 0.2)
@@ -70,8 +73,22 @@ fn run_spec(case: &str, family: &str, cfg: &Value, w: &Weights, masked: bool) {
     let dir = fixture_dir(&format!("{case}_spec"));
     write_json(&dir.join("config.json"), cfg);
     write_st_as(&dir.join("model.safetensors"), &w.tensors, StDtype::BF16);
-    let g: Value = serde_json::from_slice(&std::fs::read(format!("{}/tests/golden/{case}.json", env!("CARGO_MANIFEST_DIR"))).unwrap()).unwrap();
-    let want = |k: &str| -> Vec<f32> { g["f32"][k].as_array().unwrap().iter().map(|x| x.as_f64().unwrap() as f32).collect() };
+    let g: Value = serde_json::from_slice(
+        &std::fs::read(format!(
+            "{}/tests/golden/{case}.json",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    let want = |k: &str| -> Vec<f32> {
+        g["f32"][k]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_f64().unwrap() as f32)
+            .collect()
+    };
     for dev in devices() {
         let a = gibbs_engine::model::hub::ModelArtifacts {
             model_id: "test/text_enc".into(),
@@ -81,12 +98,25 @@ fn run_spec(case: &str, family: &str, cfg: &Value, w: &Weights, masked: bool) {
             is_cached: true,
             ..Default::default()
         };
-        let mut r = Runner::from_artifacts(&a, Some(family), dev, 64).unwrap_or_else(|e| panic!("{case}: {e}"));
-        let taps = |l: &[usize]| Val::List(l.iter().map(|i| Val::Str(format!("layer.{i}"))).collect());
+        let mut r = Runner::from_artifacts(&a, Some(family), dev, 64)
+            .unwrap_or_else(|e| panic!("{case}: {e}"));
+        let taps =
+            |l: &[usize]| Val::List(l.iter().map(|i| Val::Str(format!("layer.{i}"))).collect());
         let n = IDS.len();
-        let ins = || vec![Tensor::U32(IDS.to_vec()), Tensor::U32((0..n as u32).collect())];
-        let vars = [("rows", Val::Num(n as f64)), ("head", Val::Str("hidden".into())), ("taps", taps(&[1]))];
-        let mut o = r.run("text", &vars, ins()).unwrap_or_else(|e| panic!("{case}: {e}"));
+        let ins = || {
+            vec![
+                Tensor::U32(IDS.to_vec()),
+                Tensor::U32((0..n as u32).collect()),
+            ]
+        };
+        let vars = [
+            ("rows", Val::Num(n as f64)),
+            ("head", Val::Str("hidden".into())),
+            ("taps", taps(&[1])),
+        ];
+        let mut o = r
+            .run("text", &vars, ins())
+            .unwrap_or_else(|e| panic!("{case}: {e}"));
         let mut got = |k: &str| match o.remove(k) {
             Some(Tensor::F32(v)) => v,
             x => panic!("{case}: output {k}: {x:?}"),
@@ -99,24 +129,55 @@ fn run_spec(case: &str, family: &str, cfg: &Value, w: &Weights, masked: bool) {
             }
         }
         if !masked {
-            assert!(r.unconsumed().is_empty(), "{case}: unconsumed {:?}", r.unconsumed());
-            assert!(errs.is_empty(), "{case} spec on {dev:?}:\n  {}", errs.join("\n  "));
+            assert!(
+                r.unconsumed().is_empty(),
+                "{case}: unconsumed {:?}",
+                r.unconsumed()
+            );
+            assert!(
+                errs.is_empty(),
+                "{case} spec on {dev:?}:\n  {}",
+                errs.join("\n  ")
+            );
             continue;
         }
-        let vars = [("rows", Val::Num(n as f64)), ("head", Val::Str("hidden".into())), ("taps", taps(&[0, LAYERS - 1])),
-            ("masked", Val::Bool(true))];
+        let vars = [
+            ("rows", Val::Num(n as f64)),
+            ("head", Val::Str("hidden".into())),
+            ("taps", taps(&[0, LAYERS - 1])),
+            ("masked", Val::Bool(true)),
+        ];
         let mut mi = ins();
-        mi.push(Tensor::F32((0..n).map(|i| if i < 5 { 0.0 } else { f32::NEG_INFINITY }).collect()));
-        let mut o = r.run("text", &vars, mi).unwrap_or_else(|e| panic!("{case}: {e}"));
-        for (k, t) in [("masked_1", "layer.0"), ("masked_3", format!("layer.{}", LAYERS - 1).leak() as &str)] {
-            let Some(Tensor::F32(v)) = o.remove(t) else { panic!("{case}: {t}") };
+        mi.push(Tensor::F32(
+            (0..n)
+                .map(|i| if i < 5 { 0.0 } else { f32::NEG_INFINITY })
+                .collect(),
+        ));
+        let mut o = r
+            .run("text", &vars, mi)
+            .unwrap_or_else(|e| panic!("{case}: {e}"));
+        for (k, t) in [
+            ("masked_1", "layer.0"),
+            ("masked_3", format!("layer.{}", LAYERS - 1).leak() as &str),
+        ] {
+            let Some(Tensor::F32(v)) = o.remove(t) else {
+                panic!("{case}: {t}")
+            };
             let (e, c) = compare(&v[..5 * H], &want(k)[..5 * H]);
             if !(e < TOL.rel && c > TOL.cos) {
                 errs.push(format!("{k}: rel {e:.3e} cos {c:.6}"));
             }
         }
-        assert!(r.unconsumed().is_empty(), "{case}: unconsumed {:?}", r.unconsumed());
-        assert!(errs.is_empty(), "{case} spec on {dev:?}:\n  {}", errs.join("\n  "));
+        assert!(
+            r.unconsumed().is_empty(),
+            "{case}: unconsumed {:?}",
+            r.unconsumed()
+        );
+        assert!(
+            errs.is_empty(),
+            "{case} spec on {dev:?}:\n  {}",
+            errs.join("\n  ")
+        );
     }
 }
 
@@ -124,15 +185,28 @@ fn run_spec(case: &str, family: &str, cfg: &Value, w: &Weights, masked: bool) {
 fn qwen3_encoder() {
     let mut cfg = text_config("qwen3", LAYERS);
     cfg["architectures"] = json!(["Qwen3ForCausalLM"]);
-    run_spec("text_enc_qwen3", "qwen3", &cfg, &weights(0x5157_454E_0E01, "model", true, LAYERS), true);
+    run_spec(
+        "text_enc_qwen3",
+        "qwen3",
+        &cfg,
+        &weights(0x5157_454E_0E01, "model", true, LAYERS),
+        true,
+    );
 }
 
 #[test]
 fn qwen3_vl_encoder() {
     let mut text = text_config("qwen3_vl_text", LAYERS);
-    text["rope_scaling"] = json!({"rope_type": "default", "mrope_interleaved": true, "mrope_section": [4, 2, 2]});
+    text["rope_scaling"] =
+        json!({"rope_type": "default", "mrope_interleaved": true, "mrope_section": [4, 2, 2]});
     let cfg = json!({"model_type": "qwen3_vl", "architectures": ["Qwen3VLForConditionalGeneration"], "text_config": text});
-    run_spec("text_enc_qwen3_vl", "qwen3_vl_text", &cfg, &weights(0x5157_454E_0E02, "model.language_model", true, LAYERS), true);
+    run_spec(
+        "text_enc_qwen3_vl",
+        "krea2.text_encoder",
+        &cfg,
+        &weights(0x5157_454E_0E02, "model.language_model", true, LAYERS),
+        true,
+    );
 }
 
 #[test]
@@ -140,5 +214,11 @@ fn qwen2_5_vl_encoder() {
     let mut cfg = text_config("qwen2_5_vl", LAYERS);
     cfg["architectures"] = json!(["Qwen2_5_VLForConditionalGeneration"]);
     cfg["rope_scaling"] = json!({"type": "mrope", "mrope_section": [4, 2, 2]});
-    run_spec("text_enc_qwen2_5_vl", "qwen2_5_vl_text", &cfg, &weights(0x5157_454E_0E03, "model", false, LAYERS), false);
+    run_spec(
+        "text_enc_qwen2_5_vl",
+        "qwen_image.text_encoder",
+        &cfg,
+        &weights(0x5157_454E_0E03, "model", false, LAYERS),
+        false,
+    );
 }

@@ -10,24 +10,17 @@
     hf_architectures: ["Qwen3VLForConditionalGeneration"],
     gguf_arch: ["qwen3vl"],
   },
-  use_lib: ["transformer", "qwen", "moe", "qwen_vit"],
+  "use_lib+": ["qwen_vit"],
   config: {
     mrope_section: "first(rope.mrope_section, [rotary_dim // 2, 0, 0])",
     has_vision: "has('model.visual.patch_embed.proj.weight')",
     mrope_variant: {MRope: {sections: "mrope_section", interleaved: true, pairs: "'Half'"}},
     deepstack_layers: "has_vision ? len(deepstack_idx) : 0",
   },
-  checks: [
+  "checks+": [
     {expr: "gguf_arch == '' && rope.mrope_interleaved != true",
      error: "only interleaved M-RoPE (`mrope_interleaved: true`) is implemented"},
     {expr: "len(mrope_section) != 3 || at(mrope_section, 0) + at(mrope_section, 1) + at(mrope_section, 2) != rotary_dim // 2",
      error: "mrope_section {mrope_section} does not cover rotary dim {rotary_dim}"},
-    {expr: "first(gguf['rope.scaling.type'], 'none') != 'none'", error: "{gguf_arch} RoPE scaling '{gguf['rope.scaling.type']}' is not implemented"},
-    {expr: "has_vision && cfg.vision_config.hidden_act != 'gelu_pytorch_tanh'", error: "vision hidden_act {cfg.vision_config.hidden_act} is not gelu_pytorch_tanh"},
-    {expr: "has_vision && v_side * v_side != cfg.vision_config.num_position_embeddings",
-     error: "num_position_embeddings {cfg.vision_config.num_position_embeddings} is not a square"},
-    {expr: "has_vision && deepstack_layers > 3", error: "{deepstack_layers} deepstack layers; the spec wires at most 3"},
-    {expr: "has_vision && deepstack_layers > 0 && max(deepstack_idx) >= v_depth",
-     error: "deepstack index {max(deepstack_idx)} is past the {v_depth} vision blocks"},
   ],
 }

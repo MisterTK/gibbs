@@ -706,7 +706,14 @@ impl SpecDiffusion {
         family: Option<&str>,
         extra: &Extras,
     ) -> Result<Self, String> {
-        Self::load_in(crate::arch::registry()?, artifacts, hub, mode, family, extra)
+        Self::load_in(
+            crate::arch::registry()?,
+            artifacts,
+            hub,
+            mode,
+            family,
+            extra,
+        )
     }
 
     /// [`Self::load`] from the specs of `reg`.
@@ -763,10 +770,8 @@ impl SpecDiffusion {
             {
                 // Substituted weights under the base's component config.
                 Some(w) => {
-                    let crate::arch::Component::Ref {
-                        family,
-                        dir: Some(d),
-                    } = root.spec.component(name)?
+                    let crate::arch::Component::Ref { dir: Some(d), .. } =
+                        root.spec.component(name)?
                     else {
                         return Err(format!(
                             "component `{name}` is not a {{family, dir}} reference"
@@ -775,7 +780,8 @@ impl SpecDiffusion {
                     let mut a = dir_artifacts(&dir.join(&d));
                     a.weights_path = Some(w.clone());
                     a.model_id = w.display().to_string();
-                    crate::arch::load::load_with(&a, reg, Some(&family), reencode.clone())?
+                    let comp_spec = format!("{}.{name}", root.spec.family);
+                    crate::arch::load::load_with(&a, reg, Some(&comp_spec), reencode.clone())?
                 }
                 _ => root.component(reg, name)?,
             };
@@ -990,15 +996,18 @@ impl SpecDiffusion {
         let sched_cfg = if let Some(c) = &extra.scheduler {
             c.clone()
         } else if s.config.is_null() {
-            ev(&J::String("json.scheduler_config".into()), "scheduler.config")
-                .ok()
-                .filter(|v| !v.is_null())
-                .map(|v| v.to_json())
-                .or_else(|| {
-                    let p = dir.join("scheduler/scheduler_config.json");
-                    serde_json::from_str(&std::fs::read_to_string(p).ok()?).ok()
-                })
-                .unwrap_or(J::Null)
+            ev(
+                &J::String("json.scheduler_config".into()),
+                "scheduler.config",
+            )
+            .ok()
+            .filter(|v| !v.is_null())
+            .map(|v| v.to_json())
+            .or_else(|| {
+                let p = dir.join("scheduler/scheduler_config.json");
+                serde_json::from_str(&std::fs::read_to_string(p).ok()?).ok()
+            })
+            .unwrap_or(J::Null)
         } else {
             ev(&s.config, "scheduler.config")?.to_json()
         };
@@ -1034,7 +1043,12 @@ impl SpecDiffusion {
                 }
                 let base = s.sigmas.clone().unwrap_or_else(|| "linspace".into());
                 let card = (base == "card")
-                    .then(|| extra.card.clone().or_else(|| std::fs::read_to_string(dir.join("README.md")).ok()))
+                    .then(|| {
+                        extra
+                            .card
+                            .clone()
+                            .or_else(|| std::fs::read_to_string(dir.join("README.md")).ok())
+                    })
                     .flatten()
                     .and_then(|c| card_sigmas(&c));
                 Sampler::Flow {
@@ -1238,7 +1252,11 @@ impl SpecDiffusion {
                 0
             };
             // Tokens of the `prefix` string alone (a template may put more before `{prompt}`).
-            let prefix_tokens = if e.prefix.is_empty() { 0 } else { tokenize(&t.tok, &e.prefix, e.add_special)?.len() };
+            let prefix_tokens = if e.prefix.is_empty() {
+                0
+            } else {
+                tokenize(&t.tok, &e.prefix, e.add_special)?.len()
+            };
             let pv = [("prefix_len", Val::Num(prefix_len as f64))];
             let opt_id = |j: &J| -> Result<Option<u32>, String> {
                 if j.is_null() {
@@ -2238,7 +2256,10 @@ pub fn pipeline_class(dir: &Path) -> Option<String> {
 
 /// The diffusion family of a diffusers pipeline class (`None`: no `pipeline: diffusion` spec).
 fn family_of_class(reg: &crate::arch::Registry, class: &str) -> Option<String> {
-    let sig = crate::arch::Signals { diffusers_class: Some(class.to_string()), ..Default::default() };
+    let sig = crate::arch::Signals {
+        diffusers_class: Some(class.to_string()),
+        ..Default::default()
+    };
     let f = reg.detect(&sig)?;
     (reg.spec(&f, &sig).ok()?.pipeline == crate::arch::Pipeline::Diffusion).then_some(f)
 }
@@ -2266,7 +2287,14 @@ pub fn load_image_in(
     let dir = artifacts.local_dir.as_deref()?;
     if let Some(class) = pipeline_class(dir) {
         if family_of_class(reg, &class).is_some() {
-            return Some(arc(SpecDiffusion::load_in(reg, artifacts, hub, mode, None, &Extras::default())));
+            return Some(arc(SpecDiffusion::load_in(
+                reg,
+                artifacts,
+                hub,
+                mode,
+                None,
+                &Extras::default(),
+            )));
         }
         if class.contains("Inpaint") {
             return Some(Err(format!(
@@ -2279,7 +2307,10 @@ pub fn load_image_in(
             )));
         }
         // Another kind of pipeline a spec runs (video) loads elsewhere.
-        let sig = crate::arch::Signals { diffusers_class: Some(class.clone()), ..Default::default() };
+        let sig = crate::arch::Signals {
+            diffusers_class: Some(class.clone()),
+            ..Default::default()
+        };
         if reg.detect(&sig).is_some() {
             return None;
         }
@@ -2288,12 +2319,27 @@ pub fn load_image_in(
     let weights = artifacts.weights_path.as_deref()?;
     let names = weight_names(weights)?;
     if let Some(fam) = reg.detect_single_file(&names, &ext_of(weights)) {
-        return Some(single_file(reg, &artifacts.model_id, weights, &fam, hub, mode, Vec::new()));
+        return Some(single_file(
+            reg,
+            &artifacts.model_id,
+            weights,
+            &fam,
+            hub,
+            mode,
+            Vec::new(),
+        ));
     }
     let lora = weights.extension().is_some_and(|e| e == "safetensors")
         && crate::model::lora::is_diffusion_lora(names.iter().map(String::as_str));
-    let denoiser = if lora { None } else { Some(reg.detect_denoiser(&names)?) };
-    if let Some(r) = denoiser.as_deref().and_then(|d| split_files(reg, &artifacts.model_id, weights, d, hub, mode)) {
+    let denoiser = if lora {
+        None
+    } else {
+        Some(reg.detect_denoiser(&names)?)
+    };
+    if let Some(r) = denoiser
+        .as_deref()
+        .and_then(|d| split_files(reg, &artifacts.model_id, weights, d, hub, mode))
+    {
         return Some(r);
     }
     // `--model org/repo/file.gguf` names one file of the repo.
@@ -2304,7 +2350,11 @@ pub fn load_image_in(
         .then(|| dir.join("README.md"))
         .map_or_else(|| hub.fetch_file(repo, "README.md"), Ok)
         .and_then(|p| std::fs::read_to_string(&p).map_err(|e| format!("{}: {e}", p.display())));
-    let what = if lora { "diffusion LoRA" } else { "denoiser weights" };
+    let what = if lora {
+        "diffusion LoRA"
+    } else {
+        "denoiser weights"
+    };
     let card_text = card.as_ref().ok().cloned();
     let base = match card.map(|c| crate::model::lora::card_base_model(&c)) {
         Ok(Some(b)) => b,
@@ -2339,7 +2389,15 @@ pub fn load_image_in(
             let w = b.weights_path?;
             let fam = reg.detect_single_file(&weight_names(&w)?, &ext_of(&w))?;
             let id = format!("{} on {base}", artifacts.model_id);
-            return Some(single_file(reg, &id, &w, &fam, hub, mode, vec![(weights.to_path_buf(), 1.0)]));
+            return Some(single_file(
+                reg,
+                &id,
+                &w,
+                &fam,
+                hub,
+                mode,
+                vec![(weights.to_path_buf(), 1.0)],
+            ));
         }
         Err(e) => return Some(Err(e)),
     };
@@ -2383,12 +2441,22 @@ pub fn load_image_in(
             // A distilled finetune ships its own schedule: its `scheduler/` and its card's sigmas.
             scheduler: Some(dir.join("scheduler/scheduler_config.json"))
                 .filter(|p| p.is_file())
-                .map_or_else(|| hub.fetch_file(repo, "scheduler/scheduler_config.json"), Ok)
+                .map_or_else(
+                    || hub.fetch_file(repo, "scheduler/scheduler_config.json"),
+                    Ok,
+                )
                 .ok()
                 .and_then(|p| serde_json::from_str(&std::fs::read_to_string(p).ok()?).ok()),
             card: card_text.clone(),
         };
-        arc(SpecDiffusion::load_in(reg, &a, hub, mode, Some(&fam), &extra))
+        arc(SpecDiffusion::load_in(
+            reg,
+            &a,
+            hub,
+            mode,
+            Some(&fam),
+            &extra,
+        ))
     })())
 }
 
@@ -2419,7 +2487,9 @@ struct SplitPart {
 
 /// The `repo:path` file of a split layout, fetched.
 fn fetch_ref(hub: &HuggingFaceHub, r: &str) -> Result<std::path::PathBuf, String> {
-    let (repo, path) = r.split_once(':').ok_or_else(|| format!("split file `{r}` is not repo:path"))?;
+    let (repo, path) = r
+        .split_once(':')
+        .ok_or_else(|| format!("split file `{r}` is not repo:path"))?;
     hub.fetch_file(repo, path)
 }
 
@@ -2436,7 +2506,11 @@ fn split_files(
 ) -> Option<Result<Arc<dyn ImageGenerator>, String>> {
     let spec = reg.spec(fam, &Default::default()).ok()?;
     let rt: Runtime = spec.runtime_as().ok()?;
-    let split: SplitSpec = match rt.other.get("split").map(|j| serde_json::from_value(j.clone())) {
+    let split: SplitSpec = match rt
+        .other
+        .get("split")
+        .map(|j| serde_json::from_value(j.clone()))
+    {
         None => return None,
         Some(Ok(s)) => s,
         Some(Err(e)) => return Some(Err(format!("{fam}: runtime.split: {e}"))),
@@ -2448,9 +2522,18 @@ fn split_files(
     let base = folder.parent()?;
     Some((|| {
         let (root, parts) = split_root(&split, &rt.denoiser.component, base, weights, id, hub)?;
-        let a = ModelArtifacts { model_id: id.to_string(), local_dir: Some(root.clone()), is_cached: true, ..Default::default() };
-        let extra = Extras { weights: parts, ..Default::default() };
-        SpecDiffusion::load_in(reg, &a, hub, mode, Some(fam), &extra).map(|p| Arc::new(p) as Arc<dyn ImageGenerator>)
+        let a = ModelArtifacts {
+            model_id: id.to_string(),
+            local_dir: Some(root.clone()),
+            is_cached: true,
+            ..Default::default()
+        };
+        let extra = Extras {
+            weights: parts,
+            ..Default::default()
+        };
+        SpecDiffusion::load_in(reg, &a, hub, mode, Some(fam), &extra)
+            .map(|p| Arc::new(p) as Arc<dyn ImageGenerator>)
     })())
 }
 
@@ -2474,11 +2557,18 @@ fn split_root(
             .filter(|f| f.extension().is_some_and(|e| e == "safetensors"))
             .collect();
         local.sort();
-        let pick = local.iter().find(|f| f.to_string_lossy().contains(&p.prefer)).or(local.first()).cloned();
-        parts.push((comp.clone(), match pick {
-            Some(f) => f,
-            None => fetch_ref(hub, &p.fetch)?,
-        }));
+        let pick = local
+            .iter()
+            .find(|f| f.to_string_lossy().contains(&p.prefer))
+            .or(local.first())
+            .cloned();
+        parts.push((
+            comp.clone(),
+            match pick {
+                Some(f) => f,
+                None => fetch_ref(hub, &p.fetch)?,
+            },
+        ));
     }
     let root = std::env::temp_dir()
         .join("gibbs-split")
@@ -2494,13 +2584,20 @@ fn split_root(
         match v {
             J::String(r) => {
                 let f = fetch_ref(hub, r)?;
-                write(rel, &std::fs::read(&f).map_err(|e| format!("{}: {e}", f.display()))?)?;
+                write(
+                    rel,
+                    &std::fs::read(&f).map_err(|e| format!("{}: {e}", f.display()))?,
+                )?;
             }
             v if rel == "model_index.json" => index = v.clone(),
             v => write(rel, v.to_string().as_bytes())?,
         }
     }
-    let name = format!("{id} {}", weights.file_name().unwrap_or_default().to_string_lossy()).to_lowercase();
+    let name = format!(
+        "{id} {}",
+        weights.file_name().unwrap_or_default().to_string_lossy()
+    )
+    .to_lowercase();
     for (k, subs) in &split.name_flags {
         index[k] = J::Bool(subs.iter().any(|s| name.contains(&s.to_lowercase())));
     }
@@ -2581,8 +2678,13 @@ fn single_file(
         is_cached: true,
         ..Default::default()
     };
-    let extra = Extras { loras, weights: parts, ..Default::default() };
-    SpecDiffusion::load_in(reg, &a, hub, mode, Some(fam), &extra).map(|p| Arc::new(p) as Arc<dyn ImageGenerator>)
+    let extra = Extras {
+        loras,
+        weights: parts,
+        ..Default::default()
+    };
+    SpecDiffusion::load_in(reg, &a, hub, mode, Some(fam), &extra)
+        .map(|p| Arc::new(p) as Arc<dyn ImageGenerator>)
 }
 
 #[cfg(test)]
@@ -2645,7 +2747,12 @@ mod tests {
     fn split_root_assembles_the_pipeline() {
         let tmp = tempfile::tempdir().unwrap();
         let base = tmp.path().join("snap");
-        for f in ["dm/toy_turbo_bf16.safetensors", "te/a_fp8.safetensors", "te/b_bf16.safetensors", "vae/v.safetensors"] {
+        for f in [
+            "dm/toy_turbo_bf16.safetensors",
+            "te/a_fp8.safetensors",
+            "te/b_bf16.safetensors",
+            "vae/v.safetensors",
+        ] {
             std::fs::create_dir_all(base.join(f).parent().unwrap()).unwrap();
             std::fs::write(base.join(f), b"").unwrap();
         }
@@ -2659,15 +2766,30 @@ mod tests {
         .unwrap();
         let w = base.join("dm/toy_turbo_bf16.safetensors");
         let hub = HuggingFaceHub::with_cache_dir(tmp.path().join("hub"));
-        let (root, mut parts) = split_root(&split, "transformer", &base, &w, "org/toy", &hub).unwrap();
+        let (root, mut parts) =
+            split_root(&split, "transformer", &base, &w, "org/toy", &hub).unwrap();
         parts.sort();
-        assert_eq!(parts, [
-            ("text_encoder".to_string(), base.join("te/b_bf16.safetensors")),
-            ("transformer".to_string(), w.clone()),
-            ("vae".to_string(), base.join("vae/v.safetensors")),
-        ]);
-        let read = |f: &str| -> J { serde_json::from_str(&std::fs::read_to_string(root.join(f)).unwrap()).unwrap() };
-        assert_eq!(read("model_index.json"), serde_json::json!({"_class_name": "ToyPipeline", "is_distilled": true, "is_raw": false}));
-        assert_eq!(read("text_encoder/config.json"), serde_json::json!({"n": 2}));
+        assert_eq!(
+            parts,
+            [
+                (
+                    "text_encoder".to_string(),
+                    base.join("te/b_bf16.safetensors")
+                ),
+                ("transformer".to_string(), w.clone()),
+                ("vae".to_string(), base.join("vae/v.safetensors")),
+            ]
+        );
+        let read = |f: &str| -> J {
+            serde_json::from_str(&std::fs::read_to_string(root.join(f)).unwrap()).unwrap()
+        };
+        assert_eq!(
+            read("model_index.json"),
+            serde_json::json!({"_class_name": "ToyPipeline", "is_distilled": true, "is_raw": false})
+        );
+        assert_eq!(
+            read("text_encoder/config.json"),
+            serde_json::json!({"n": 2})
+        );
     }
 }

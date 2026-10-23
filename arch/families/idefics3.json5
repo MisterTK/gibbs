@@ -17,7 +17,7 @@
     head_dim: "first(cfg.text_config.head_dim, hidden // heads)",
     inter: "cfg.text_config.intermediate_size",
     eps: "first(cfg.text_config.rms_norm_eps, 1e-5)",
-    act: "first(cfg.text_config.hidden_act, 'silu') == 'silu' ? 'Silu' : 'GeluTanh'",
+    act: "unary_act(first(cfg.text_config.hidden_act, 'silu'), 'GeluTanh')",
     theta: "first(cfg.text_config.rope_theta, 10000)",
     rotary_pct: "1",
     rope_type: "first(cfg.text_config.rope_scaling.rope_type, cfg.text_config.rope_scaling.type, 'default')",

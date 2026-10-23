@@ -87,12 +87,7 @@ fn par_tasks<S: Default>(tasks: usize, parallel: bool, f: impl Fn(&mut S, usize)
         work();
         return;
     }
-    std::thread::scope(|s| {
-        for _ in 1..threads {
-            s.spawn(&work);
-        }
-        work();
-    });
+    crate::model::par::par_for(threads, &|_| work());
 }
 
 /// Applies `f(chunk_index, chunk)` over `chunk`-sized pieces of `x` (last may be short).
@@ -786,7 +781,6 @@ pub fn attention(
     out
 }
 
-
 /// [rows, cols] -> [cols, rows], 32x32 cache blocks.
 pub fn transpose(x: &[f32], rows: usize, cols: usize) -> Vec<f32> {
     assert_eq!(x.len(), rows * cols, "transpose: x is not rows*cols");
@@ -833,7 +827,6 @@ pub fn l2_normalize(v: &mut [f32]) {
         .max(1e-12);
     v.iter_mut().for_each(|x| *x /= n);
 }
-
 
 #[cfg(test)]
 mod tests {

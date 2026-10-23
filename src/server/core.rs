@@ -456,9 +456,35 @@ pub async fn count_tokens(
 
 /// Renders and queues the request; generation runs on the scheduler and its decoded,
 /// stop-trimmed, tool-parsed events arrive on `events`. Dropping `events` cancels it.
-pub async fn start(state: &AppState, req: GenRequest) -> Result<Generation, ApiError> {
+pub async fn start(state: &AppState, mut req: GenRequest) -> Result<Generation, ApiError> {
     if !text_model_active(state) {
         return Err(no_text_model(state));
+    }
+    if let Prompt::Chat { messages, .. } = &mut req.prompt {
+        let cfg = crate::tui::settings::load_settings().compact;
+        if cfg.mode != crate::compact::CompactionMode::Off {
+            let tok = state.scheduler.tokenizer();
+            let ctx = state
+                .scheduler
+                .model()
+                .and_then(|m| m.context_len())
+                .unwrap_or(8192);
+            let (compacted, extra_media, report) =
+                crate::compact::compact_chat_session(messages, &tok, ctx, &cfg, &[], false);
+            if report.saved_tokens() > 0 {
+                state.telemetry.log_info(&format!(
+                    "compact: {} -> {} tokens (-{} tok; tier1={}B, tier2={}B, tier3={} turns)",
+                    report.before_tokens,
+                    report.after_tokens,
+                    report.saved_tokens(),
+                    report.tier1_chars_elided,
+                    report.tier2_chars_shaken,
+                    report.tier3_turns_summarized,
+                ));
+                *messages = compacted;
+                req.media.extend(extra_media);
+            }
+        }
     }
     let (text, mut tools) = render_for(state, req.prompt, &req.media)?;
     let (id, mut rx, tokenizer, prompt_tokens, finish) =

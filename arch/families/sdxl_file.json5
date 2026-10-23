@@ -9,10 +9,32 @@
     single_file_ext: ["safetensors"],
   },
   components: {
-    text_encoder: {family: "sdxl_clip_l", dir: "text_encoder"},
-    text_encoder_2: {family: "sdxl_clip_g", dir: "text_encoder_2"},
-    unet: {family: "ldm_unet", dir: "unet"},
-    vae: {family: "ldm_vae", dir: "vae"},
+    text_encoder: {
+      family: "clip_text",
+      dir: "text_encoder",
+      strip: ["conditioner.embedders.0.transformer."],
+      ignore: ["conditioner.embedders.1.*", "model.diffusion_model.*", "first_stage_model.*", "denoiser.*"],
+      patch: {"use_lib+": ["ldm"]},
+    },
+    text_encoder_2: {
+      family: "clip_text",
+      dir: "text_encoder_2",
+      strip: ["conditioner.embedders.1.model."],
+      ignore: ["conditioner.embedders.0.*", "model.diffusion_model.*", "first_stage_model.*", "denoiser.*"],
+      patch: {"use_lib+": ["ldm"]},
+    },
+    unet: {
+      family: "sd",
+      dir: "unet",
+      ignore: ["first_stage_model.*", "cond_stage_model.*", "conditioner.*", "denoiser.*"],
+      patch: {"use_lib+": ["ldm"]},
+    },
+    vae: {
+      family: "sd_vae",
+      dir: "vae",
+      ignore: ["model.diffusion_model.*", "cond_stage_model.*", "conditioner.*", "denoiser.*"],
+      patch: {"use_lib+": ["ldm"]},
+    },
   },
   runtime: {
     reference: "'stabilityai/stable-diffusion-xl-base-1.0'",

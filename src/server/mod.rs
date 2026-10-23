@@ -156,6 +156,11 @@ pub fn create_router(state: AppState) -> Router {
         .route("/v1/rerank", post(classify::handle_rerank))
         .route("/health", get(handle_health))
         .route("/metrics", get(handle_metrics))
+        .route(
+            "/v1/draft/config",
+            get(handle_get_draft_config).post(handle_set_draft_config),
+        )
+        .route("/v1/compact", post(handle_compact))
         // Agent requests carry whole conversations and base64 images; axum's default is 2 MB.
         .layer(axum::extract::DefaultBodyLimit::max(64 << 20))
         .with_state(state)
@@ -672,6 +677,131 @@ async fn handle_image_edits(
     .await
 }
 
+#[derive(Debug, Deserialize, Default)]
+pub struct DraftConfigUpdate {
+    pub mode: Option<crate::runtime::noise_draft::DraftMode>,
+    pub max_k: Option<usize>,
+    pub target_acceptance: Option<f32>,
+    pub cost_weight: Option<f32>,
+    pub suffix_min_match: Option<usize>,
+    pub noise_lr: Option<f32>,
+    pub noise_sigma: Option<f32>,
+}
+
+fn draft_status_json(state: &AppState) -> serde_json::Value {
+    let knobs = state.scheduler.draft_knobs();
+    let view = state.scheduler.view();
+    let sum = state.telemetry.get_summary();
+    let rates: Vec<serde_json::Value> = state
+        .scheduler
+        .k_tuner_rates()
+        .into_iter()
+        .map(|(k, tok_s, acc)| {
+            serde_json::json!({
+                "k": k,
+                "tok_per_sec": tok_s,
+                "acceptance_rate": acc,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "knobs": knobs,
+        "active_drafter": view.spec.as_ref().map(|s| s.label.clone()),
+        "best_k": view.spec.as_ref().and_then(|s| s.k),
+        "spec_accept_rate": sum.spec_accept_rate,
+        "spec_tokens_per_forward": sum.spec_tokens_per_forward,
+        "k_tuner": rates,
+    })
+}
+
+async fn handle_get_draft_config(State(state): State<AppState>) -> Json<serde_json::Value> {
+    Json(draft_status_json(&state))
+}
+
+async fn handle_set_draft_config(
+    State(state): State<AppState>,
+    Json(update): Json<DraftConfigUpdate>,
+) -> Json<serde_json::Value> {
+    let mut knobs = state.scheduler.draft_knobs();
+    if let Some(m) = update.mode {
+        knobs.mode = m;
+    }
+    if let Some(k) = update.max_k {
+        knobs.max_k = k;
+    }
+    if let Some(a) = update.target_acceptance {
+        knobs.target_acceptance = a;
+    }
+    if let Some(c) = update.cost_weight {
+        knobs.cost_weight = c;
+    }
+    if let Some(s) = update.suffix_min_match {
+        knobs.suffix_min_match = s;
+    }
+    if let Some(lr) = update.noise_lr {
+        knobs.noise_lr = lr;
+    }
+    if let Some(sig) = update.noise_sigma {
+        knobs.noise_sigma = sig;
+    }
+    let knobs = knobs.sanitized();
+    state.scheduler.set_draft_knobs(knobs);
+    let mut s = crate::tui::settings::load_settings();
+    s.draft = knobs;
+    let _ = crate::tui::settings::save_settings(&s);
+    Json(draft_status_json(&state))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CompactRequest {
+    pub messages: Vec<ChatMessage>,
+    #[serde(default)]
+    pub mode: Option<crate::compact::CompactionMode>,
+    #[serde(default)]
+    pub context_limit: Option<usize>,
+    #[serde(default)]
+    pub keep_recent_turns: Option<usize>,
+    #[serde(default)]
+    pub enable_snapcompact_vision: Option<bool>,
+}
+
+async fn handle_compact(
+    State(state): State<AppState>,
+    Json(req): Json<CompactRequest>,
+) -> Json<serde_json::Value> {
+    let mut cfg = crate::tui::settings::load_settings().compact;
+    cfg.mode = req
+        .mode
+        .unwrap_or(crate::compact::CompactionMode::Aggressive);
+    if let Some(k) = req.keep_recent_turns {
+        cfg.keep_recent_turns = k;
+    }
+    if let Some(v) = req.enable_snapcompact_vision {
+        cfg.enable_snapcompact_vision = v;
+    }
+    let ctx = req.context_limit.unwrap_or_else(|| {
+        state
+            .scheduler
+            .model()
+            .and_then(|m| m.context_len())
+            .unwrap_or(8192)
+    });
+    let tok = state.scheduler.tokenizer();
+    let (messages, media, report) = crate::compact::compact_chat_session(
+        &req.messages,
+        &tok,
+        ctx,
+        &cfg,
+        &[],
+        cfg.enable_snapcompact_vision,
+    );
+    Json(serde_json::json!({
+        "messages": messages,
+        "media_count": media.len(),
+        "report": report,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -816,5 +946,46 @@ mod tests {
         let edit = serde_json::json!({"prompt": "x", "image": path.to_string_lossy()});
         let body = post_body("/v1/images/edits", edit).await;
         assert!(body.contains("Invalid input image"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn draft_config_endpoint_updates_live_knobs() {
+        let payload = serde_json::json!({
+            "mode": "noise",
+            "max_k": 6,
+            "target_acceptance": 0.72,
+            "cost_weight": 0.4,
+            "suffix_min_match": 3,
+            "noise_lr": 0.008
+        });
+        let body = post_body("/v1/draft/config", payload).await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["knobs"]["mode"], "noise");
+        assert_eq!(v["knobs"]["max_k"], 6);
+        assert_eq!(v["knobs"]["suffix_min_match"], 3);
+    }
+
+    #[tokio::test]
+    async fn compact_endpoint_elides_thinking_and_folds_turns() {
+        let payload = serde_json::json!({
+            "messages": [
+                {"role": "user", "content": "Turn 1 user question"},
+                {"role": "assistant", "content": "<think>Very long reasoning trace...</think>\nTurn 1 answer"},
+                {"role": "user", "content": "Turn 2 user question"},
+                {"role": "assistant", "content": "<think>Second reasoning trace...</think>\nTurn 2 answer"},
+                {"role": "user", "content": "Turn 3 user question"},
+                {"role": "assistant", "content": "Turn 3 answer"}
+            ],
+            "mode": "aggressive",
+            "keep_recent_turns": 1,
+            "context_limit": 32
+        });
+        let body = post_body("/v1/compact", payload).await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(v["report"]["tier1_chars_elided"].as_u64().unwrap() > 0);
+        assert!(
+            v["report"]["after_tokens"].as_u64().unwrap()
+                < v["report"]["before_tokens"].as_u64().unwrap()
+        );
     }
 }

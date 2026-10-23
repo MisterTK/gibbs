@@ -19,15 +19,15 @@ pub mod testing;
 #[cfg(test)]
 mod tests_encoders_bert;
 #[cfg(test)]
+mod tests_encoders_bert_gguf;
+#[cfg(test)]
 mod tests_encoders_bert_variants;
+#[cfg(test)]
+mod tests_encoders_deberta;
 #[cfg(test)]
 mod tests_encoders_factorized;
 #[cfg(test)]
 mod tests_encoders_modernbert;
-#[cfg(test)]
-mod tests_encoders_bert_gguf;
-#[cfg(test)]
-mod tests_encoders_deberta;
 
 pub use dispatch::{load_model, LoadOpts, Loaded};
 
@@ -198,6 +198,12 @@ pub enum Component {
         family: String,
         #[serde(default)]
         dir: Option<String>,
+        #[serde(default)]
+        strip: Vec<String>,
+        #[serde(default)]
+        ignore: Vec<String>,
+        #[serde(default)]
+        patch: Option<J>,
     },
     Net(Network),
 }
@@ -307,15 +313,19 @@ pub struct Override {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AppliesTo {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "one_or_many")]
     pub hub_id: Vec<String>,
     #[serde(default, deserialize_with = "one_or_many")]
     pub family: Vec<String>,
-    #[serde(default)]
-    pub model_type: Option<String>,
-    #[serde(default)]
-    pub gguf_arch: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "one_or_many")]
+    pub model_type: Vec<String>,
+    #[serde(default, deserialize_with = "one_or_many")]
+    pub hf_architectures: Vec<String>,
+    #[serde(default, deserialize_with = "one_or_many")]
+    pub gguf_arch: Vec<String>,
+    #[serde(default, deserialize_with = "one_or_many")]
+    pub diffusers_class: Vec<String>,
+    #[serde(default, deserialize_with = "one_or_many")]
     pub file_name: Vec<String>,
 }
 
@@ -510,7 +520,9 @@ impl Registry {
                     let bad = ov.applies_to.family.iter().find_map(|f| match r.base(f) {
                         Ok(mut b) => {
                             merge_patch(&mut b, &ov.patch);
-                            serde_json::from_value::<Spec>(b).err().map(|e| e.to_string())
+                            serde_json::from_value::<Spec>(b)
+                                .err()
+                                .map(|e| e.to_string())
                         }
                         Err(e) => Some(e),
                     });
@@ -541,6 +553,10 @@ impl Registry {
 
     /// `name` with its `extends` chain merged (parent first), without overrides.
     pub fn base(&self, name: &str) -> Result<J, String> {
+        self.merge_layers(name, &[])
+    }
+
+    fn merge_layers(&self, name: &str, patches: &[J]) -> Result<J, String> {
         let mut chain = vec![self.raw(name)?.clone()];
         while let Some(parent) = chain.last().unwrap()["extends"].as_str() {
             if chain.len() > 16 {
@@ -552,7 +568,11 @@ impl Registry {
         for layer in chain.iter().rev() {
             merge_patch(&mut pre, layer);
         }
+        for p in patches {
+            merge_patch(&mut pre, p);
+        }
         let mut merged = J::Object(Map::new());
+        let mut macros = Map::new();
         for lib in pre["use_lib"].as_array().cloned().unwrap_or_default() {
             let lib = lib.as_str().ok_or("use_lib: expected names")?;
             let mut l = self
@@ -563,12 +583,50 @@ impl Registry {
                 .1
                 .clone();
             if let Some(o) = l.as_object_mut() {
-                o.remove("macros");
+                if let Some(J::Object(m)) = o.remove("macros") {
+                    macros.extend(m);
+                }
             }
             merge_patch(&mut merged, &l);
         }
-        for layer in chain.iter().rev() {
-            merge_patch(&mut merged, layer);
+        let root_idx = chain.len() - 1;
+        for (idx, layer) in chain.iter().enumerate().rev() {
+            if idx == root_idx {
+                let mut root = layer.clone();
+                if let Some(o) = root.as_object_mut() {
+                    for k in ["checks", "ignore", "transforms"] {
+                        if merged.get(k).is_some() {
+                            if let Some(v) = o.remove(k) {
+                                o.insert(format!("{k}+"), v);
+                            }
+                        }
+                    }
+                }
+                merge_patch(&mut merged, &root);
+            } else {
+                merge_patch(&mut merged, layer);
+            }
+        }
+        for p in patches {
+            merge_patch(&mut merged, p);
+        }
+        if let Some(m) = merged["macros"].as_object() {
+            macros.extend(m.clone());
+        }
+        merged["macros"] = J::Object(macros);
+        // Propagate any `strip` prefixes declared by referenced `names/<set>.json5`.
+        let sets: Vec<String> = merged["names"]["use"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect();
+        for set in sets {
+            let s_strip = self.name_set_strip(&set)?;
+            if !s_strip.is_empty() {
+                let patch = serde_json::json!({"names": {"strip+": s_strip}});
+                merge_patch(&mut merged, &patch);
+            }
         }
         // The leaf's own name and match win; a parent's `match` must not claim the child's checkpoints.
         merged["family"] = J::String(name.to_string());
@@ -585,32 +643,55 @@ impl Registry {
             .map_err(|e| format!("family `{family}`: {e}"))
     }
 
-    /// [`Self::spec`] as JSON (what `--arch-dump` prints).
+    /// [`Self::spec`] as JSON (what `--arch-dump` prints). Supports `parent.component` references.
     pub fn merged(&self, family: &str, sig: &Signals) -> Result<J, String> {
-        let mut j = self.base(family)?;
-        for (_, ov) in &self.overrides {
-            if applies(&ov.applies_to, family, sig) {
-                merge_patch(&mut j, &ov.patch);
-            }
-        }
-        // Library macros named in `use_lib` (spec macros of the same name win).
-        let mut macros = Map::new();
-        for lib in j["use_lib"].as_array().cloned().unwrap_or_default() {
-            let lib = lib.as_str().ok_or("use_lib: expected names")?;
-            let l = self
-                .lib
+        if let Some((parent, comp)) = family.split_once('.') {
+            let p_spec = self.spec(parent, sig)?;
+            let Component::Ref {
+                family: ref_fam,
+                strip,
+                ignore,
+                patch,
+                ..
+            } = p_spec.component(comp)?
+            else {
+                return Err(format!(
+                    "{parent}: component `{comp}` is not a family reference"
+                ));
+            };
+            let mut patches: Vec<J> = self
+                .overrides
                 .iter()
-                .find(|(n, _)| n == lib)
-                .ok_or_else(|| format!("{family}: unknown lib `{lib}`"))?;
-            if let Some(m) = l.1["macros"].as_object() {
-                macros.extend(m.clone());
+                .filter(|(_, ov)| applies(&ov.applies_to, &ref_fam, sig))
+                .map(|(_, ov)| ov.patch.clone())
+                .collect();
+            if let Some(p) = patch {
+                patches.push(p);
             }
+            let mut j = self.merge_layers(&ref_fam, &patches)?;
+            if !strip.is_empty() {
+                let mut cur: Vec<J> = strip.into_iter().map(J::String).collect();
+                if let Some(existing) = j["names"]["strip"].as_array() {
+                    cur.extend(existing.iter().cloned());
+                }
+                if !j["names"].is_object() {
+                    j["names"] = J::Object(Map::new());
+                }
+                j["names"]["strip"] = J::Array(cur);
+            }
+            if !ignore.is_empty() {
+                let patch = serde_json::json!({"ignore+": ignore});
+                merge_patch(&mut j, &patch);
+            }
+            return Ok(j);
         }
-        if let Some(m) = j["macros"].as_object() {
-            macros.extend(m.clone());
-        }
-        j["macros"] = J::Object(macros);
-        Ok(j)
+        let patches: Vec<J> = self
+            .overrides
+            .iter()
+            .filter(|(_, ov)| applies(&ov.applies_to, family, sig))
+            .map(|(_, ov)| ov.patch.clone())
+            .collect();
+        self.merge_layers(family, &patches)
     }
 
     /// Rename rules of a shared set.
@@ -621,6 +702,21 @@ impl Registry {
             .find(|(n, _)| n == set)
             .ok_or_else(|| format!("unknown name set `{set}`"))?;
         serde_json::from_value(s.1["rules"].clone()).map_err(|e| format!("names/{set}: {e}"))
+    }
+
+    /// Optional `strip` prefixes of a shared name set.
+    pub fn name_set_strip(&self, set: &str) -> Result<Vec<String>, String> {
+        let s = self
+            .names
+            .iter()
+            .find(|(n, _)| n == set)
+            .ok_or_else(|| format!("unknown name set `{set}`"))?;
+        match s.1.get("strip") {
+            Some(v) => {
+                serde_json::from_value(v.clone()).map_err(|e| format!("names/{set}.strip: {e}"))
+            }
+            None => Ok(Vec::new()),
+        }
     }
 
     /// The family claiming `sig`: first non-fallback match in registry order, then fallbacks.
@@ -670,13 +766,17 @@ impl Registry {
     /// The family whose `match.single_file_tensors` (and `single_file_ext`) claim a weights file
     /// with extension `ext` and tensor `names`.
     pub fn detect_single_file(&self, names: &[String], ext: &str) -> Option<String> {
-        self.detect_tensors(names, |m| {
-            if m.single_file_ext.is_empty() || m.single_file_ext.iter().any(|e| e == ext) {
-                &m.single_file_tensors
-            } else {
-                &m.denoiser_tensors[..0]
-            }
-        }, false)
+        self.detect_tensors(
+            names,
+            |m| {
+                if m.single_file_ext.is_empty() || m.single_file_ext.iter().any(|e| e == ext) {
+                    &m.single_file_tensors
+                } else {
+                    &m.denoiser_tensors[..0]
+                }
+            },
+            false,
+        )
     }
 
     fn detect_tensors(
@@ -733,7 +833,8 @@ impl Registry {
     /// Whether a `causal_lm` family lists `model_type` (glob) in its `hf_model_type`.
     pub fn runs_model_type(&self, model_type: &str) -> bool {
         self.matchers().iter().any(|(_, m, p)| {
-            matches!(p, Pipeline::CausalLm | Pipeline::Encdec) && m.hf_model_type.iter().any(|g| glob(g, model_type))
+            matches!(p, Pipeline::CausalLm | Pipeline::Encdec)
+                && m.hf_model_type.iter().any(|g| glob(g, model_type))
         })
     }
 
@@ -797,7 +898,10 @@ impl Registry {
     pub fn gguf_uses_mmproj(&self, arch: &str) -> bool {
         self.matchers().into_iter().any(|(f, m, _)| {
             m.gguf_arch.iter().any(|g| glob(g, arch))
-                && self.base(&f).ok().is_some_and(|b| b["runtime"]["mmproj"] == true)
+                && self
+                    .base(&f)
+                    .ok()
+                    .is_some_and(|b| b["runtime"]["mmproj"] == true)
         })
     }
 
@@ -806,7 +910,10 @@ impl Registry {
         self.matchers().into_iter().any(|(f, m, p)| {
             p == Pipeline::Encoder
                 && m.hf_model_type.iter().any(|g| glob(g, model_type))
-                && self.base(&f).ok().is_some_and(|b| !b["runtime"]["system1"].is_null())
+                && self
+                    .base(&f)
+                    .ok()
+                    .is_some_and(|b| !b["runtime"]["system1"].is_null())
         })
     }
 
@@ -864,15 +971,19 @@ impl Registry {
 }
 
 fn applies(a: &AppliesTo, family: &str, sig: &Signals) -> bool {
-    let ci = |g: &str, s: &str| glob(&g.to_lowercase(), &s.to_lowercase());
+    let ci = |g: &str, s: &str| glob(&g.to_ascii_lowercase(), &s.to_ascii_lowercase());
+    let opt = |pats: &[String], v: Option<&str>| {
+        pats.is_empty() || v.is_some_and(|s| pats.iter().any(|g| ci(g, s)))
+    };
     (a.hub_id.is_empty() || a.hub_id.iter().any(|g| ci(g, &sig.hub_id)))
-        && (a.family.is_empty() || a.family.iter().any(|f| f == family))
-        && a.model_type
-            .as_deref()
-            .is_none_or(|t| sig.hf_model_type.as_deref() == Some(t))
-        && a.gguf_arch
-            .as_deref()
-            .is_none_or(|t| sig.gguf_arch.as_deref() == Some(t))
+        && (a.family.is_empty() || a.family.iter().any(|g| ci(g, family)))
+        && opt(&a.model_type, sig.hf_model_type.as_deref())
+        && (a.hf_architectures.is_empty()
+            || a.hf_architectures
+                .iter()
+                .any(|g| sig.hf_architectures.iter().any(|s| ci(g, s))))
+        && opt(&a.gguf_arch, sig.gguf_arch.as_deref())
+        && opt(&a.diffusers_class, sig.diffusers_class.as_deref())
         && (a.file_name.is_empty() || a.file_name.iter().any(|g| ci(g, &sig.file_name)))
 }
 
@@ -943,16 +1054,37 @@ mod tests {
     fn denoiser_tensor_groups_claim_weight_files() {
         let toy = r#"{family: "toy", pipeline: "diffusion",
             match: {denoiser_tensors: [["img_in.weight"], ["x.weight", "y.weight"]]}}"#;
-        let r = Registry::from_files(&files(&[("families/toy.json5", toy), ("families/base.json5", BASE)]), &[]).unwrap();
+        let r = Registry::from_files(
+            &files(&[("families/toy.json5", toy), ("families/base.json5", BASE)]),
+            &[],
+        )
+        .unwrap();
         let n = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        assert_eq!(r.detect_denoiser(&n(&["model.diffusion_model.img_in.weight"])).as_deref(), Some("toy"));
-        assert_eq!(r.detect_denoiser(&n(&["x.weight", "y.weight", "z"])).as_deref(), Some("toy"));
+        assert_eq!(
+            r.detect_denoiser(&n(&["model.diffusion_model.img_in.weight"]))
+                .as_deref(),
+            Some("toy")
+        );
+        assert_eq!(
+            r.detect_denoiser(&n(&["x.weight", "y.weight", "z"]))
+                .as_deref(),
+            Some("toy")
+        );
         assert_eq!(r.detect_denoiser(&n(&["x.weight"])), None);
         let single = r#"{family: "one", pipeline: "diffusion", match: {single_file_tensors: [["a.w", "b.w"]], single_file_ext: ["gguf"]}}"#;
         let r = Registry::from_files(&files(&[("families/one.json5", single)]), &[]).unwrap();
-        assert_eq!(r.detect_single_file(&n(&["a.w", "b.w"]), "gguf").as_deref(), Some("one"));
-        assert_eq!(r.detect_single_file(&n(&["a.w", "b.w"]), "safetensors"), None);
-        assert_eq!(r.detect_single_file(&n(&["model.diffusion_model.a.w", "b.w"]), "gguf"), None);
+        assert_eq!(
+            r.detect_single_file(&n(&["a.w", "b.w"]), "gguf").as_deref(),
+            Some("one")
+        );
+        assert_eq!(
+            r.detect_single_file(&n(&["a.w", "b.w"]), "safetensors"),
+            None
+        );
+        assert_eq!(
+            r.detect_single_file(&n(&["model.diffusion_model.a.w", "b.w"]), "gguf"),
+            None
+        );
     }
 
     /// SD single-file checkpoints claim their pipeline family by tensor names and extension; every
@@ -962,38 +1094,109 @@ mod tests {
         let r = Registry::load(None).unwrap();
         let n = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         let unet = "model.diffusion_model.input_blocks.0.0.weight";
-        let sd1 = n(&["cond_stage_model.transformer.text_model.final_layer_norm.weight", unet]);
-        assert_eq!(r.detect_single_file(&sd1, "safetensors").as_deref(), Some("sd1_file"));
-        assert_eq!(r.detect_single_file(&sd1, "gguf").as_deref(), Some("sd2_gguf"));
+        let sd1 = n(&[
+            "cond_stage_model.transformer.text_model.final_layer_norm.weight",
+            unet,
+        ]);
+        assert_eq!(
+            r.detect_single_file(&sd1, "safetensors").as_deref(),
+            Some("sd1_file")
+        );
+        assert_eq!(
+            r.detect_single_file(&sd1, "gguf").as_deref(),
+            Some("sd2_gguf")
+        );
         let sd2 = n(&["cond_stage_model.model.ln_final.weight", unet]);
-        assert_eq!(r.detect_single_file(&sd2, "safetensors").as_deref(), Some("sd2_file"));
-        let xl = n(&["conditioner.embedders.0.transformer.text_model.final_layer_norm.weight",
-                     "conditioner.embedders.1.model.ln_final.weight", unet]);
-        assert_eq!(r.detect_single_file(&xl, "safetensors").as_deref(), Some("sdxl_file"));
-        for f in ["sd", "sdxl", "sd1_file", "sd2_file", "sdxl_file", "sd2_gguf", "ldm_clip", "ldm_openclip",
-                  "sdxl_clip_l", "sdxl_clip_g", "ldm_unet", "ldm_vae"] {
-            r.spec(f, &Signals::default()).unwrap_or_else(|e| panic!("{f}: {e}"));
+        assert_eq!(
+            r.detect_single_file(&sd2, "safetensors").as_deref(),
+            Some("sd2_file")
+        );
+        let xl = n(&[
+            "conditioner.embedders.0.transformer.text_model.final_layer_norm.weight",
+            "conditioner.embedders.1.model.ln_final.weight",
+            unet,
+        ]);
+        assert_eq!(
+            r.detect_single_file(&xl, "safetensors").as_deref(),
+            Some("sdxl_file")
+        );
+        for f in [
+            "sd",
+            "sdxl",
+            "sd1_file",
+            "sd2_file",
+            "sdxl_file",
+            "sd2_gguf",
+            "sd1_file.text_encoder",
+            "sd2_file.text_encoder",
+            "sdxl_file.text_encoder",
+            "sdxl_file.text_encoder_2",
+            "sd1_file.unet",
+            "sd1_file.vae",
+        ] {
+            r.spec(f, &Signals::default())
+                .unwrap_or_else(|e| panic!("{f}: {e}"));
         }
-        let turbo = Signals { hub_id: "stabilityai/sdxl-turbo".into(), ..Default::default() };
+        let turbo = Signals {
+            hub_id: "stabilityai/sdxl-turbo".into(),
+            ..Default::default()
+        };
         let s = r.spec("sdxl_file", &turbo).unwrap();
-        assert_eq!((s.runtime["defaults"]["steps"].as_u64(), s.runtime["defaults"]["guidance"].as_u64()), (Some(1), Some(0)));
-        assert_eq!(s.runtime["reference"], "'stabilityai/stable-diffusion-xl-base-1.0'");
+        assert_eq!(
+            (
+                s.runtime["defaults"]["steps"].as_u64(),
+                s.runtime["defaults"]["guidance"].as_u64()
+            ),
+            (Some(1), Some(0))
+        );
+        assert_eq!(
+            s.runtime["reference"],
+            "'stabilityai/stable-diffusion-xl-base-1.0'"
+        );
     }
 
     #[test]
     fn ldm_vae_names_map_to_diffusers() {
-        let r = names::Renamer::from_pairs(&registry().unwrap().name_set("ldm_vae").unwrap()).unwrap();
+        let r =
+            names::Renamer::from_pairs(&registry().unwrap().name_set("ldm_vae").unwrap()).unwrap();
         let d = |n: &str| r.canonical(&format!("first_stage_model.{n}"));
-        assert_eq!(d("decoder.up.3.block.0.conv1.weight"), "decoder.up_ldm.3.resnets.0.conv1.weight");
-        assert_eq!(d("decoder.up.0.block.0.nin_shortcut.bias"), "decoder.up_ldm.0.resnets.0.conv_shortcut.bias");
-        assert_eq!(d("decoder.up.2.upsample.conv.weight"), "decoder.up_ldm.2.upsamplers.0.conv.weight");
-        assert_eq!(d("decoder.mid.block_2.norm1.weight"), "decoder.mid_block.resnets.1.norm1.weight");
-        assert_eq!(d("decoder.mid.attn_1.norm.bias"), "decoder.mid_block.attentions.0.group_norm.bias");
-        assert_eq!(d("encoder.mid.attn_1.proj_out.weight"), "encoder.mid_block.attentions.0.to_out.0.weight");
-        assert_eq!(d("decoder.mid.attn_1.q.weight"), "decoder.mid_block.attentions.0.to_q.weight");
+        assert_eq!(
+            d("decoder.up.3.block.0.conv1.weight"),
+            "decoder.up_ldm.3.resnets.0.conv1.weight"
+        );
+        assert_eq!(
+            d("decoder.up.0.block.0.nin_shortcut.bias"),
+            "decoder.up_ldm.0.resnets.0.conv_shortcut.bias"
+        );
+        assert_eq!(
+            d("decoder.up.2.upsample.conv.weight"),
+            "decoder.up_ldm.2.upsamplers.0.conv.weight"
+        );
+        assert_eq!(
+            d("decoder.mid.block_2.norm1.weight"),
+            "decoder.mid_block.resnets.1.norm1.weight"
+        );
+        assert_eq!(
+            d("decoder.mid.attn_1.norm.bias"),
+            "decoder.mid_block.attentions.0.group_norm.bias"
+        );
+        assert_eq!(
+            d("encoder.mid.attn_1.proj_out.weight"),
+            "encoder.mid_block.attentions.0.to_out.0.weight"
+        );
+        assert_eq!(
+            d("decoder.mid.attn_1.q.weight"),
+            "decoder.mid_block.attentions.0.to_q.weight"
+        );
         assert_eq!(d("decoder.norm_out.weight"), "decoder.conv_norm_out.weight");
-        assert_eq!(d("encoder.down.1.downsample.conv.bias"), "encoder.down_blocks.1.downsamplers.0.conv.bias");
-        assert_eq!(d("encoder.down.0.block.1.nin_shortcut.weight"), "encoder.down_blocks.0.resnets.1.conv_shortcut.weight");
+        assert_eq!(
+            d("encoder.down.1.downsample.conv.bias"),
+            "encoder.down_blocks.1.downsamplers.0.conv.bias"
+        );
+        assert_eq!(
+            d("encoder.down.0.block.1.nin_shortcut.weight"),
+            "encoder.down_blocks.0.resnets.1.conv_shortcut.weight"
+        );
         assert_eq!(d("post_quant_conv.weight"), "post_quant_conv.weight");
         assert_eq!(d("decoder.conv_in.bias"), "decoder.conv_in.bias");
     }
@@ -1003,7 +1206,11 @@ mod tests {
         let r = registry().unwrap();
         let s = r.spec("sana", &Signals::default()).unwrap();
         let rt: crate::runtime::diffusion::Runtime = s.runtime_as().unwrap();
-        assert!(rt.other.is_empty(), "unknown runtime keys {:?}", rt.other.keys());
+        assert!(
+            rt.other.is_empty(),
+            "unknown runtime keys {:?}",
+            rt.other.keys()
+        );
         // A Gemma 2 causal LM detects as the encoder family: LM dispatch keeps it off the spec LM path.
         let sig = Signals {
             hf_model_type: Some("gemma2".into()),
@@ -1017,11 +1224,22 @@ mod tests {
     #[test]
     fn flux_families_runtime_keys_and_pipeline_claims() {
         let r = registry().unwrap();
-        for (fam, class) in [("flux", "FluxPipeline"), ("chroma", "ChromaPipeline"), ("flux2", "Flux2KleinPipeline")] {
+        for (fam, class) in [
+            ("flux", "FluxPipeline"),
+            ("chroma", "ChromaPipeline"),
+            ("flux2", "Flux2KleinPipeline"),
+        ] {
             let s = r.spec(fam, &Signals::default()).unwrap();
             let rt: crate::runtime::diffusion::Runtime = s.runtime_as().unwrap();
-            assert!(rt.other.is_empty(), "{fam}: unknown runtime keys {:?}", rt.other.keys());
-            assert!(s.components.get("text_encoder_2").is_none() == (fam != "flux"), "{fam}");
+            assert!(
+                rt.other.is_empty(),
+                "{fam}: unknown runtime keys {:?}",
+                rt.other.keys()
+            );
+            assert!(
+                s.components.get("text_encoder_2").is_none() == (fam != "flux"),
+                "{fam}"
+            );
             let sig = Signals {
                 diffusers_class: Some(class.into()),
                 ..Default::default()
@@ -1029,8 +1247,14 @@ mod tests {
             assert_eq!(r.detect(&sig).as_deref(), Some(fam));
         }
         let names = names::Renamer::from_pairs(&r.name_set("bfl").unwrap()).unwrap();
-        assert_eq!(names.canonical("double_blocks.3.txt_attn.qkv.bias"), "transformer_blocks.3.attn.to_added_qkv.bias");
-        assert_eq!(names.canonical("single_blocks.0.norm.key_norm.scale"), "single_transformer_blocks.0.attn.norm_k.weight");
+        assert_eq!(
+            names.canonical("double_blocks.3.txt_attn.qkv.bias"),
+            "transformer_blocks.3.attn.to_added_qkv.bias"
+        );
+        assert_eq!(
+            names.canonical("single_blocks.0.norm.key_norm.scale"),
+            "single_transformer_blocks.0.attn.norm_k.weight"
+        );
     }
 
     #[test]
@@ -1126,7 +1350,8 @@ mod tests {
 
     #[test]
     fn lib_blocks_multi_family_and_robust_user_files() {
-        let lib = r#"{config: {a: "0", from_lib: "1"}, ignore: ["ema.*"], macros: {m: {body: []}}}"#;
+        let lib =
+            r#"{config: {a: "0", from_lib: "1"}, ignore: ["ema.*"], macros: {m: {body: []}}}"#;
         let base = r#"{family: "base", match: {hf_model_type: ["base"]}, pipeline: "causal_lm",
             use_lib: ["shared"], config: {a: "1"}, "ignore+": ["extra.*"]}"#;
         let embedded = files(&[
@@ -1145,7 +1370,10 @@ mod tests {
         ]);
         let user = files(&[
             ("families/broken.json5", "{not json5"),
-            ("families/bad_spec.json5", r#"{family: "bad", not_a_field: 1}"#),
+            (
+                "families/bad_spec.json5",
+                r#"{family: "bad", not_a_field: 1}"#,
+            ),
             ("families/base.json5", r#"{family: "base", not_a_field: 1}"#),
             ("overrides/broken.json5", "{not json5"),
             (
@@ -1167,14 +1395,24 @@ mod tests {
         assert!(r.family_names().all(|f| f != "bad"));
         assert_eq!(b.config["from_lib"], "1");
         assert_eq!(b.config["a"], "1", "family overrides lib");
-        assert_eq!(b.config["turbo"], "1", "case-insensitive hub_id/file_name + multi-family");
+        assert_eq!(
+            b.config["turbo"], "1",
+            "case-insensitive hub_id/file_name + multi-family"
+        );
         assert_eq!(b.config["only_base"], "1");
         assert_eq!(b.ignore.len(), 2, "ignore+ appends to lib ignore");
         assert!(b.macros.contains_key("m"));
         let c = r.spec("child", &sig).unwrap();
-        assert_eq!(c.config["from_lib"], "1", "child inherits parent use_lib blocks");
+        assert_eq!(
+            c.config["from_lib"], "1",
+            "child inherits parent use_lib blocks"
+        );
         assert_eq!(c.config["turbo"], "1");
-        assert_eq!(c.config.get("only_base"), None, "applies_to.family does not follow extends");
+        assert_eq!(
+            c.config.get("only_base"),
+            None,
+            "applies_to.family does not follow extends"
+        );
         assert_eq!(c.config["u"], "ok");
     }
 
@@ -1231,7 +1469,14 @@ mod tests {
     }
 
     /// `tests/golden/lm.rs` `llama_weights` (HF llama names).
-    fn llama_weights(seed: u64, d: &Dims, qk_norm: bool, shared_mlp: bool, bitnet: bool, untied: bool) -> Weights {
+    fn llama_weights(
+        seed: u64,
+        d: &Dims,
+        qk_norm: bool,
+        shared_mlp: bool,
+        bitnet: bool,
+        untied: bool,
+    ) -> Weights {
         let mut w = Weights::new(seed);
         w.s("model.embed_tokens.weight", &[V, d.h], 0.05);
         w.norm("model.norm.weight", d.h, 1.0);
@@ -1245,14 +1490,21 @@ mod tests {
                 return;
             }
             let s = 1.0 / (shape[1] as f32).sqrt();
-            let v = (0..shape[0] * shape[1]).map(|_| s * ((w.rng.next_u64() % 3) as f32 - 1.0)).collect();
+            let v = (0..shape[0] * shape[1])
+                .map(|_| s * ((w.rng.next_u64() % 3) as f32 - 1.0))
+                .collect();
             w.put(name, &shape, v);
         };
         for l in 0..d.layers {
             let p = format!("model.layers.{l}");
             w.norm(format!("{p}.input_layernorm.weight"), d.h, 1.0);
             w.norm(format!("{p}.post_attention_layernorm.weight"), d.h, 1.0);
-            for (n, shape) in [("q_proj", [a, d.h]), ("k_proj", [kvd, d.h]), ("v_proj", [kvd, d.h]), ("o_proj", [d.h, a])] {
+            for (n, shape) in [
+                ("q_proj", [a, d.h]),
+                ("k_proj", [kvd, d.h]),
+                ("v_proj", [kvd, d.h]),
+                ("o_proj", [d.h, a]),
+            ] {
                 proj(&mut w, format!("{p}.self_attn.{n}.weight"), shape);
             }
             if qk_norm {
@@ -1260,10 +1512,20 @@ mod tests {
                 w.norm(format!("{p}.self_attn.k_norm.weight"), d.hd, 1.0);
             }
             if shared_mlp {
-                w.w(format!("{p}.shared_mlp.input_linear.weight"), &[2 * d.inter, d.h]);
-                w.w(format!("{p}.shared_mlp.output_linear.weight"), &[d.h, d.inter]);
+                w.w(
+                    format!("{p}.shared_mlp.input_linear.weight"),
+                    &[2 * d.inter, d.h],
+                );
+                w.w(
+                    format!("{p}.shared_mlp.output_linear.weight"),
+                    &[d.h, d.inter],
+                );
             } else {
-                for (n, shape) in [("gate_proj", [d.inter, d.h]), ("up_proj", [d.inter, d.h]), ("down_proj", [d.h, d.inter])] {
+                for (n, shape) in [
+                    ("gate_proj", [d.inter, d.h]),
+                    ("up_proj", [d.inter, d.h]),
+                    ("down_proj", [d.h, d.inter]),
+                ] {
                     proj(&mut w, format!("{p}.mlp.{n}.weight"), shape);
                 }
             }
@@ -1276,12 +1538,24 @@ mod tests {
     }
 
     fn lfm2_fixture() -> (J, Weights) {
-        let d = Dims { h: 32, heads: 4, kv: 2, hd: 8, inter: 64, layers: 3 };
+        let d = Dims {
+            h: 32,
+            heads: 4,
+            kv: 2,
+            hd: 8,
+            inter: 64,
+            layers: 3,
+        };
         let (conv, k) = ([true, false, true], 3);
-        let cfg = lm_config("lfm2", "Lfm2ForCausalLM", &d, json!({
+        let cfg = lm_config(
+            "lfm2",
+            "Lfm2ForCausalLM",
+            &d,
+            json!({
             "norm_eps": 1e-5, "conv_L_cache": k, "conv_bias": false,
             "block_auto_adjust_ff_dim": false, "rope_theta": 1000000.0,
-            "layer_types": ["conv", "full_attention", "conv"]}));
+            "layer_types": ["conv", "full_attention", "conv"]}),
+        );
         let mut w = Weights::new(13);
         w.s("model.embed_tokens.weight", &[V, d.h], 0.05);
         w.norm("model.embedding_norm.weight", d.h, 1.0);
@@ -1387,7 +1661,11 @@ mod tests {
             w.s(format!("{n}.bias"), &[h], 0.1);
         };
         let conv1d = |w: &mut Weights, n: String, inp: usize, out: usize| {
-            w.s(format!("{n}.weight"), &[inp, out], 1.0 / (inp as f32).sqrt());
+            w.s(
+                format!("{n}.weight"),
+                &[inp, out],
+                1.0 / (inp as f32).sqrt(),
+            );
             w.s(format!("{n}.bias"), &[out], 0.1);
         };
         for l in 0..2 {
@@ -1464,7 +1742,15 @@ mod tests {
 
     /// The spec's `out` after a 6-row prefill of `prompt` (head `head`), then after each of 3
     /// one-row decode steps with the KV state carried, and the runner.
-    fn spec_steps(dir: &Path, family: &str, dev: Device, prompt: &[u32], decode: &[u32], head: &str, out: &str) -> (Vec<Vec<f32>>, Runner) {
+    fn spec_steps(
+        dir: &Path,
+        family: &str,
+        dev: Device,
+        prompt: &[u32],
+        decode: &[u32],
+        head: &str,
+        out: &str,
+    ) -> (Vec<Vec<f32>>, Runner) {
         let mut r = Runner::load(dir, None, dev, 64).unwrap_or_else(|e| panic!("{family}: {e}"));
         assert_eq!(r.model.spec.family, family, "detected family");
         let mut o = vec![r.lm(prompt, 0, head, out, vec![])];
@@ -1476,7 +1762,11 @@ mod tests {
 
     /// Every checkpoint tensor is read by some instance `r` built.
     fn all_read(r: &Runner, case: &str) {
-        assert_eq!(r.unconsumed(), Vec::<String>::new(), "{case}: unconsumed checkpoint tensors");
+        assert_eq!(
+            r.unconsumed(),
+            Vec::<String>::new(),
+            "{case}: unconsumed checkpoint tensors"
+        );
     }
 
     /// Each GraphLm fixture family against the deleted GraphLm's frozen CPU logits
@@ -1489,30 +1779,62 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut bad = Vec::new();
         let seq: Vec<u32> = PROMPT.iter().chain(&DECODE).copied().collect();
-        let d = |h, heads, kv, hd, inter, layers| Dims { h, heads, kv, hd, inter, layers };
+        let d = |h, heads, kv, hd, inter, layers| Dims {
+            h,
+            heads,
+            kv,
+            hd,
+            inter,
+            layers,
+        };
         let smol = d(64, 4, 2, 16, 128, 2);
-        let granite_cfg = lm_config("granitemoehybrid", "GraniteMoeHybridForCausalLM", &smol, json!({
+        let granite_cfg = lm_config(
+            "granitemoehybrid",
+            "GraniteMoeHybridForCausalLM",
+            &smol,
+            json!({
             "attention_multiplier": 0.1, "embedding_multiplier": 3.0, "residual_multiplier": 0.5,
             "logits_scaling": 4.0, "shared_intermediate_size": 128, "num_local_experts": 0,
             "layer_types": ["attention", "attention"], "position_embedding_type": "rope",
-            "tie_word_embeddings": false}));
+            "tie_word_embeddings": false}),
+        );
         let (qk, wide) = (d(32, 2, 2, 16, 64, 2), d(32, 4, 2, 16, 64, 2));
         let graph_lm: Vec<(&str, &str, J, Weights)> = vec![
-            ("smollm", "llama", lm_config("llama", "LlamaForCausalLM", &smol, json!({})),
-             llama_weights(11, &smol, false, false, false, false)),
-            ("granite", "granite", granite_cfg, llama_weights(12, &smol, false, true, false, true)),
+            (
+                "smollm",
+                "llama",
+                lm_config("llama", "LlamaForCausalLM", &smol, json!({})),
+                llama_weights(11, &smol, false, false, false, false),
+            ),
+            (
+                "granite",
+                "granite",
+                granite_cfg,
+                llama_weights(12, &smol, false, true, false, true),
+            ),
             ("lfm2", "lfm2", lfm2_fixture().0, lfm2_fixture().1),
-            ("qk_norm", "llama", lm_config("llama", "LlamaForCausalLM", &qk, json!({})),
-             llama_weights(14, &qk, true, false, false, false)),
-            ("gqa_wide", "llama", lm_config("llama", "LlamaForCausalLM", &wide, json!({})),
-             llama_weights(15, &wide, false, false, false, false)),
+            (
+                "qk_norm",
+                "llama",
+                lm_config("llama", "LlamaForCausalLM", &qk, json!({})),
+                llama_weights(14, &qk, true, false, false, false),
+            ),
+            (
+                "gqa_wide",
+                "llama",
+                lm_config("llama", "LlamaForCausalLM", &wide, json!({})),
+                llama_weights(15, &wide, false, false, false, false),
+            ),
             ("gpt_neox", "gpt_neox", neox_fixture().0, neox_fixture().1),
             ("gpt_neo", "gpt2", neo_fixture().0, neo_fixture().1),
         ];
         // The deleted GraphLm's CPU logits on these fixtures (`tests/golden/lm_graph_lm_logits.json`,
         // written by it at c96457c).
         let gl_ref: J = serde_json::from_slice(
-            &std::fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/lm_graph_lm_logits.json")).unwrap(),
+            &std::fs::read(
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/lm_graph_lm_logits.json"),
+            )
+            .unwrap(),
         )
         .unwrap();
         for (case, family, cfg, w) in &graph_lm {
@@ -1538,7 +1860,11 @@ mod tests {
         // (`tests/golden/lm_ln_decoder_hidden.json`, written by it at b73c897), and the score
         // instance against `score · hidden`.
         let ln_ref: J = serde_json::from_slice(
-            &std::fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/lm_ln_decoder_hidden.json")).unwrap(),
+            &std::fs::read(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/golden/lm_ln_decoder_hidden.json"),
+            )
+            .unwrap(),
         )
         .unwrap();
         let dec_seq: Vec<u32> = seq.iter().map(|t| t % DEC_VOCAB as u32).collect();
@@ -1553,19 +1879,32 @@ mod tests {
             w.write_checkpoint(&dir, cfg, DEC_VOCAB);
             let score = &w.tensors.iter().find(|t| t.0 == "score.weight").unwrap().2;
             let want = |i: usize| -> Vec<f32> {
-                ln_ref["f32"][format!("{case}.step{i}")].as_array().unwrap().iter().map(|x| x.as_f64().unwrap() as f32).collect()
+                ln_ref["f32"][format!("{case}.step{i}")]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|x| x.as_f64().unwrap() as f32)
+                    .collect()
             };
             for dev in devices() {
                 let (got, mut r) = spec_steps(&dir, family, dev, dp, dd, "hidden", "hidden");
                 for (i, g) in got.iter().enumerate() {
                     let w = want(i);
-                    close(&mut bad, &format!("{case} {dev:?} step {i}"), &g[g.len() - w.len()..], &w);
+                    close(
+                        &mut bad,
+                        &format!("{case} {dev:?} step {i}"),
+                        &g[g.len() - w.len()..],
+                        &w,
+                    );
                 }
                 // Seq-cls: row `last_index` of the 6-row prompt (rewrites the same KV rows).
                 let idx = crate::graph::Tensor::U32(vec![PROMPT.len() as u32 - 1]);
                 let logits = r.lm(dp, 0, "score", "logits", vec![idx]);
                 let h = want(0);
-                let want: Vec<f32> = score.chunks(h.len()).map(|row| row.iter().zip(&h).map(|(a, b)| a * b).sum()).collect();
+                let want: Vec<f32> = score
+                    .chunks(h.len())
+                    .map(|row| row.iter().zip(&h).map(|(a, b)| a * b).sum())
+                    .collect();
                 close(&mut bad, &format!("{case} {dev:?} score"), &logits, &want);
                 all_read(&r, case);
             }
@@ -1573,20 +1912,37 @@ mod tests {
 
         // BitNet: online-ternarized masters, int8 activations, sub-norms, relu².
         let bit = d(64, 4, 2, 16, 128, 2);
-        let cfg = lm_config("bitnet", "BitNetForCausalLM", &bit, json!({"hidden_act": "relu2",
-            "quantization_config": {"quant_method": "bitnet", "linear_class": "autobitlinear", "quantization_mode": "online"}}));
+        let cfg = lm_config(
+            "bitnet",
+            "BitNetForCausalLM",
+            &bit,
+            json!({"hidden_act": "relu2",
+            "quantization_config": {"quant_method": "bitnet", "linear_class": "autobitlinear", "quantization_mode": "online"}}),
+        );
         let dir = tmp.path().join("bitnet");
         llama_weights(16, &bit, false, false, true, false).write_checkpoint(&dir, &cfg, V);
         let golden: J = serde_json::from_slice(
-            &std::fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/lm_bitnet.json")).unwrap(),
+            &std::fs::read(
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/lm_bitnet.json"),
+            )
+            .unwrap(),
         )
         .unwrap();
         for dev in devices() {
             let (got, r) = spec_steps(&dir, "bitnet", dev, &PROMPT, &DECODE, "last", "logits");
             all_read(&r, "bitnet");
             for (i, g) in got.iter().enumerate() {
-                let key = if i == 0 { "prefill6".to_string() } else { format!("decode{}", i - 1) };
-                let want: Vec<f32> = golden["f32"][&key].as_array().unwrap().iter().map(|x| x.as_f64().unwrap() as f32).collect();
+                let key = if i == 0 {
+                    "prefill6".to_string()
+                } else {
+                    format!("decode{}", i - 1)
+                };
+                let want: Vec<f32> = golden["f32"][&key]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|x| x.as_f64().unwrap() as f32)
+                    .collect();
                 close(&mut bad, &format!("bitnet {dev:?} {key}"), g, &want);
             }
         }
@@ -1646,7 +2002,9 @@ mod tests {
         let r = Registry::from_files(&[("families/toy.json5".into(), spec.into())], &[]).unwrap();
         assert_eq!(r.derived_bases(Pipeline::Diffusion), ["org/toy"]);
         assert_eq!(r.pipeline_gguf_archs(Pipeline::Diffusion), ["toy_dit"]);
-        assert!(r.derived_bases(Pipeline::CausalLm).is_empty() && r.causal_lm_gguf_archs().is_empty());
+        assert!(
+            r.derived_bases(Pipeline::CausalLm).is_empty() && r.causal_lm_gguf_archs().is_empty()
+        );
     }
 
     #[test]
@@ -1657,5 +2015,48 @@ mod tests {
             readme.contains(&table),
             "README.md Supported models table is out of sync with arch/families:\n{table}"
         );
+    }
+
+    #[test]
+    fn override_adding_use_lib_merges_all_library_sections() {
+        let lib = r#"{
+            config: {from_lib: "42"},
+            checks: [{expr: "from_lib != 42", error: "bad lib config"}],
+            ignore: ["lib_ignored.*"],
+            macros: {lib_mac: {body: []}}
+        }"#;
+        let fam = r#"{
+            family: "toy",
+            match: {hf_model_type: ["toy"]},
+            pipeline: "causal_lm",
+            config: {own: "1"},
+            checks: [{expr: "own != 1", error: "bad own"}]
+        }"#;
+        let ov = r#"{
+            applies_to: {model_type: "TOY*", hf_architectures: ["*ToyForCausalLM*"]},
+            patch: {"use_lib+": ["extra"]}
+        }"#;
+        let r = Registry::from_files(
+            &files(&[
+                ("lib/extra.json5", lib),
+                ("families/toy.json5", fam),
+                ("overrides/ov.json5", ov),
+            ]),
+            &[],
+        )
+        .unwrap();
+        let sig = Signals {
+            hf_model_type: Some("toy_v2".into()),
+            hf_architectures: vec!["MyToyForCausalLM".into()],
+            ..Default::default()
+        };
+        let s = r.spec("toy", &sig).unwrap();
+        assert_eq!(
+            s.config.get("from_lib").and_then(|v| v.as_str()),
+            Some("42")
+        );
+        assert_eq!(s.checks.len(), 2, "lib check + family check both present");
+        assert_eq!(s.ignore.len(), 1);
+        assert!(s.macros.contains_key("lib_mac"));
     }
 }

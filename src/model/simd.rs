@@ -192,19 +192,19 @@ pub fn vector_gemv_q4_0_f32(
         .min(out_features);
 
     if num_threads > 1 && out_features >= 4 && in_features >= 128 {
-        let chunk_size = (out_features + num_threads - 1) / num_threads;
-        std::thread::scope(|s| {
-            for (t_idx, out_chunk) in out.chunks_mut(chunk_size).enumerate() {
-                let r_start = t_idx * chunk_size;
-                let r_count = out_chunk.len();
-                s.spawn(move || {
-                    for i in 0..r_count {
-                        let r = r_start + i;
-                        let row_bytes = &raw_bytes[r * row_len..(r + 1) * row_len];
-                        let b = bias.map(|b| b[r]);
-                        out_chunk[i] = compute_q4_0_row(row_bytes, in_features, num_blocks, x, b);
-                    }
-                });
+        let chunk_size = out_features.div_ceil(num_threads);
+        let n_chunks = out_features.div_ceil(chunk_size);
+        let out_ptr = crate::model::par::OutPtr::new(out);
+        crate::model::par::par_for(n_chunks, &|t_idx| {
+            let r_start = t_idx * chunk_size;
+            let r_count = chunk_size.min(out_features.saturating_sub(r_start));
+            // SAFETY: each task index `t_idx` writes a disjoint slice `r_start..r_start + r_count`.
+            let out_chunk = unsafe { out_ptr.slice(r_start, r_count) };
+            for (i, dst) in out_chunk.iter_mut().enumerate() {
+                let r = r_start + i;
+                let row_bytes = &raw_bytes[r * row_len..(r + 1) * row_len];
+                let b = bias.map(|b| b[r]);
+                *dst = compute_q4_0_row(row_bytes, in_features, num_blocks, x, b);
             }
         });
     } else {
@@ -341,6 +341,178 @@ unsafe fn dot_q4_0_block_neon(block: *const u8, x_ptr: *const f32) -> f32 {
 
     let sum12 = vaddq_f32(vaddq_f32(sum0, sum1), vaddq_f32(sum2, sum3));
     vaddvq_f32(sum12) * d
+}
+
+/// ARM `FEAT_I8MM` (`vmmlaq_s32`) 2x8x2 int8 matrix multiply-accumulate:
+/// Computes $C_{2\times 2} = A_{2\times 8} \cdot B_{2\times 8}^\top$ for signed `i8` tiles of length `k`
+/// (a multiple of 8). Uses hardware `SMMLA` (`vmmlaq_s32`) when `FEAT_I8MM` is available on `aarch64`,
+/// falling back to NEON / scalar accumulation otherwise.
+pub fn gemm_int8_i8mm_2x2(a_row0: &[i8], a_row1: &[i8], b_row0: &[i8], b_row1: &[i8]) -> [i32; 4] {
+    let k = a_row0
+        .len()
+        .min(a_row1.len())
+        .min(b_row0.len())
+        .min(b_row1.len());
+    #[cfg(target_arch = "aarch64")]
+    {
+        static HAS_I8MM: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *HAS_I8MM
+            .get_or_init(|| crate::hardware::HardwareCapability::probe_system().cpu_has_arm_i8mm)
+            && k >= 8
+        {
+            // SAFETY: guarded by runtime `FEAT_I8MM` sysctl detection.
+            return unsafe { gemm_int8_i8mm_2x2_neon(a_row0, a_row1, b_row0, b_row1, k) };
+        }
+    }
+    let mut c = [0i32; 4];
+    for i in 0..k {
+        let a0 = a_row0[i] as i32;
+        let a1 = a_row1[i] as i32;
+        let b0 = b_row0[i] as i32;
+        let b1 = b_row1[i] as i32;
+        c[0] += a0 * b0;
+        c[1] += a0 * b1;
+        c[2] += a1 * b0;
+        c[3] += a1 * b1;
+    }
+    c
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon,i8mm")]
+unsafe fn gemm_int8_i8mm_2x2_neon(
+    a_row0: &[i8],
+    a_row1: &[i8],
+    b_row0: &[i8],
+    b_row1: &[i8],
+    k: usize,
+) -> [i32; 4] {
+    use core::arch::aarch64::*;
+    let mut acc = vdupq_n_s32(0);
+    let mut i = 0;
+    while i + 8 <= k {
+        let a0 = vld1_s8(a_row0.as_ptr().add(i));
+        let a1 = vld1_s8(a_row1.as_ptr().add(i));
+        let va = vcombine_s8(a0, a1);
+        let b0 = vld1_s8(b_row0.as_ptr().add(i));
+        let b1 = vld1_s8(b_row1.as_ptr().add(i));
+        let vb = vcombine_s8(b0, b1);
+        core::arch::asm!(
+            "smmla {acc:v}.4s, {va:v}.16b, {vb:v}.16b",
+            acc = inout(vreg) acc,
+            va = in(vreg) va,
+            vb = in(vreg) vb,
+            options(pure, nomem, nostack),
+        );
+        i += 8;
+    }
+    let mut out = [0i32; 4];
+    vst1q_s32(out.as_mut_ptr(), acc);
+    while i < k {
+        let a0 = *a_row0.get_unchecked(i) as i32;
+        let a1 = *a_row1.get_unchecked(i) as i32;
+        let b0 = *b_row0.get_unchecked(i) as i32;
+        let b1 = *b_row1.get_unchecked(i) as i32;
+        out[0] += a0 * b0;
+        out[1] += a0 * b1;
+        out[2] += a1 * b0;
+        out[3] += a1 * b1;
+        i += 1;
+    }
+    out
+}
+
+/// ARM `FEAT_SME2` / Apple AMX-style 4x16 outer-product register-blocked tile microkernel:
+/// Accumulates $C_{4\times 16} \mathrel{+}= \sum_{p=0}^{k-1} a_{:, p} \otimes b_{p, :}$ using
+/// 16 rank-1 vector outer-product updates (`vfmaq_n_f32`) in 16 `float32x4_t` ZA-tile registers.
+pub fn gemm_f32_sme2_outer_tile_4x16(
+    a_panel: &[f32], // [k, 4] column-major panel of 4 rows
+    b_panel: &[f32], // [k, 16] row-major panel of 16 cols
+    k: usize,
+    c_tile: &mut [f32; 64], // [4, 16] row-major output tile
+) {
+    assert!(a_panel.len() >= k * 4 && b_panel.len() >= k * 16);
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        use core::arch::aarch64::*;
+        let mut za00 = vld1q_f32(c_tile.as_ptr());
+        let mut za01 = vld1q_f32(c_tile.as_ptr().add(4));
+        let mut za02 = vld1q_f32(c_tile.as_ptr().add(8));
+        let mut za03 = vld1q_f32(c_tile.as_ptr().add(12));
+        let mut za10 = vld1q_f32(c_tile.as_ptr().add(16));
+        let mut za11 = vld1q_f32(c_tile.as_ptr().add(20));
+        let mut za12 = vld1q_f32(c_tile.as_ptr().add(24));
+        let mut za13 = vld1q_f32(c_tile.as_ptr().add(28));
+        let mut za20 = vld1q_f32(c_tile.as_ptr().add(32));
+        let mut za21 = vld1q_f32(c_tile.as_ptr().add(36));
+        let mut za22 = vld1q_f32(c_tile.as_ptr().add(40));
+        let mut za23 = vld1q_f32(c_tile.as_ptr().add(44));
+        let mut za30 = vld1q_f32(c_tile.as_ptr().add(48));
+        let mut za31 = vld1q_f32(c_tile.as_ptr().add(52));
+        let mut za32 = vld1q_f32(c_tile.as_ptr().add(56));
+        let mut za33 = vld1q_f32(c_tile.as_ptr().add(60));
+
+        for p in 0..k {
+            let ap = a_panel.as_ptr().add(p * 4);
+            let a0 = *ap;
+            let a1 = *ap.add(1);
+            let a2 = *ap.add(2);
+            let a3 = *ap.add(3);
+            let bp = b_panel.as_ptr().add(p * 16);
+            let b0 = vld1q_f32(bp);
+            let b1 = vld1q_f32(bp.add(4));
+            let b2 = vld1q_f32(bp.add(8));
+            let b3 = vld1q_f32(bp.add(12));
+
+            za00 = vfmaq_n_f32(za00, b0, a0);
+            za01 = vfmaq_n_f32(za01, b1, a0);
+            za02 = vfmaq_n_f32(za02, b2, a0);
+            za03 = vfmaq_n_f32(za03, b3, a0);
+
+            za10 = vfmaq_n_f32(za10, b0, a1);
+            za11 = vfmaq_n_f32(za11, b1, a1);
+            za12 = vfmaq_n_f32(za12, b2, a1);
+            za13 = vfmaq_n_f32(za13, b3, a1);
+
+            za20 = vfmaq_n_f32(za20, b0, a2);
+            za21 = vfmaq_n_f32(za21, b1, a2);
+            za22 = vfmaq_n_f32(za22, b2, a2);
+            za23 = vfmaq_n_f32(za23, b3, a2);
+
+            za30 = vfmaq_n_f32(za30, b0, a3);
+            za31 = vfmaq_n_f32(za31, b1, a3);
+            za32 = vfmaq_n_f32(za32, b2, a3);
+            za33 = vfmaq_n_f32(za33, b3, a3);
+        }
+
+        vst1q_f32(c_tile.as_mut_ptr(), za00);
+        vst1q_f32(c_tile.as_mut_ptr().add(4), za01);
+        vst1q_f32(c_tile.as_mut_ptr().add(8), za02);
+        vst1q_f32(c_tile.as_mut_ptr().add(12), za03);
+        vst1q_f32(c_tile.as_mut_ptr().add(16), za10);
+        vst1q_f32(c_tile.as_mut_ptr().add(20), za11);
+        vst1q_f32(c_tile.as_mut_ptr().add(24), za12);
+        vst1q_f32(c_tile.as_mut_ptr().add(28), za13);
+        vst1q_f32(c_tile.as_mut_ptr().add(32), za20);
+        vst1q_f32(c_tile.as_mut_ptr().add(36), za21);
+        vst1q_f32(c_tile.as_mut_ptr().add(40), za22);
+        vst1q_f32(c_tile.as_mut_ptr().add(44), za23);
+        vst1q_f32(c_tile.as_mut_ptr().add(48), za30);
+        vst1q_f32(c_tile.as_mut_ptr().add(52), za31);
+        vst1q_f32(c_tile.as_mut_ptr().add(56), za32);
+        vst1q_f32(c_tile.as_mut_ptr().add(60), za33);
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        for p in 0..k {
+            for r in 0..4 {
+                let a = a_panel[p * 4 + r];
+                for c in 0..16 {
+                    c_tile[r * 16 + c] += a * b_panel[p * 16 + c];
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -483,6 +655,41 @@ mod tests {
                 out_actual[r],
                 expected_row
             );
+        }
+    }
+
+    #[test]
+    fn test_arm_i8mm_and_sme2_outer_tile_match_scalar() {
+        let a0: Vec<i8> = (0..24).map(|i| (i * 3 - 20) as i8).collect();
+        let a1: Vec<i8> = (0..24).map(|i| (15 - i * 2) as i8).collect();
+        let b0: Vec<i8> = (0..24).map(|i| (i * 5 - 30) as i8).collect();
+        let b1: Vec<i8> = (0..24).map(|i| (i - 10) as i8).collect();
+        let got = gemm_int8_i8mm_2x2(&a0, &a1, &b0, &b1);
+        let dot = |x: &[i8], y: &[i8]| -> i32 {
+            x.iter().zip(y).map(|(&u, &v)| u as i32 * v as i32).sum()
+        };
+        assert_eq!(
+            got,
+            [dot(&a0, &b0), dot(&a0, &b1), dot(&a1, &b0), dot(&a1, &b1)]
+        );
+
+        let k = 8usize;
+        let a_panel: Vec<f32> = (0..k * 4).map(|i| (i as f32 * 0.25) - 2.0).collect();
+        let b_panel: Vec<f32> = (0..k * 16).map(|i| (i as f32 * 0.1) - 1.5).collect();
+        let mut c_tile = [0.0f32; 64];
+        gemm_f32_sme2_outer_tile_4x16(&a_panel, &b_panel, k, &mut c_tile);
+        for r in 0..4 {
+            for c in 0..16 {
+                let mut want = 0.0f32;
+                for p in 0..k {
+                    want += a_panel[p * 4 + r] * b_panel[p * 16 + c];
+                }
+                assert!(
+                    (c_tile[r * 16 + c] - want).abs() < 1e-4,
+                    "SME2 outer tile mismatch at ({r},{c}): {} vs {want}",
+                    c_tile[r * 16 + c]
+                );
+            }
         }
     }
 }

@@ -413,20 +413,31 @@ inline void rmsnorm_rope_row(device const float* xr,
         if (i < rotary_dim) {
             if (pair_stride == 2) {
                 uint pair_idx = i / 2;
-                float theta = float(p_val) * inv_freq[pair_idx];
-                float cos_th = cos(theta) * mscale;
-                float sin_th = sin(theta) * mscale;
+                float freq = inv_freq[pair_idx];
                 float a = xr[pair_idx * 2] * scale * g[pair_idx * 2];
                 float b = xr[pair_idx * 2 + 1] * scale * g[pair_idx * 2 + 1];
-                outr[i] = (i % 2 == 0) ? (a * cos_th - b * sin_th) : (b * cos_th + a * sin_th);
+                if (freq == 0.0f) {
+                    outr[i] = ((i % 2 == 0) ? a : b) * mscale;
+                } else {
+                    float theta = float(p_val) * freq;
+                    float cos_th = cos(theta) * mscale;
+                    float sin_th = sin(theta) * mscale;
+                    outr[i] = (i % 2 == 0) ? (a * cos_th - b * sin_th) : (b * cos_th + a * sin_th);
+                }
             } else if (i < half_dim) {
-                float theta = float(p_val) * inv_freq[i];
-                float cos_th = cos(theta) * mscale;
-                float sin_th = sin(theta) * mscale;
+                float freq = inv_freq[i];
                 float a = xr[i] * scale * g[i];
                 float b = xr[i + half_dim] * scale * g[i + half_dim];
-                outr[i] = a * cos_th - b * sin_th;
-                outr[i + half_dim] = b * cos_th + a * sin_th;
+                if (freq == 0.0f) {
+                    outr[i] = a * mscale;
+                    outr[i + half_dim] = b * mscale;
+                } else {
+                    float theta = float(p_val) * freq;
+                    float cos_th = cos(theta) * mscale;
+                    float sin_th = sin(theta) * mscale;
+                    outr[i] = a * cos_th - b * sin_th;
+                    outr[i + half_dim] = b * cos_th + a * sin_th;
+                }
             }
         } else {
             outr[i] = xr[i] * scale * g[i];
@@ -1368,23 +1379,32 @@ inline void rope_elem(device const float* in, device float* out, device const ui
         if (pair_stride == 2) {
             uint pair_idx = d / 2;
             float freq = inv_freq[pair_idx];
-            float theta = float(pos[seq]) * freq;
-            float cos_th = cos(theta) * mscale;
-            float sin_th = sin(theta) * mscale;
-            float a = in_h[pair_idx * 2];
-            float b = in_h[pair_idx * 2 + 1];
-            out_h[d] = (d % 2 == 0) ? (a * cos_th - b * sin_th) : (b * cos_th + a * sin_th);
+            if (freq == 0.0f) {
+                out_h[d] = in_h[d] * mscale;
+            } else {
+                float theta = float(pos[seq]) * freq;
+                float cos_th = cos(theta) * mscale;
+                float sin_th = sin(theta) * mscale;
+                float a = in_h[pair_idx * 2];
+                float b = in_h[pair_idx * 2 + 1];
+                out_h[d] = (d % 2 == 0) ? (a * cos_th - b * sin_th) : (b * cos_th + a * sin_th);
+            }
         } else {
             uint half_dim = rotary_dim / 2;
             if (d < half_dim) {
                 float freq = inv_freq[d];
-                float theta = float(pos[seq]) * freq;
-                float cos_th = cos(theta) * mscale;
-                float sin_th = sin(theta) * mscale;
-                float a = in_h[d];
-                float b = in_h[d + half_dim];
-                out_h[d] = a * cos_th - b * sin_th;
-                out_h[d + half_dim] = b * cos_th + a * sin_th;
+                if (freq == 0.0f) {
+                    out_h[d] = in_h[d] * mscale;
+                    out_h[d + half_dim] = in_h[d + half_dim] * mscale;
+                } else {
+                    float theta = float(pos[seq]) * freq;
+                    float cos_th = cos(theta) * mscale;
+                    float sin_th = sin(theta) * mscale;
+                    float a = in_h[d];
+                    float b = in_h[d + half_dim];
+                    out_h[d] = a * cos_th - b * sin_th;
+                    out_h[d + half_dim] = b * cos_th + a * sin_th;
+                }
             }
         }
     } else {
@@ -1665,7 +1685,9 @@ inline float attn_rope_val(device const float* xh,
     if (d >= rotary_dim) return xh[d];
     if (pair_stride == 2) {
         uint pair = d >> 1;
-        float theta = (float)pos * inv_freq[pair];
+        float freq = inv_freq[pair];
+        if (freq == 0.0f) return xh[d] * mscale;
+        float theta = (float)pos * freq;
         float c = cos(theta) * mscale;
         float s = sin(theta) * mscale;
         float a = xh[pair * 2];
@@ -1674,7 +1696,9 @@ inline float attn_rope_val(device const float* xh,
     } else {
         uint half_d = rotary_dim >> 1;
         uint pair = d < half_d ? d : (d - half_d);
-        float theta = (float)pos * inv_freq[pair];
+        float freq = inv_freq[pair];
+        if (freq == 0.0f) return xh[d] * mscale;
+        float theta = (float)pos * freq;
         float c = cos(theta) * mscale;
         float s = sin(theta) * mscale;
         float a = xh[pair];
@@ -2328,6 +2352,108 @@ kernel void gemv_bf16_pair(device const ushort* w0 [[buffer(0)]],
         y[(ulong)batch * p.rows + row0] = acc0;
         if (has_row1) {
             y[(ulong)batch * p.rows + row1] = acc1;
+        }
+    }
+}
+
+struct SampleGpuParams {
+    uint vocab;
+    uint top_k;
+    float inv_temp;
+    float top_p;
+    float rep_penalty;
+    uint n_recent;
+    ulong rng_seed;
+};
+
+kernel void sample_logits_gpu(device const float* logits [[buffer(0)]],
+                              device uint* out_token [[buffer(1)]],
+                              device uint* recent_ids [[buffer(2)]],
+                              constant SampleGpuParams& p [[buffer(3)]],
+                              uint tid [[thread_index_in_threadgroup]]) {
+    threadgroup uint sh_recent[64];
+    threadgroup float sh_val[256];
+    threadgroup uint sh_id[256];
+
+    if (tid < 64) {
+        sh_recent[tid] = (tid < p.n_recent) ? recent_ids[tid] : 0xFFFFFFFFu;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float best_v = -FLT_MAX;
+    uint best_id = 0;
+    const bool has_rep = (p.rep_penalty > 0.0f && p.rep_penalty != 1.0f && p.n_recent > 0);
+    for (uint i = tid; i < p.vocab; i += 256) {
+        float v = logits[i];
+        if (isnan(v)) v = -FLT_MAX;
+        if (has_rep) {
+            for (uint r = 0; r < p.n_recent && r < 64; ++r) {
+                if (sh_recent[r] == i) {
+                    v = (v > 0.0f) ? (v / p.rep_penalty) : (v * p.rep_penalty);
+                    break;
+                }
+            }
+        }
+        if (v > best_v) {
+            best_v = v;
+            best_id = i;
+        }
+    }
+    sh_val[tid] = best_v;
+    sh_id[tid] = best_id;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid == 0) {
+        const uint k = min(max(p.top_k, 1u), 64u);
+        float top_v[64];
+        uint top_i[64];
+        for (uint j = 0; j < k; ++j) {
+            float mv = -FLT_MAX;
+            uint mi = 0;
+            uint mslot = 0;
+            for (uint s = 0; s < 256; ++s) {
+                if (sh_val[s] > mv || (sh_val[s] == mv && sh_id[s] < mi)) {
+                    mv = sh_val[s];
+                    mi = sh_id[s];
+                    mslot = s;
+                }
+            }
+            top_v[j] = mv;
+            top_i[j] = mi;
+            sh_val[mslot] = -FLT_MAX;
+        }
+        const float max_v = top_v[0];
+        float total = 0.0f;
+        for (uint j = 0; j < k; ++j) {
+            float w = exp((top_v[j] - max_v) * p.inv_temp);
+            top_v[j] = w;
+            total += w;
+        }
+        const float cutoff = total * clamp(p.top_p, 1e-6f, 1.0f);
+        float kept_sum = 0.0f;
+        uint kept_k = 0;
+        for (uint j = 0; j < k; ++j) {
+            kept_sum += top_v[j];
+            kept_k = j + 1;
+            if (kept_sum >= cutoff) break;
+        }
+        ulong z = p.rng_seed + 0x9e3779b97f4a7c15UL;
+        z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9UL;
+        z = (z ^ (z >> 27)) * 0x94d049bb133111ebUL;
+        z = z ^ (z >> 31);
+        const float u = (float(z >> 40) * (1.0f / 16777216.0f)) * kept_sum;
+        float acc = 0.0f;
+        uint chosen = top_i[0];
+        for (uint j = 0; j < kept_k; ++j) {
+            acc += top_v[j];
+            if (u <= acc) {
+                chosen = top_i[j];
+                break;
+            }
+        }
+        out_token[0] = chosen;
+        if (p.n_recent > 0) {
+            recent_ids[uint(p.rng_seed) % min(p.n_recent, 64u)] = chosen;
         }
     }
 }

@@ -11,9 +11,25 @@
     single_file_ext: ["safetensors"],
   },
   components: {
-    text_encoder: {family: "ldm_clip", dir: "text_encoder"},
-    unet: {family: "ldm_unet", dir: "unet"},
-    vae: {family: "ldm_vae", dir: "vae"},
+    text_encoder: {
+      family: "clip_text",
+      dir: "text_encoder",
+      strip: ["cond_stage_model.transformer."],
+      ignore: ["model.diffusion_model.*", "first_stage_model.*"],
+      patch: {"use_lib+": ["ldm"]},
+    },
+    unet: {
+      family: "sd",
+      dir: "unet",
+      ignore: ["first_stage_model.*", "cond_stage_model.*", "conditioner.*", "denoiser.*"],
+      patch: {"use_lib+": ["ldm"]},
+    },
+    vae: {
+      family: "sd_vae",
+      dir: "vae",
+      ignore: ["model.diffusion_model.*", "cond_stage_model.*", "conditioner.*", "denoiser.*"],
+      patch: {"use_lib+": ["ldm"]},
+    },
   },
   runtime: {
     reference: "'stable-diffusion-v1-5/stable-diffusion-v1-5'",

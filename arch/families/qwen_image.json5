@@ -54,7 +54,32 @@
     ]},
   },
   components: {
-    text_encoder: {family: "qwen2_5_vl_text", dir: "text_encoder"},
+    text_encoder: {
+      family: "llama",
+      dir: "text_encoder",
+      ignore: ["visual.*", "model.visual.*", "lm_head.weight"],
+      patch: {
+        names: {"rules+": [["model.language_model.{r:*}", "model.{r}"]]},
+        config: {
+          tc: "first(cfg.text_config, cfg)",
+          hidden: "tc.hidden_size",
+          layers: "tc.num_hidden_layers",
+          heads: "tc.num_attention_heads",
+          kv_heads: "first(tc.num_key_value_heads, heads)",
+          head_dim: "first(tc.head_dim, hidden // heads)",
+          inter: "tc.intermediate_size",
+          eps: "first(tc.rms_norm_eps, 1e-6)",
+          theta: "first(tc.rope_theta, 1000000)",
+          rotary_pct: "1",
+          rope_variant: "'HalfSplit'",
+          rope_kind: "'default'",
+          ctx: "first(runtime.ctx, 4096)",
+        },
+        "transforms+": [
+          {tensor: "{n:*}.weight", op: "to_bf16", when: "len(shape(fmt('{n}.weight'))) == 2"},
+        ],
+      },
+    },
     transformer: {family: "qwen_image", dir: "transformer"},
     vae: {family: "qwen_vae", dir: "vae"},
     // Velocity [h/2 * w/2, in_ch] for a 2x2-packed latent grid h x w and `nt` text rows.

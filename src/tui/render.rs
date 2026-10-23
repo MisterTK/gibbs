@@ -445,6 +445,29 @@ impl TuiApp {
                     th.fg(Token::Parchment),
                 ),
             ]),
+            Line::from(vec![
+                Span::styled(" [5] Spec Draft Mode:    ", label),
+                Span::styled(self.draft_knobs.mode.name().to_uppercase(), value),
+                Span::styled("  (5: cycle auto / noise / suffix / model / off)", dim),
+            ]),
+            Line::from(vec![
+                Span::styled(" [6] Spec Max K:         ", label),
+                Span::styled(format!("{}", self.draft_knobs.max_k), value),
+                Span::styled("  (6: cycle 0 / 2 / 4 / 6 / 8 / 12)", dim),
+            ]),
+            Line::from(vec![
+                Span::styled(" [7] Spec Target Accept: ", label),
+                Span::styled(
+                    format!("{:.0}%", self.draft_knobs.target_acceptance * 100.0),
+                    value,
+                ),
+                Span::styled("  (7: cycle 50% / 65% / 75% / 85%)", dim),
+            ]),
+            Line::from(vec![
+                Span::styled(" [8] Auto Compaction:    ", label),
+                Span::styled(self.compact_config.mode.name().to_uppercase(), value),
+                Span::styled("  (8: cycle auto / light / aggressive / off)", dim),
+            ]),
             Line::from(""),
             Line::from(Span::styled(
                 " Esc / F4: Close modal | Enter: Save settings",

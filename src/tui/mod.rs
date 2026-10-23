@@ -81,6 +81,7 @@ enum SlashCmd {
     Variant(Option<VariantPolicy>),
     Profile(ProfileArg),
     Placement,
+    Spec(SpecArg),
 }
 
 /// `/profile` arguments.
@@ -91,6 +92,18 @@ enum ProfileArg {
     Off,
     /// `None` cycles the column.
     Sort(Option<crate::telemetry::KernelSort>),
+}
+
+/// `/spec` arguments for live speculative decoding & online noise drafter tuning.
+#[derive(Debug, PartialEq)]
+enum SpecArg {
+    Status,
+    Mode(crate::runtime::noise_draft::DraftMode),
+    MaxK(usize),
+    Accept(f32),
+    Cost(f32),
+    Suffix(usize),
+    Lr(f32),
 }
 
 /// Parses `/reencode`, `/variant`, `/profile` and `/placement` lines; `None` for any other command.
@@ -118,8 +131,42 @@ fn parse_slash(raw: &str) -> Option<Result<SlashCmd, String>> {
                 )
             }),
         "/profile" => parse_profile(arg).map(SlashCmd::Profile),
+        "/spec" => parse_spec(arg).map(SlashCmd::Spec),
         _ => return None,
     })
+}
+
+fn parse_spec(arg: &str) -> Result<SpecArg, String> {
+    let (word, rest) = arg.split_once(char::is_whitespace).unwrap_or((arg, ""));
+    let val = rest.trim();
+    match (word, val) {
+        ("", _) => Ok(SpecArg::Status),
+        ("mode", m) => m.parse().map(SpecArg::Mode),
+        ("k" | "max-k" | "max_k", v) => v
+            .parse::<usize>()
+            .map(|k| SpecArg::MaxK(k.min(crate::runtime::noise_draft::NOISE_MAX_K)))
+            .map_err(|_| format!("invalid max_k '{v}'; expected integer 0..=15")),
+        ("accept" | "target-accept", v) => v
+            .parse::<f32>()
+            .map(SpecArg::Accept)
+            .map_err(|_| format!("invalid target acceptance '{v}'; expected float 0.10..=0.98")),
+        ("cost" | "cost-weight", v) => v
+            .parse::<f32>()
+            .map(SpecArg::Cost)
+            .map_err(|_| format!("invalid cost weight '{v}'; expected float 0.0..=1.0")),
+        ("suffix" | "suffix-min", v) => v
+            .parse::<usize>()
+            .map(SpecArg::Suffix)
+            .map_err(|_| format!("invalid suffix min match '{v}'; expected integer 1..=4")),
+        ("lr" | "noise-lr", v) => v
+            .parse::<f32>()
+            .map(SpecArg::Lr)
+            .map_err(|_| format!("invalid noise lr '{v}'; expected float 0.0..=0.10")),
+        (w, "") => w.parse().map(SpecArg::Mode),
+        (w, _) => Err(format!(
+            "unknown /spec argument '{w}'; use mode <auto|noise|suffix|model|off>, k <0..15>, accept <0.1..0.98>, cost <0..1>, suffix <1..4>, or lr <f32>"
+        )),
+    }
 }
 
 fn parse_profile(arg: &str) -> Result<ProfileArg, String> {
@@ -272,6 +319,8 @@ pub struct Entry {
     took: Option<Duration>,
     /// Set for running chats: raising it stops streaming and drops the token receiver.
     cancel: Option<Arc<AtomicBool>>,
+    /// User prompt text when this entry is a chat turn; committed to `chat_history` on finish.
+    chat_user: Option<String>,
 }
 
 /// Results from background work, applied on the UI thread.
@@ -402,6 +451,8 @@ pub struct TuiApp {
     pub placement: PlacementMode,
     pub scratch_dir: tempfile::TempDir,
     pub history: Vec<Entry>,
+    /// Multi-turn conversation history (`("user" | "assistant", content)` pairs).
+    pub chat_history: Vec<(String, String)>,
     pub input: String,
     focus: Focus,
     picker: Picker,
@@ -437,6 +488,8 @@ pub struct TuiApp {
     placement_modal: Option<(Vec<crate::graph::placement::PlacementRow>, usize)>,
     pub reencode_policy: crate::model::weight_format::ReencodePolicy,
     pub variant_policy: crate::model::weight_format::VariantPolicy,
+    pub draft_knobs: crate::runtime::noise_draft::DraftKnobs,
+    pub compact_config: crate::compact::CompactionConfig,
     pub ctx_limit: usize,
     pub show_roofline_hud: bool,
     pub frame_log_path: Option<String>,
@@ -511,6 +564,7 @@ impl TuiApp {
             placement: PlacementMode::Auto,
             scratch_dir: tempfile::tempdir().expect("scratch directory for TUI images"),
             history: Vec::new(),
+            chat_history: Vec::new(),
             input: String::new(),
             focus: Focus::Dashboard,
             picker,
@@ -538,6 +592,8 @@ impl TuiApp {
             placement_modal: None,
             reencode_policy: crate::model::weight_format::ReencodePolicy::MaxSpeed,
             variant_policy: crate::model::weight_format::VariantPolicy::Fastest,
+            draft_knobs: settings::load_settings().draft,
+            compact_config: settings::load_settings().compact,
             ctx_limit: 8192,
             show_roofline_hud: true,
             frame_log_path: None,
@@ -606,6 +662,7 @@ impl TuiApp {
             started: now,
             took: (kind != Kind::Running).then_some(Duration::ZERO),
             cancel: None,
+            chat_user: None,
         });
         if kind == Kind::Running {
             self.running += 1;
@@ -638,7 +695,7 @@ impl TuiApp {
                 self.roofline_probe_result = probe.as_ref().ok().cloned();
                 Some(probe)
             }
-            "/reencode" | "/variant" | "/profile" | "/placement" => Some(
+            "/reencode" | "/variant" | "/profile" | "/placement" | "/spec" => Some(
                 parse_slash(&raw)
                     .unwrap_or_else(|| Err(format!("unknown command '{cmd}'")))
                     .and_then(|c| self.run_slash(c, &raw)),
@@ -652,6 +709,48 @@ impl TuiApp {
             }
             "/bench" => Some(self.start_bench()),
             "/system1" | "/s1" => Some(self.toggle_system1(rest.trim())),
+            "/clear" | "/reset" | "/new" => {
+                let prev_turns = self.chat_history.len() / 2;
+                self.chat_history.clear();
+                if let Some(s) = &self.scheduler {
+                    s.kv_pool.radix_cache.clear();
+                }
+                Some(Ok(format!(
+                    "Cleared multi-turn chat history ({prev_turns} turns removed) and reset KV prefix cache."
+                )))
+            }
+            "/pop" | "/undo" => {
+                if self.chat_history.is_empty() {
+                    Some(Err("chat history is already empty".to_string()))
+                } else {
+                    let removed = if self.chat_history.len() >= 2 { 2 } else { 1 };
+                    for _ in 0..removed {
+                        self.chat_history.pop();
+                    }
+                    let turns = self.chat_history.len() / 2;
+                    Some(Ok(format!(
+                        "Popped last chat turn ({turns} turn{} remaining in context).",
+                        if turns == 1 { "" } else { "s" }
+                    )))
+                }
+            }
+            "/history" => {
+                if self.chat_history.is_empty() {
+                    Some(Ok("Multi-turn chat history is empty (0 turns).".to_string()))
+                } else {
+                    let mut lines = vec![format!(
+                        "MULTI-TURN CHAT HISTORY ({} messages, {} turns):",
+                        self.chat_history.len(),
+                        self.chat_history.len() / 2
+                    )];
+                    for (i, (role, content)) in self.chat_history.iter().enumerate() {
+                        let preview: String = content.chars().take(72).collect();
+                        lines.push(format!("  [{}] {}: {}", i + 1, role, preview));
+                    }
+                    Some(Ok(lines.join("\n")))
+                }
+            }
+            "/compact" => Some(self.run_compact_cmd(rest.trim())),
             "/quant" => {
                 Some(Ok(format!(
                     "MODEL QUANTIZATION:\n\
@@ -679,6 +778,7 @@ impl TuiApp {
                      · /bench     : Benchmark the loaded model on Metal (128 tokens x 3 runs): tok/s, roofline % and where each token's time goes; refuses while generating\n\
                      · /placement : Where every graph node of the loaded model runs (op, device, avenue): 100% Metal, or the CPU ops\n\
                      · /roofline  : Focus ROOFLINE detail & run the calibration sweep\n\
+                     · /spec [mode|k|accept|cost|suffix|lr] : Live-tune speculative decoding & online noise drafter\n\
                      · /quant     : Display active weight quantization formats\n\
                      · /gibbs     : Full historical biography & ASCII portrait of J. Willard Gibbs\n\
                      · /system1 [on|off] : Turn the active LLM into a System 1 encoder & zero-shot judge (or return to chat)\n\
@@ -686,6 +786,10 @@ impl TuiApp {
                      · /embed <text>     : Compute L2-normalized embedding on the active System 1 or LLM model\n\
                      · /chat <msg>: Send chat message to active model\n\
                      · /connect   : Print curl/OpenAI API connection commands\n\
+                     · /clear (/reset, /new) : Clear multi-turn chat history and KV prefix cache\n\
+                     · /pop (/undo)          : Remove the last user/assistant turn from chat history\n\
+                     · /history              : Inspect active multi-turn chat messages\n\
+                     · /compact [auto|light|aggressive|off|now] : Configure or trigger 4-tier session compaction\n\
                      · /help      : This reference"
                         .to_string(),
                 ))
@@ -723,12 +827,13 @@ impl TuiApp {
             ),
             _ => (Ok(route_for_model(&self.model_id())), raw.as_str()),
         };
-        let body = body.to_string();
+        let body_str = body.to_string();
+        let is_chat = matches!(route, Ok(Route::Chat));
         let job = route.and_then(|r| {
-            if body.is_empty() {
+            if body_str.is_empty() {
                 Err("empty prompt".to_string())
             } else {
-                self.prompt_job(r, body)
+                self.prompt_job(r, body_str.clone())
             }
         });
         match job {
@@ -748,6 +853,9 @@ impl TuiApp {
                 };
                 let idx = self.push_entry(shown, Kind::Running, String::new());
                 self.history[idx].cancel = cancel;
+                if is_chat {
+                    self.history[idx].chat_user = Some(body_str);
+                }
                 let tx = self.updates_tx.clone();
                 std::thread::spawn(move || {
                     crate::tui::qos::set_qos(crate::tui::qos::QosClass::Utility);
@@ -778,6 +886,7 @@ impl TuiApp {
                     self.kernel_sort.name()
                 ))
             }
+            SlashCmd::Spec(a) => self.apply_spec_cmd(a),
         }
     }
 
@@ -845,6 +954,114 @@ impl TuiApp {
         s.variant = next;
         settings::save_settings(&s)?;
         Ok(self.reload_for("variant", next.name()))
+    }
+
+    /// Applies a `/spec` command, updating `self.draft_knobs`, `settings.json`, and the live scheduler.
+    fn apply_spec_cmd(&mut self, arg: SpecArg) -> Result<String, String> {
+        let mut k = self
+            .scheduler
+            .as_ref()
+            .map_or(self.draft_knobs, |s| s.draft_knobs());
+        match arg {
+            SpecArg::Status => {}
+            SpecArg::Mode(m) => k.mode = m,
+            SpecArg::MaxK(mk) => k.max_k = mk,
+            SpecArg::Accept(a) => k.target_acceptance = a,
+            SpecArg::Cost(c) => k.cost_weight = c,
+            SpecArg::Suffix(sm) => k.suffix_min_match = sm,
+            SpecArg::Lr(lr) => k.noise_lr = lr,
+        }
+        let k = k.sanitized();
+        self.draft_knobs = k;
+        let mut s = settings::load_settings();
+        s.draft = k;
+        let _ = settings::save_settings(&s);
+        if let Some(sched) = &self.scheduler {
+            sched.set_draft_knobs(k);
+        }
+        let active = self
+            .scheduler
+            .as_ref()
+            .and_then(|sc| sc.view().spec)
+            .map_or_else(
+                || "none (plain decode)".to_string(),
+                |sv| format!("{} (best k={:?})", sv.label, sv.k),
+            );
+        Ok(format!(
+            "Speculative decoding: mode={} · active={} · max_k={} · target_accept={:.0}% · cost_weight={:.2} · suffix_min={} · noise_lr={:.4}",
+            k.mode.name(),
+            active,
+            k.max_k,
+            k.target_acceptance * 100.0,
+            k.cost_weight,
+            k.suffix_min_match,
+            k.noise_lr
+        ))
+    }
+
+    /// `/compact [auto|light|aggressive|off|now]`: configures or runs 4-tier session compaction on `chat_history`.
+    fn run_compact_cmd(&mut self, arg: &str) -> Result<String, String> {
+        let run_now = matches!(arg, "now" | "run" | "force");
+        if !arg.is_empty() && !run_now {
+            let mode: crate::compact::CompactionMode = arg.parse()?;
+            self.compact_config.mode = mode;
+            let mut s = settings::load_settings();
+            s.compact = self.compact_config;
+            let _ = settings::save_settings(&s);
+        }
+        if run_now
+            || matches!(
+                self.compact_config.mode,
+                crate::compact::CompactionMode::Light | crate::compact::CompactionMode::Aggressive
+            )
+        {
+            if !self.chat_history.is_empty() {
+                let tok = self
+                    .scheduler
+                    .as_ref()
+                    .map(|s| s.tokenizer())
+                    .unwrap_or_else(|| Arc::new(Tokenizer::default_bpe()));
+                let msgs: Vec<crate::model::hf_loader::ChatMessage> = self
+                    .chat_history
+                    .iter()
+                    .map(|(r, c)| crate::model::hf_loader::ChatMessage::new(r.as_str(), c.as_str()))
+                    .collect();
+                let mut cfg = self.compact_config;
+                if run_now && cfg.mode == crate::compact::CompactionMode::Auto {
+                    cfg.mode = crate::compact::CompactionMode::Aggressive;
+                }
+                let (compacted, _, report) = crate::compact::compact_chat_session(
+                    &msgs,
+                    &tok,
+                    self.ctx_limit,
+                    &cfg,
+                    &[],
+                    false,
+                );
+                self.chat_history = compacted
+                    .into_iter()
+                    .map(|m| (m.role.clone(), m.text().to_string()))
+                    .collect();
+                return Ok(format!(
+                    "Session compacted (mode={}): {} -> {} tokens (-{} tok; tier1={}B, tier2={}B, tier3={} turns)",
+                    self.compact_config.mode.name(),
+                    report.before_tokens,
+                    report.after_tokens,
+                    report.saved_tokens(),
+                    report.tier1_chars_elided,
+                    report.tier2_chars_shaken,
+                    report.tier3_turns_summarized,
+                ));
+            }
+        }
+        Ok(format!(
+            "Auto-compaction: mode={} · trigger={:.0}% · target={:.0}% · keep_recent_turns={} · snapcompact_vision={}",
+            self.compact_config.mode.name(),
+            self.compact_config.trigger_ratio * 100.0,
+            self.compact_config.target_ratio * 100.0,
+            self.compact_config.keep_recent_turns,
+            self.compact_config.enable_snapcompact_vision,
+        ))
     }
 
     /// The reply to a changed setting. A loaded model is reloaded so the setting takes effect now;
@@ -1108,6 +1325,7 @@ impl TuiApp {
                 let cancelled = cancel.clone();
                 let active_template = self.active_template;
                 let system_prompt = self.system_prompt.clone();
+                let prior_turns = self.chat_history.clone();
                 let job: Job = Box::new(move |idx, tx| {
                     // Instruct models get their chat template; base models (Plain) get the raw text.
                     // Answers run to EOS or the end of the model's context.
@@ -1120,11 +1338,13 @@ impl TuiApp {
                     let submitted = match &media {
                         None => {
                             let system_prompt = system_prompt.clone();
+                            let prior_turns = prior_turns.clone();
                             Ok(sched.submit_with_params(params, move |tok| {
-                                let prompt_str = Self::format_chat_prompt_with(
+                                let prompt_str = Self::format_chat_history_with(
                                     &system_prompt,
                                     active_template,
                                     tok,
+                                    &prior_turns,
                                     body.as_str(),
                                 );
                                 tok.encode(&prompt_str)
@@ -1132,6 +1352,7 @@ impl TuiApp {
                         }
                         Some((msg, media)) => {
                             let system_prompt = system_prompt.clone();
+                            let prior_turns = prior_turns.clone();
                             let msg = msg.clone();
                             sched.submit_with_media(params, media, move |tok| {
                                 let mut msgs = Vec::new();
@@ -1139,6 +1360,12 @@ impl TuiApp {
                                     msgs.push(crate::model::hf_loader::ChatMessage::new(
                                         "system",
                                         system_prompt.as_str(),
+                                    ));
+                                }
+                                for (role, content) in &prior_turns {
+                                    msgs.push(crate::model::hf_loader::ChatMessage::new(
+                                        role.as_str(),
+                                        content.as_str(),
                                     ));
                                 }
                                 msgs.push(msg);
@@ -1517,6 +1744,20 @@ impl TuiApp {
         std::thread::spawn(move || {
             crate::tui::qos::set_qos(crate::tui::qos::QosClass::Utility);
             let attach = || -> Result<String, String> {
+                if matches!(id.as_str(), "noise" | "online-noise" | "suffix") {
+                    let mode = if id == "suffix" {
+                        crate::runtime::noise_draft::DraftMode::Suffix
+                    } else {
+                        crate::runtime::noise_draft::DraftMode::Noise
+                    };
+                    let mut knobs = sched.draft_knobs();
+                    knobs.mode = mode;
+                    sched.set_draft_knobs(knobs);
+                    return Ok(format!(
+                        "speculative decoding on {target} with {}",
+                        mode.name()
+                    ));
+                }
                 let da = hub.auto_download_and_cache(&id, token.as_deref())?;
                 let d = crate::runtime::draft::load_drafter(
                     &da,
@@ -1636,6 +1877,15 @@ impl TuiApp {
             return;
         }
         self.running -= 1;
+        if kind == Kind::Text {
+            if let Some(user_msg) = e.chat_user.take() {
+                self.chat_history.push(("user".to_string(), user_msg));
+                self.chat_history
+                    .push(("assistant".to_string(), text.clone()));
+            }
+        } else {
+            e.chat_user = None;
+        }
         (e.kind, e.output, e.stats) = (kind, text, stats);
         e.took = Some(e.started.elapsed());
         e.cancel = None;
@@ -1651,6 +1901,7 @@ impl TuiApp {
         else {
             return false;
         };
+        self.history[idx].chat_user = None;
         let e = &self.history[idx];
         if let Some(c) = &e.cancel {
             c.store(true, Ordering::Relaxed);
@@ -1926,6 +2177,35 @@ impl TuiApp {
                 KeyCode::Char('3') => {
                     self.show_roofline_hud = !self.show_roofline_hud;
                 }
+                KeyCode::Char('5') => {
+                    let next = self.draft_knobs.mode.next();
+                    let _ = self.apply_spec_cmd(SpecArg::Mode(next));
+                }
+                KeyCode::Char('6') => {
+                    let next = match self.draft_knobs.max_k {
+                        0 => 2,
+                        2 => 4,
+                        4 => 6,
+                        6 => 8,
+                        8 => 12,
+                        _ => 0,
+                    };
+                    let _ = self.apply_spec_cmd(SpecArg::MaxK(next));
+                }
+                KeyCode::Char('7') => {
+                    let cur = (self.draft_knobs.target_acceptance * 100.0).round() as u32;
+                    let next = match cur {
+                        0..=55 => 0.65,
+                        56..=70 => 0.75,
+                        71..=80 => 0.85,
+                        _ => 0.50,
+                    };
+                    let _ = self.apply_spec_cmd(SpecArg::Accept(next));
+                }
+                KeyCode::Char('8') => {
+                    let next = self.compact_config.mode.next();
+                    let _ = self.run_compact_cmd(next.name());
+                }
                 KeyCode::Enter => self.show_settings_modal = false,
                 _ => {}
             }
@@ -2098,19 +2378,39 @@ impl TuiApp {
 
     /// Formats a chat prompt using the active chat template and system prompt.
     pub fn format_chat_prompt(&self, tok: &Tokenizer, user_prompt: &str) -> String {
-        Self::format_chat_prompt_with(&self.system_prompt, self.active_template, tok, user_prompt)
+        Self::format_chat_history_with(
+            &self.system_prompt,
+            self.active_template,
+            tok,
+            &self.chat_history,
+            user_prompt,
+        )
     }
 
-    /// Formats a chat prompt using explicit system prompt and template style.
+    /// Formats a single-turn chat prompt using explicit system prompt and template style.
     pub fn format_chat_prompt_with(
         system_prompt: &str,
         active_template: usize,
         tok: &Tokenizer,
         user_prompt: &str,
     ) -> String {
-        let mut msgs = Vec::new();
+        Self::format_chat_history_with(system_prompt, active_template, tok, &[], user_prompt)
+    }
+
+    /// Formats a multi-turn chat prompt including `history` (`(role, content)` pairs) and `user_prompt`.
+    pub fn format_chat_history_with(
+        system_prompt: &str,
+        active_template: usize,
+        tok: &Tokenizer,
+        history: &[(String, String)],
+        user_prompt: &str,
+    ) -> String {
+        let mut msgs: Vec<(&str, &str)> = Vec::with_capacity(history.len() + 2);
         if !system_prompt.is_empty() {
             msgs.push(("system", system_prompt));
+        }
+        for (role, content) in history {
+            msgs.push((role.as_str(), content.as_str()));
         }
         msgs.push(("user", user_prompt));
         match active_template
@@ -3477,5 +3777,44 @@ mod tests {
             .unwrap()
             .output
             .contains("System 1 mode OFF"));
+    }
+
+    #[test]
+    fn test_multi_turn_chat_history_and_slash_commands() {
+        let kv = Arc::new(PagedKVPool::new(64));
+        let mut app = TuiApp::new(EngineTelemetry::new(), kv);
+        app.chat_history
+            .push(("user".into(), "First question".into()));
+        app.chat_history
+            .push(("assistant".into(), "First answer".into()));
+        app.chat_history
+            .push(("user".into(), "Second question".into()));
+        app.chat_history
+            .push(("assistant".into(), "Second answer".into()));
+
+        let tok = Tokenizer::default_bpe();
+        let formatted = app.format_chat_prompt(&tok, "Third question");
+        assert!(formatted.contains("First question"));
+        assert!(formatted.contains("First answer"));
+        assert!(formatted.contains("Second question"));
+        assert!(formatted.contains("Third question"));
+
+        app.input = "/history".into();
+        app.submit_prompt();
+        assert!(app.history.last().unwrap().output.contains("2 turns"));
+
+        app.input = "/pop".into();
+        app.submit_prompt();
+        assert_eq!(app.chat_history.len(), 2);
+        assert!(app
+            .history
+            .last()
+            .unwrap()
+            .output
+            .contains("1 turn remaining"));
+
+        app.input = "/clear".into();
+        app.submit_prompt();
+        assert!(app.chat_history.is_empty());
     }
 }

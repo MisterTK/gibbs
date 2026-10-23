@@ -709,8 +709,8 @@ fn architecture_svg() -> String {
             736,
             272,
             "CPU executor",
-            "parity oracle",
-            "--backend cpu",
+            "NEON · i8mm · SME2",
+            "CUDA · ROCm · XLA · TSU",
             Kind::Optional,
         ),
         (
@@ -725,8 +725,8 @@ fn architecture_svg() -> String {
             512,
             416,
             "Scheduler",
-            "KV admission",
-            "prefill budget",
+            "Paged-Radix KV · compact",
+            "noise draft · prefill",
             Kind::Normal,
         ),
     ];

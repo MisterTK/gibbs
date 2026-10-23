@@ -1,9 +1,0 @@
-// The SD / SDXL UNet of an LDM single-file / GGUF checkpoint (`model.diffusion_model.*` via the
-// `ldm` names, layers_per_block 2) under its reference repo's `unet/config.json`; the other
-// components' tensors and the training buffers are ignored.
-{
-  family: "ldm_unet",
-  extends: "sd",
-  use_lib: ["unet", "ldm"],
-  "ignore+": ["first_stage_model.*", "cond_stage_model.*", "conditioner.*", "denoiser.*"],
-}

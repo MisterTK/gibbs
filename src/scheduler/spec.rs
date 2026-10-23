@@ -10,8 +10,9 @@
 
 use super::{recent, ExecutableModel, NO_STATE};
 use crate::model::native::SeqState;
-use crate::runtime::sched::Rng;
 use crate::runtime::lm::nucleus;
+use crate::runtime::noise_draft::{DraftKnobs, DraftMode};
+use crate::runtime::sched::Rng;
 use std::any::Any;
 use std::sync::Arc;
 use std::time::Duration;
@@ -105,7 +106,8 @@ impl ExecutableModel {
         start: usize,
         kv: &mut Option<SeqState>,
     ) -> Result<Vec<f32>, String> {
-        self.0.forward_all(tokens, start, kv.as_mut().ok_or(NO_STATE)?)
+        self.0
+            .forward_all(tokens, start, kv.as_mut().ok_or(NO_STATE)?)
     }
 
     /// Rewinds the sequence to `len` positions.
@@ -290,10 +292,12 @@ fn draw(p: &[(u32, f32)], u: f64) -> u32 {
 /// doubles, up to [`MAX_EXPLORE`] steps, while probes lose and drops to [`MIN_EXPLORE`] when one
 /// wins, so a losing drafter settles at a small fraction of plain decoding's cost.
 #[derive(Default)]
-pub(super) struct KTuner {
+pub struct KTuner {
     /// Per `k`, EWMA (tokens, seconds) per step: current for the `k` being run, as of its last
     /// probe for the others.
     avg: Vec<(f64, f64)>,
+    /// Per `k`, EWMA (accepted, drafted) per step for acceptance-rate gating.
+    avg_accept: Vec<(f64, f64)>,
     /// Per `k`, the first measurement, until every `k` has a decisive one.
     sweep: Vec<Acc>,
     /// The `k` being run, once every `k` was measured.
@@ -310,6 +314,8 @@ pub(super) struct KTuner {
 struct Acc {
     steps: usize,
     tokens: usize,
+    accepted: usize,
+    drafted: usize,
     secs: f64,
 }
 
@@ -327,6 +333,11 @@ impl Acc {
         let n = self.steps.max(1) as f64;
         (self.tokens as f64 / n, self.secs / n)
     }
+
+    fn accept_per_step(&self) -> (f64, f64) {
+        let n = self.steps.max(1) as f64;
+        (self.accepted as f64 / n, self.drafted as f64 / n)
+    }
 }
 
 struct Probe {
@@ -335,7 +346,6 @@ struct Probe {
     calls: usize,
     acc: Acc,
 }
-
 const MIN_EXPLORE: usize = 16;
 const MAX_EXPLORE: usize = 512;
 /// Recorded steps that make a measurement of plain decoding, and of a drafting `k`
@@ -351,10 +361,23 @@ const DRAFT_MORE_MARGIN: f64 = 0.05;
 
 impl KTuner {
     /// The `k` for the next step of a drafter that drafts at most `max_k`.
-    pub(super) fn choose(&mut self, max_k: usize) -> usize {
+    pub fn choose(&mut self, max_k: usize) -> usize {
+        self.choose_with_knobs(max_k, &DraftKnobs::default())
+    }
+
+    /// Multi-objective `k` selection respecting live [`DraftKnobs`].
+    pub fn choose_with_knobs(&mut self, max_k: usize, knobs: &DraftKnobs) -> usize {
+        if knobs.mode == DraftMode::Off {
+            return 0;
+        }
+        let max_k = max_k.min(knobs.max_k);
+        if max_k == 0 {
+            return 0;
+        }
         if self.avg.len() != max_k + 1 {
             *self = Self {
                 avg: vec![(0.0, 0.0); max_k + 1],
+                avg_accept: vec![(0.0, 0.0); max_k + 1],
                 sweep: vec![Acc::default(); max_k + 1],
                 every: MIN_EXPLORE,
                 ..Self::default()
@@ -367,8 +390,9 @@ impl KTuner {
                 .find(|&k| !self.sweep[k].decisive(k))
                 .unwrap_or(0);
         };
+        let cur = cur.min(max_k);
         if let Some(p) = &mut self.probe {
-            if p.calls > 0 {
+            if p.calls > 0 && p.k <= max_k {
                 p.calls -= 1;
                 return p.k;
             }
@@ -380,7 +404,8 @@ impl KTuner {
         }
         self.since = 0;
         self.turn += 1;
-        let best_drafting = (1..=max_k).max_by(|&a, &b| self.rate(a).total_cmp(&self.rate(b)));
+        let best_drafting =
+            (1..=max_k).max_by(|&a, &b| self.score(a, knobs).total_cmp(&self.score(b, knobs)));
         let options = if cur == 0 {
             [best_drafting, None, None]
         } else {
@@ -401,10 +426,33 @@ impl KTuner {
         k
     }
 
-    /// Records a step of `k` that emitted `tokens` in `took`. Callers skip steps whose drafter
-    /// first caught up on rows it missed (`Step::synced` false). Returns a log line when plain
-    /// decoding starts or stops beating speculation.
-    pub(super) fn record(&mut self, k: usize, tokens: usize, took: Duration) -> Option<String> {
+    /// Records a step of `k` that emitted `tokens` in `took` with default knobs.
+    pub fn record(&mut self, k: usize, tokens: usize, took: Duration) -> Option<String> {
+        let accepted = tokens.saturating_sub(1);
+        self.record_with_knobs(
+            k,
+            tokens,
+            k,
+            accepted,
+            took,
+            &DraftKnobs {
+                cost_weight: 0.0,
+                ..DraftKnobs::default()
+            },
+        )
+    }
+
+    /// Records a step of `k` that drafted `drafted`, accepted `accepted`, and emitted `tokens` in
+    /// `took`, scoring candidates under `knobs`.
+    pub fn record_with_knobs(
+        &mut self,
+        k: usize,
+        tokens: usize,
+        drafted: usize,
+        accepted: usize,
+        took: Duration,
+        knobs: &DraftKnobs,
+    ) -> Option<String> {
         let secs = took.as_secs_f64().max(1e-9);
         let before = self.cur;
         match (self.cur, self.probe.as_mut()) {
@@ -412,28 +460,36 @@ impl KTuner {
                 let a = self.sweep.get_mut(k)?;
                 a.steps += 1;
                 a.tokens += tokens;
+                a.accepted += accepted;
+                a.drafted += drafted;
                 a.secs += secs;
                 self.avg[k] = a.per_step();
+                self.avg_accept[k] = a.accept_per_step();
                 if self.sweep.iter().enumerate().all(|(k, a)| a.decisive(k)) {
-                    self.cur = self.fastest();
+                    self.cur = self.fastest_for(knobs);
                 }
             }
             (Some(cur), Some(p)) if p.k == k && k != cur => {
                 p.acc.steps += 1;
                 p.acc.tokens += tokens;
+                p.acc.accepted += accepted;
+                p.acc.drafted += drafted;
                 p.acc.secs += secs;
                 let acc = p.acc;
-                // Drafting more also spends more CPU: it has to win clearly, not by noise.
+                // Drafting more also spends more compute: it has to win clearly, not by noise.
                 let margin = if k > cur {
                     1.0 + DRAFT_MORE_MARGIN
                 } else {
                     1.0
                 };
                 let (t, s) = acc.per_step();
-                let won = t / s > self.rate(cur) * margin;
+                let (ac, dr) = acc.accept_per_step();
+                let probe_score = Self::compute_score(k, t, s, ac, dr, knobs);
+                let won = probe_score > self.score(cur, knobs) * margin;
                 // A loss ends the probe early (that only backs off); a win needs a decisive run.
                 if acc.steps >= PLAIN_STEPS && (!won || acc.decisive(k)) {
                     self.avg[k] = (t, s);
+                    self.avg_accept[k] = (ac, dr);
                     self.probe = None;
                     self.every = if won {
                         self.cur = Some(k);
@@ -447,6 +503,10 @@ impl KTuner {
                 let (t, s) = self.avg.get_mut(k)?;
                 *t = 0.8 * *t + 0.2 * tokens as f64;
                 *s = 0.8 * *s + 0.2 * secs;
+                if let Some((ac, dr)) = self.avg_accept.get_mut(k) {
+                    *ac = 0.8 * *ac + 0.2 * accepted as f64;
+                    *dr = 0.8 * *dr + 0.2 * drafted as f64;
+                }
             }
         }
         let rates = (0..self.avg.len())
@@ -465,8 +525,10 @@ impl KTuner {
     }
 
     /// Tokens per second of `k`: EWMA tokens per step over EWMA seconds per step.
-    fn rate(&self, k: usize) -> f64 {
-        let (t, s) = self.avg[k];
+    pub fn rate(&self, k: usize) -> f64 {
+        let Some(&(t, s)) = self.avg.get(k) else {
+            return 0.0;
+        };
         if s > 0.0 {
             t / s
         } else {
@@ -474,13 +536,69 @@ impl KTuner {
         }
     }
 
-    fn fastest(&self) -> Option<usize> {
-        (0..self.avg.len()).max_by(|&a, &b| self.rate(a).total_cmp(&self.rate(b)))
+    /// Measured acceptance rate `accepted / drafted` at `k` (`1.0` for `k == 0`).
+    pub fn acceptance_rate(&self, k: usize) -> f64 {
+        if k == 0 {
+            return 1.0;
+        }
+        let Some(&(ac, dr)) = self.avg_accept.get(k) else {
+            return 0.0;
+        };
+        if dr > 0.0 {
+            (ac / dr).clamp(0.0, 1.0)
+        } else {
+            0.0
+        }
+    }
+
+    fn compute_score(k: usize, t: f64, s: f64, ac: f64, dr: f64, knobs: &DraftKnobs) -> f64 {
+        if s <= 0.0 {
+            return 0.0;
+        }
+        let raw = t / s;
+        if k == 0 || knobs.cost_weight <= 1e-5 {
+            return raw;
+        }
+        let cw = (knobs.cost_weight as f64).clamp(0.0, 1.0);
+        let acc = if dr > 0.0 {
+            (ac / dr).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let target = (knobs.target_acceptance as f64).clamp(0.10, 0.98);
+        let acc_factor = if acc >= target {
+            1.0
+        } else {
+            (acc / target).clamp(0.15, 1.0).powf(cw * 1.5)
+        };
+        // Penalize verify waste when extra drafted tokens are rejected.
+        let verify_eff = (t / (1.0 + k as f64 * 0.15 * cw)).max(0.1);
+        raw * acc_factor * (1.0 - 0.15 * cw + 0.15 * cw * verify_eff.min(2.0))
+    }
+
+    /// Multi-objective score of `k` under `knobs`.
+    pub fn score(&self, k: usize, knobs: &DraftKnobs) -> f64 {
+        let Some(&(t, s)) = self.avg.get(k) else {
+            return 0.0;
+        };
+        let (ac, dr) = self.avg_accept.get(k).copied().unwrap_or((0.0, 0.0));
+        Self::compute_score(k, t, s, ac, dr, knobs)
+    }
+
+    fn fastest_for(&self, knobs: &DraftKnobs) -> Option<usize> {
+        (0..self.avg.len()).max_by(|&a, &b| self.score(a, knobs).total_cmp(&self.score(b, knobs)))
     }
 
     /// The `k` being run; `None` until every `k` was measured.
-    pub(super) fn best(&self) -> Option<usize> {
+    pub fn best(&self) -> Option<usize> {
         self.cur
+    }
+
+    /// Summary `(k, tok_per_sec, accept_rate)` for each measured `k`.
+    pub fn rates_summary(&self) -> Vec<(usize, f64, f64)> {
+        (0..self.avg.len())
+            .map(|k| (k, self.rate(k), self.acceptance_rate(k)))
+            .collect()
     }
 }
 

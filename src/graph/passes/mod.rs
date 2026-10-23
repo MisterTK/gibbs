@@ -11,8 +11,11 @@ use crate::graph::{Graph, Weights};
 /// Runs all canonical graph optimization passes on `graph` and its `weights`.
 pub fn run_optimization_passes(
     graph: &mut Graph,
-    weights: Option<&mut Weights>,
+    mut weights: Option<&mut Weights>,
 ) -> Result<(), String> {
+    if let Some(w) = weights.as_deref_mut() {
+        canonical::fold_scales_and_gains(graph, w);
+    }
     prefuse(graph);
     fuse(graph, weights)
 }
@@ -85,7 +88,15 @@ mod tests {
             vec![1, 64],
             DType::F32,
         );
-        let res1 = g.add("res1", Op::Binary { kind: crate::graph::BinaryKind::Add }, &[out_proj, in_x], vec![1, 64], DType::F32);
+        let res1 = g.add(
+            "res1",
+            Op::Binary {
+                kind: crate::graph::BinaryKind::Add,
+            },
+            &[out_proj, in_x],
+            vec![1, 64],
+            DType::F32,
+        );
 
         let g_ff = g.weight("g_ff", vec![64], DType::F32);
         let norm2 = g.add(
@@ -110,7 +121,15 @@ mod tests {
 
         let w_down = g.weight("w_down", vec![64, 128], DType::F32);
         let down = g.add("down", Op::Linear, &[mlp, w_down], vec![1, 64], DType::F32);
-        let res2 = g.add("res2", Op::Binary { kind: crate::graph::BinaryKind::Add }, &[down, res1], vec![1, 64], DType::F32);
+        let res2 = g.add(
+            "res2",
+            Op::Binary {
+                kind: crate::graph::BinaryKind::Add,
+            },
+            &[down, res1],
+            vec![1, 64],
+            DType::F32,
+        );
         g.output(res2);
 
         let mut weights = Weights::new();

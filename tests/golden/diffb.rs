@@ -5,11 +5,11 @@
 //! Metal program on `Device::Metal`.
 
 use crate::util::*;
-use gibbs_engine::hardware::Device;
-use serde_json::{json, Value};
 use gibbs_engine::arch::expr::Val;
 use gibbs_engine::graph::Tensor;
+use gibbs_engine::hardware::Device;
 use gibbs_engine::runtime::diffusion::{unconsumed, Net};
+use serde_json::{json, Value};
 
 type Spec = Vec<(String, Vec<usize>)>;
 
@@ -121,7 +121,11 @@ fn pack2x2(lat: &[f32], c: usize, h: usize, w: usize, unpack: bool) -> Vec<f32> 
                     for px in 0..2 {
                         let p = ((i * (w / 2) + j) * c + ch) * 4 + py * 2 + px;
                         let u = (ch * h + 2 * i + py) * w + 2 * j + px;
-                        if unpack { out[u] = lat[p] } else { out[p] = lat[u] }
+                        if unpack {
+                            out[u] = lat[p]
+                        } else {
+                            out[p] = lat[u]
+                        }
                     }
                 }
             }
@@ -137,8 +141,16 @@ fn assert_consumed(r: &Runner) {
 }
 
 /// Output `out` of `component` (f32).
-fn run1(r: &mut Runner, component: &str, vars: &[(&str, Val)], ins: Vec<Tensor>, out: &str) -> Vec<f32> {
-    let mut o = r.run(component, vars, ins).unwrap_or_else(|e| panic!("{e}"));
+fn run1(
+    r: &mut Runner,
+    component: &str,
+    vars: &[(&str, Val)],
+    ins: Vec<Tensor>,
+    out: &str,
+) -> Vec<f32> {
+    let mut o = r
+        .run(component, vars, ins)
+        .unwrap_or_else(|e| panic!("{e}"));
     match o.remove(out) {
         Some(F32(v)) => v,
         other => panic!("output `{out}`: {other:?}"),
@@ -167,7 +179,13 @@ fn zimage_fixture(case: &str) -> std::path::PathBuf {
         for i in 0..2 {
             let p = format!("{fam}.{i}");
             if modulated {
-                lin(&mut s, &format!("{p}.adaLN_modulation.0"), 4 * DIM, ADA, true);
+                lin(
+                    &mut s,
+                    &format!("{p}.adaLN_modulation.0"),
+                    4 * DIM,
+                    ADA,
+                    true,
+                );
             }
             for n in ["to_q", "to_k", "to_v", "to_out.0"] {
                 lin(&mut s, &format!("{p}.attention.{n}"), DIM, DIM, false);
@@ -192,11 +210,20 @@ fn zimage_fixture(case: &str) -> std::path::PathBuf {
     lin(&mut s, "all_x_embedder.2-1", DIM, 4 * IN, true);
     sp(&mut s, "cap_embedder.0.weight", &[CAP]);
     lin(&mut s, "cap_embedder.1", DIM, CAP, true);
-    lin(&mut s, "all_final_layer.2-1.adaLN_modulation.1", DIM, ADA, true);
+    lin(
+        &mut s,
+        "all_final_layer.2-1.adaLN_modulation.1",
+        DIM,
+        ADA,
+        true,
+    );
     lin(&mut s, "all_final_layer.2-1.linear", 4 * IN, DIM, true);
     sp(&mut s, "x_pad_token", &[1, DIM]);
     sp(&mut s, "cap_pad_token", &[1, DIM]);
-    write_st(&dir.join("diffusion_pytorch_model.safetensors"), &synth(1, &s));
+    write_st(
+        &dir.join("diffusion_pytorch_model.safetensors"),
+        &synth(1, &s),
+    );
     write_json(
         &dir.join("config.json"),
         &json!({
@@ -251,18 +278,42 @@ fn write_qwen_image_v1(dir: &std::path::Path) -> Value {
     lin(&mut s, "img_in", D, IN, true);
     sp(&mut s, "txt_norm.weight", &[TW]);
     lin(&mut s, "txt_in", D, TW, true);
-    lin(&mut s, "time_text_embed.timestep_embedder.linear_1", D, 256, true);
-    lin(&mut s, "time_text_embed.timestep_embedder.linear_2", D, D, true);
+    lin(
+        &mut s,
+        "time_text_embed.timestep_embedder.linear_1",
+        D,
+        256,
+        true,
+    );
+    lin(
+        &mut s,
+        "time_text_embed.timestep_embedder.linear_2",
+        D,
+        D,
+        true,
+    );
     for i in 0..2 {
         let p = format!("transformer_blocks.{i}");
         for (m, q, k, v, nq, nk, o, mlp) in [
             (
-                "img_mod.1", "attn.to_q", "attn.to_k", "attn.to_v", "attn.norm_q", "attn.norm_k",
-                "attn.to_out.0", "img_mlp",
+                "img_mod.1",
+                "attn.to_q",
+                "attn.to_k",
+                "attn.to_v",
+                "attn.norm_q",
+                "attn.norm_k",
+                "attn.to_out.0",
+                "img_mlp",
             ),
             (
-                "txt_mod.1", "attn.add_q_proj", "attn.add_k_proj", "attn.add_v_proj",
-                "attn.norm_added_q", "attn.norm_added_k", "attn.to_add_out", "txt_mlp",
+                "txt_mod.1",
+                "attn.add_q_proj",
+                "attn.add_k_proj",
+                "attn.add_v_proj",
+                "attn.norm_added_q",
+                "attn.norm_added_k",
+                "attn.to_add_out",
+                "txt_mlp",
             ),
         ] {
             lin(&mut s, &format!("{p}.{m}"), 6 * D, D, true);
@@ -303,7 +354,13 @@ fn qwen_image_v1_run() {
         for sigma in [0.8f32, 0.15] {
             r.step = vec![("sigma".into(), Val::Num(sigma as f64))];
             let vars = [("h", num(2 * ph)), ("w", num(2 * pw)), ("nt", num(nt))];
-            let y = run1(&mut r, "denoiser", &vars, vec![F32(lat.clone()), F32(txt.clone())], "out");
+            let y = run1(
+                &mut r,
+                "denoiser",
+                &vars,
+                vec![F32(lat.clone()), F32(txt.clone())],
+                "out",
+            );
             o.f(format!("out_s{sigma}"), &y);
         }
         assert_consumed(&r);
@@ -332,8 +389,20 @@ fn qwen_image21_fixture() -> (Vec<T>, Vec<T>, Value) {
     sp(&mut s, "txt_in.text_norm.weight", &[TW]);
     lin(&mut s, "txt_in.in_layer", D, TW, false);
     lin(&mut s, "txt_in.out_layer", D, D, false);
-    lin(&mut s, "time_text_embed.timestep_embedder.linear_1", D, 256, false);
-    lin(&mut s, "time_text_embed.timestep_embedder.linear_2", D, D, false);
+    lin(
+        &mut s,
+        "time_text_embed.timestep_embedder.linear_1",
+        D,
+        256,
+        false,
+    );
+    lin(
+        &mut s,
+        "time_text_embed.timestep_embedder.linear_2",
+        D,
+        D,
+        false,
+    );
     lin(&mut s, "modulation.1", 4 * D, D, false);
     for i in 0..2 {
         let p = format!("transformer_blocks.{i}");
@@ -387,7 +456,10 @@ fn qwen_image21_run() {
         write_json(&dir.join("config.json"), &cfg);
         dir
     };
-    let dirs = [("split", load("diffb_qwen_image21", &split)), ("fused", load("diffb_qwen_image21_fused", &fused))];
+    let dirs = [
+        ("split", load("diffb_qwen_image21", &split)),
+        ("fused", load("diffb_qwen_image21_fused", &fused)),
+    ];
     let (h, w, nt) = (5usize, 7usize, 21usize);
     let lat = rnd(11, h * w * IN, 1.0);
     let txt = rnd(12, nt * TW, 1.0);
@@ -399,7 +471,13 @@ fn qwen_image21_run() {
             for sigma in [0.8f32, 0.15] {
                 r.step = vec![("sigma".into(), Val::Num(sigma as f64))];
                 let vars = [("h", num(h)), ("w", num(w)), ("nt", num(nt))];
-                let y = run1(&mut r, "denoiser", &vars, vec![F32(lat.clone()), F32(txt.clone())], "out");
+                let y = run1(
+                    &mut r,
+                    "denoiser",
+                    &vars,
+                    vec![F32(lat.clone()), F32(txt.clone())],
+                    "out",
+                );
                 o.f(format!("{name}_s{sigma}"), &y);
             }
             assert_consumed(&r);
@@ -431,31 +509,40 @@ fn krea2_fixture(case: &str) -> std::path::PathBuf {
     lin(&mut s, "last.linear", 64, dim, true);
     sp(&mut s, "last.norm.scale", &[dim]);
     sp(&mut s, "last.modulation.lin", &[2, dim]);
-    let block = |s: &mut Spec, p: String, d: usize, a: usize, kvw: usize, m: usize, modulated: bool| {
-        if modulated {
-            sp(s, format!("{p}.mod.lin"), &[6 * d]);
-        }
-        for (n, sh) in [
-            ("attn.wq.weight", vec![a, d]),
-            ("attn.wk.weight", vec![kvw, d]),
-            ("attn.wv.weight", vec![kvw, d]),
-            ("attn.gate.weight", vec![d, d]),
-            ("attn.wo.weight", vec![d, a]),
-            ("attn.qknorm.qnorm.scale", vec![hd]),
-            ("attn.qknorm.knorm.scale", vec![hd]),
-            ("prenorm.scale", vec![d]),
-            ("postnorm.scale", vec![d]),
-            ("mlp.gate.weight", vec![m, d]),
-            ("mlp.up.weight", vec![m, d]),
-            ("mlp.down.weight", vec![d, m]),
-        ] {
-            sp(s, format!("{p}.{n}"), &sh);
-        }
-    };
+    let block =
+        |s: &mut Spec, p: String, d: usize, a: usize, kvw: usize, m: usize, modulated: bool| {
+            if modulated {
+                sp(s, format!("{p}.mod.lin"), &[6 * d]);
+            }
+            for (n, sh) in [
+                ("attn.wq.weight", vec![a, d]),
+                ("attn.wk.weight", vec![kvw, d]),
+                ("attn.wv.weight", vec![kvw, d]),
+                ("attn.gate.weight", vec![d, d]),
+                ("attn.wo.weight", vec![d, a]),
+                ("attn.qknorm.qnorm.scale", vec![hd]),
+                ("attn.qknorm.knorm.scale", vec![hd]),
+                ("prenorm.scale", vec![d]),
+                ("postnorm.scale", vec![d]),
+                ("mlp.gate.weight", vec![m, d]),
+                ("mlp.up.weight", vec![m, d]),
+                ("mlp.down.weight", vec![d, m]),
+            ] {
+                sp(s, format!("{p}.{n}"), &sh);
+            }
+        };
     for i in 0..2 {
         block(&mut s, format!("blocks.{i}"), dim, dim, kv, mlp, true);
         for kind in ["layerwise_blocks", "refiner_blocks"] {
-            block(&mut s, format!("txtfusion.{kind}.{i}"), td, td, td / 2, tmlp, false);
+            block(
+                &mut s,
+                format!("txtfusion.{kind}.{i}"),
+                td,
+                td,
+                td / 2,
+                tmlp,
+                false,
+            );
         }
     }
     let file = dir.join("krea2_tiny.safetensors");
@@ -475,13 +562,24 @@ fn krea2_run() {
         let mut o = Out::default();
         let mut r = spec_runner(&dir, "krea2_tiny.safetensors", Some("krea2"), dev);
         // Taps stacked per token, layer-minor (the runtime's context layout).
-        let stacked: Vec<f32> = (0..n).flat_map(|t| taps.iter().flat_map(move |l| l[t * td..][..td].iter().copied())).collect();
+        let stacked: Vec<f32> = (0..n)
+            .flat_map(|t| {
+                taps.iter()
+                    .flat_map(move |l| l[t * td..][..td].iter().copied())
+            })
+            .collect();
         let ctx = run1(&mut r, "fuse", &[("nt", num(n))], vec![F32(stacked)], "out");
         o.f("fuse", &ctx);
         for sigma in [0.8f32, 0.3] {
             r.step = vec![("sigma".into(), Val::Num(sigma as f64))];
             let vars = [("h", num(h)), ("w", num(w)), ("nt", num(n))];
-            let y = run1(&mut r, "denoiser", &vars, vec![F32(pack2x2(&lat, 16, h, w, false)), F32(ctx.clone())], "out");
+            let y = run1(
+                &mut r,
+                "denoiser",
+                &vars,
+                vec![F32(pack2x2(&lat, 16, h, w, false)), F32(ctx.clone())],
+                "out",
+            );
             o.f(format!("forward_s{sigma}"), &pack2x2(&y, 16, h, w, true));
         }
         assert_consumed(&r);
@@ -500,8 +598,20 @@ fn ltx() {
     let dir = fixture_dir("diffb_ltx");
     let mut s = Spec::new();
     lin(&mut s, "patchify_proj", D, LATENT, true);
-    lin(&mut s, "adaln_single.emb.timestep_embedder.linear_1", D, 256, true);
-    lin(&mut s, "adaln_single.emb.timestep_embedder.linear_2", D, D, true);
+    lin(
+        &mut s,
+        "adaln_single.emb.timestep_embedder.linear_1",
+        D,
+        256,
+        true,
+    );
+    lin(
+        &mut s,
+        "adaln_single.emb.timestep_embedder.linear_2",
+        D,
+        D,
+        true,
+    );
     lin(&mut s, "adaln_single.linear", 6 * D, D, true);
     lin(&mut s, "caption_projection.linear_1", D, TI, true);
     lin(&mut s, "caption_projection.linear_2", D, D, true);
@@ -537,9 +647,24 @@ fn ltx() {
         let net = spec_net(&dir, "ltxv_tiny.safetensors", "ltx", "denoiser", dev);
         let mut o = Out::default();
         for (t, clean) in [(700.0f32, 0usize), (350.0, 5), (700.0, n)] {
-            let vars = [("frames", f), ("h", h), ("w", w), ("nt", nt), ("clean", clean)].map(|(k, v)| (k, Val::Num(v as f64)));
-            let given = [("x", Tensor::F32(x.clone())), ("context", Tensor::F32(raw.clone()))];
-            o.f(format!("t{t}_clean{clean}"), &sub(&net.run_one(&vars, &given, &[("t", t as f64)], None).unwrap()));
+            let vars = [
+                ("frames", f),
+                ("h", h),
+                ("w", w),
+                ("nt", nt),
+                ("clean", clean),
+            ]
+            .map(|(k, v)| (k, Val::Num(v as f64)));
+            let given = [
+                ("x", Tensor::F32(x.clone())),
+                ("context", Tensor::F32(raw.clone())),
+            ];
+            o.f(
+                format!("t{t}_clean{clean}"),
+                &sub(&net
+                    .run_one(&vars, &given, &[("t", t as f64)], None)
+                    .unwrap()),
+            );
         }
         assert!(unconsumed(&net.model, &[&net], &[]).is_empty());
         o
@@ -555,7 +680,12 @@ fn qwen_vae() {
 
 /// Qwen-Image VAE decoder (original Wan names) `qwen_image_vae.safetensors` + config in `dir`, widths
 /// `base * mult`, `z` latent channels; returns the latent (mean, std).
-fn write_qwen_vae(dir: &std::path::Path, base: usize, mult: [usize; 4], z: usize) -> (Vec<f32>, Vec<f32>) {
+fn write_qwen_vae(
+    dir: &std::path::Path,
+    base: usize,
+    mult: [usize; 4],
+    z: usize,
+) -> (Vec<f32>, Vec<f32>) {
     let conv = |s: &mut Spec, p: &str, i: usize, o: usize, k: usize| {
         sp(s, format!("{p}.weight"), &[o, i, k, k]);
         sp(s, format!("{p}.bias"), &[o]);
@@ -620,7 +750,13 @@ fn qwen_vae_run() {
     // runner: arch::testing::Runner, spec `qwen_vae` component `decoder`
     frozen("diffb_qwen_vae", TOL, |dev| {
         let mut r = spec_runner(&dir, "qwen_image_vae.safetensors", None, dev);
-        let y = run1(&mut r, "decoder", &[("h", num(h)), ("w", num(w))], vec![F32(z.clone())], "image");
+        let y = run1(
+            &mut r,
+            "decoder",
+            &[("h", num(h)), ("w", num(w))],
+            vec![F32(z.clone())],
+            "image",
+        );
         assert_consumed(&r);
         let mut o = Out::default();
         o.f("decode_3x2", &sub(&y));
@@ -638,7 +774,13 @@ fn qwen_vae21() {
 /// Qwen-Image 2.1 VAE decoder (diffusers names, residual, unpatched) in `dir`: widths
 /// `base * mult`, `zc` latent channels, `temporal` flags (one per downsampling level); returns the
 /// latent (mean, std).
-fn write_qwen_vae21(dir: &std::path::Path, mult: &[usize], base: usize, zc: usize, temporal: &[bool]) -> (Vec<f32>, Vec<f32>) {
+fn write_qwen_vae21(
+    dir: &std::path::Path,
+    mult: &[usize],
+    base: usize,
+    zc: usize,
+    temporal: &[bool],
+) -> (Vec<f32>, Vec<f32>) {
     let conv = |s: &mut Spec, p: &str, i: usize, o: usize, k: usize| {
         sp(s, format!("{p}.weight"), &[o, i, k, k]);
         sp(s, format!("{p}.bias"), &[o]);
@@ -672,12 +814,21 @@ fn write_qwen_vae21(dir: &std::path::Path, mult: &[usize], base: usize, zc: usiz
             res(&mut s, &format!("{p}.resnets.{j}"), cin, io[1]);
         }
         if i + 1 != mult.len() {
-            conv(&mut s, &format!("{p}.upsampler.resample.1"), io[1], io[1], 3);
+            conv(
+                &mut s,
+                &format!("{p}.upsampler.resample.1"),
+                io[1],
+                io[1],
+                3,
+            );
         }
     }
     sp(&mut s, "decoder.norm_out.gamma", &[dims[mult.len()]]);
     conv(&mut s, "decoder.conv_out", dims[mult.len()], 4, 3);
-    write_st(&dir.join("diffusion_pytorch_model.safetensors"), &synth(7, &s));
+    write_st(
+        &dir.join("diffusion_pytorch_model.safetensors"),
+        &synth(7, &s),
+    );
     let (mean, std) = stats(70, zc);
     write_json(
         &dir.join("config.json"),
@@ -699,8 +850,19 @@ fn qwen_vae21_run() {
     let z = denorm(&rnd(14, zc * h * w, 1.0), h * w, &mean, &std);
     // runner: arch::testing::Runner, spec `qwen_vae21` component `decoder`
     frozen("diffb_qwen_vae21", TOL, |dev| {
-        let mut r = spec_runner(&dir, "diffusion_pytorch_model.safetensors", Some("qwen_vae21"), dev);
-        let y = run1(&mut r, "decoder", &[("h", num(h)), ("w", num(w))], vec![F32(z.clone())], "image");
+        let mut r = spec_runner(
+            &dir,
+            "diffusion_pytorch_model.safetensors",
+            Some("qwen_vae21"),
+            dev,
+        );
+        let y = run1(
+            &mut r,
+            "decoder",
+            &[("h", num(h)), ("w", num(w))],
+            vec![F32(z.clone())],
+            "image",
+        );
         assert_consumed(&r);
         assert_eq!(y.len(), 4 * (8 * h) * (8 * w)); // RGBA; 3 upsamplers in this tiny config
         let mut o = Out::default();
@@ -747,7 +909,12 @@ fn ltx_vae() {
     let mut s = Spec::new();
     conv(&mut s, "decoder.conv_in", cfg.latent, rev[0], 3);
     for j in 0..l[0] {
-        res(&mut s, &format!("decoder.mid_block.resnets.{j}"), rev[0], rev[0]);
+        res(
+            &mut s,
+            &format!("decoder.mid_block.resnets.{j}"),
+            rev[0],
+            rev[0],
+        );
     }
     let mut cin = rev[0];
     for i in 0..4 {
@@ -764,7 +931,13 @@ fn ltx_vae() {
         }
         cin = cout;
     }
-    conv(&mut s, "decoder.conv_out", cfg.ch[0], 3 * cfg.patch * cfg.patch, 3);
+    conv(
+        &mut s,
+        "decoder.conv_out",
+        cfg.ch[0],
+        3 * cfg.patch * cfg.patch,
+        3,
+    );
     sp(&mut s, "latents_mean", &[cfg.latent]);
     sp(&mut s, "latents_std", &[cfg.latent]);
     let mut t = synth(8, &s);
@@ -795,10 +968,18 @@ fn ltx_vae() {
     let _ = (&mean, &std);
     // runner: gibbs_engine::runtime::diffusion::Net (spec `ltx_vae`, net `decoder`, patchified output `y`).
     golden("diffb_ltx_vae", TOL, |dev| {
-        let net = spec_net(&dir, "diffusion_pytorch_model.safetensors", "ltx_vae", "decoder", dev);
+        let net = spec_net(
+            &dir,
+            "diffusion_pytorch_model.safetensors",
+            "ltx_vae",
+            "decoder",
+            dev,
+        );
         let num = |v: usize| Val::Num(v as f64);
         let vars = [("frames", num(f)), ("h", num(h)), ("w", num(w))];
-        let y = net.run_one(&vars, &[("z", Tensor::F32(z.clone()))], &[], Some("y")).unwrap();
+        let y = net
+            .run_one(&vars, &[("z", Tensor::F32(z.clone()))], &[], Some("y"))
+            .unwrap();
         assert_eq!(y.len(), 9 * 12 * 8 * h * 8 * w);
         let mut o = Out::default();
         o.f("decode_2x2x3", &sub(&y));
@@ -851,7 +1032,13 @@ fn write_unet3d(dir: &std::path::Path, ctx_dim: usize) {
         let r = format!("{base}.resnets.{j}");
         s_norm(s, &format!("{r}.norm1"), ci);
         s_conv(s, &format!("{r}.conv1"), ci, co, 3);
-        s_lin(s, &format!("{r}.time_emb_proj"), 4 * cfg.block_out[0], co, true);
+        s_lin(
+            s,
+            &format!("{r}.time_emb_proj"),
+            4 * cfg.block_out[0],
+            co,
+            true,
+        );
         s_norm(s, &format!("{r}.norm2"), co);
         s_conv(s, &format!("{r}.conv2"), co, co, 3);
         if ci != co {
@@ -879,7 +1066,14 @@ fn write_unet3d(dir: &std::path::Path, ctx_dim: usize) {
     for (i, &out) in bo.iter().enumerate() {
         let base = format!("down_blocks.{i}");
         for j in 0..2 {
-            s_layer(&mut s, &base, j, if j == 0 { ch } else { out }, out, i < top);
+            s_layer(
+                &mut s,
+                &base,
+                j,
+                if j == 0 { ch } else { out },
+                out,
+                i < top,
+            );
         }
         if i < top {
             s_conv(&mut s, &format!("{base}.downsamplers.0.conv"), out, out, 3);
@@ -938,13 +1132,31 @@ fn unet3d() {
     let ctx = rnd(17, ctx_len * ctx_dim, 1.0);
     // runner: gibbs_engine::runtime::diffusion::Net (spec `modelscope_t2v`, net `denoiser`).
     golden("diffb_unet3d", TOL, |dev| {
-        let net = spec_net(&dir, "diffusion_pytorch_model.safetensors", "modelscope_t2v", "denoiser", dev);
+        let net = spec_net(
+            &dir,
+            "diffusion_pytorch_model.safetensors",
+            "modelscope_t2v",
+            "denoiser",
+            dev,
+        );
         let num = |v: usize| Val::Num(v as f64);
-        let vars = [("frames", num(frames)), ("h", num(h)), ("w", num(w)), ("nt", num(ctx_len))];
+        let vars = [
+            ("frames", num(frames)),
+            ("h", num(h)),
+            ("w", num(w)),
+            ("nt", num(ctx_len)),
+        ];
         let mut o = Out::default();
         for t in [900.0f32, 400.0] {
-            let given = [("x", Tensor::F32(x.clone())), ("context", Tensor::F32(ctx.clone()))];
-            o.f(format!("eps_t{t}"), &net.run_one(&vars, &given, &[("t", t as f64)], None).unwrap());
+            let given = [
+                ("x", Tensor::F32(x.clone())),
+                ("context", Tensor::F32(ctx.clone())),
+            ];
+            o.f(
+                format!("eps_t{t}"),
+                &net.run_one(&vars, &given, &[("t", t as f64)], None)
+                    .unwrap(),
+            );
         }
         assert!(unconsumed(&net.model, &[&net], &[]).is_empty());
         o
@@ -953,10 +1165,18 @@ fn unet3d() {
 
 /// Network `net` of `family` loaded from fixture `dir` (weights `weights`), placed on `dev`.
 fn spec_net(dir: &std::path::Path, weights: &str, family: &str, net: &str, dev: Device) -> Net {
-    let m = gibbs_engine::arch::load::load(&artifacts(dir, "test/spec", weights), gibbs_engine::arch::registry().unwrap(), Some(family))
-        .expect(family);
+    let m = gibbs_engine::arch::load::load(
+        &artifacts(dir, "test/spec", weights),
+        gibbs_engine::arch::registry().unwrap(),
+        Some(family),
+    )
+    .expect(family);
     gibbs_engine::arch::load::check(&m).unwrap();
-    Net::new(std::sync::Arc::new(m), net, gibbs_engine::hardware::PlacementMode::Pin(dev))
+    Net::new(
+        std::sync::Arc::new(m),
+        net,
+        gibbs_engine::hardware::PlacementMode::Pin(dev),
+    )
 }
 
 /// ModelScope text-to-video through the public video pipeline (`SpecDiffusion::generate_video`): a
@@ -987,7 +1207,9 @@ fn modelscope_pipeline() {
     crate::diffa::write_clip(&dir, "text_encoder", "tokenizer", true, false, 21);
     write_unet3d(&dir.join("unet"), 64);
     crate::diffa::write_sd_vae(&dir, &[32, 32, 32, 32]);
-    let plan = video_repo::detect(&hub, "golden/tiny-t2v", None).expect("a video repo").unwrap();
+    let plan = video_repo::detect(&hub, "golden/tiny-t2v", None)
+        .expect("a video repo")
+        .unwrap();
     assert_eq!(plan.family, "modelscope_t2v");
     let req = VideoRequest {
         prompt: "t5 t17 t200".into(),
@@ -1001,14 +1223,31 @@ fn modelscope_pipeline() {
     };
     for dev in devices() {
         let mode = gibbs_engine::hardware::PlacementMode::Pin(dev);
-        let (frames, fps, _) = video_repo::generate(&hub, &plan, mode, None, &req, None, &|_| {}).unwrap();
+        let (frames, fps, _) =
+            video_repo::generate(&hub, &plan, mode, None, &req, None, &|_| {}).unwrap();
         assert_eq!((frames.len(), fps), (16, 8));
-        assert!(frames.iter().all(|f| (f.width, f.height, f.data.len()) == (64, 64, 64 * 64 * 3)));
-        assert!(frames[0].data.iter().any(|&v| v != frames[0].data[0]), "{dev:?}: flat frame");
+        assert!(frames
+            .iter()
+            .all(|f| (f.width, f.height, f.data.len()) == (64, 64, 64 * 64 * 3)));
+        assert!(
+            frames[0].data.iter().any(|&v| v != frames[0].data[0]),
+            "{dev:?}: flat frame"
+        );
         let p = video_repo::load(&hub, &plan, mode, None).unwrap();
-        let e = p.generate_video(&VideoRequest { frames: Some(8), ..req.clone() }, None, &|_| {}).unwrap_err();
+        let e = p
+            .generate_video(
+                &VideoRequest {
+                    frames: Some(8),
+                    ..req.clone()
+                },
+                None,
+                &|_| {},
+            )
+            .unwrap_err();
         assert!(e.contains("16..=24"), "{e}");
-        let e = p.generate_video(&req, Some(&frames[0]), &|_| {}).unwrap_err();
+        let e = p
+            .generate_video(&req, Some(&frames[0]), &|_| {})
+            .unwrap_err();
         assert!(e.contains("does not take an input image"), "{e}");
     }
 }
@@ -1035,10 +1274,19 @@ fn qwen_image21_real_gguf_spec() {
         "/Users/keas/code/rust-inference-server/disk/models--abenzerps--Qwen-Image-2.1-Uncensored-GGUF/snapshots/main/qwen-image-2.1-UC-Q4_0.gguf".into()
     }));
     let want: Vec<f32> = serde_json::from_str(
-        &std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/golden/diffb_qwen_image21_real.json")).unwrap(),
+        &std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/golden/diffb_qwen_image21_real.json"
+        ))
+        .unwrap(),
     )
     .unwrap();
-    let mut r = spec_runner(path.parent().unwrap(), path.file_name().unwrap().to_str().unwrap(), Some("qwen_image21"), Device::Metal);
+    let mut r = spec_runner(
+        path.parent().unwrap(),
+        path.file_name().unwrap().to_str().unwrap(),
+        Some("qwen_image21"),
+        Device::Metal,
+    );
     let var = |r: &Runner, k: &str| r.model.env.var(k).unwrap().usize().unwrap();
     let (in_ch, tw) = (var(&r, "in_ch"), var(&r, "text_width"));
     let (h, w, nt) = (4usize, 4usize, 12usize);
@@ -1047,7 +1295,10 @@ fn qwen_image21_real_gguf_spec() {
         &mut r,
         "denoiser",
         &[("h", num(h)), ("w", num(w)), ("nt", num(nt))],
-        vec![F32(rand(h * w * in_ch, 21, 1.0)), F32(rand(nt * tw, 22, 1.0))],
+        vec![
+            F32(rand(h * w * in_ch, 21, 1.0)),
+            F32(rand(nt * tw, 22, 1.0)),
+        ],
         "out",
     );
     let (e, c) = gibbs_engine::arch::testing::compare(&got, &want);
@@ -1091,7 +1342,12 @@ fn qwen2_5_vl_text_run() {
     let ids: Vec<u32> = (0..11).map(|i| (i * 7 + 3) % v as u32).collect();
     // runner: arch::testing::Runner, spec `qwen2_5_vl_text` component `text` (head `hidden`)
     frozen("diffb_qwen2_5_vl_text", TOL, |dev| {
-        let mut r = spec_runner(&dir, "model.safetensors", Some("qwen2_5_vl_text"), dev);
+        let mut r = spec_runner(
+            &dir,
+            "model.safetensors",
+            Some("qwen_image.text_encoder"),
+            dev,
+        );
         let y = r.lm(&ids, 0, "hidden", "hidden", vec![]);
         assert_consumed(&r);
         let mut o = Out::default();
@@ -1106,7 +1362,9 @@ fn qwen2_5_vl_text_run() {
 fn dit_runtimes_parse() {
     let reg = gibbs_engine::arch::registry().unwrap();
     for f in ["zimage", "qwen_image", "qwen_image21", "krea2"] {
-        let spec = reg.spec(f, &Default::default()).unwrap_or_else(|e| panic!("{f}: {e}"));
+        let spec = reg
+            .spec(f, &Default::default())
+            .unwrap_or_else(|e| panic!("{f}: {e}"));
         spec.runtime_as::<gibbs_engine::runtime::diffusion::Runtime>()
             .unwrap_or_else(|e| panic!("{f}: {e}"));
     }
@@ -1135,8 +1393,16 @@ fn krea2_spec_lora() {
     };
     let pair = |m: &str, up: f32| -> Vec<T> {
         vec![
-            (format!("diffusion_model.{m}.lora_down.weight"), vec![4, 64], rnd(30, 4 * 64, 0.5)),
-            (format!("diffusion_model.{m}.lora_up.weight"), vec![64, 4], rnd(31, 64 * 4, up)),
+            (
+                format!("diffusion_model.{m}.lora_down.weight"),
+                vec![4, 64],
+                rnd(30, 4 * 64, 0.5),
+            ),
+            (
+                format!("diffusion_model.{m}.lora_up.weight"),
+                vec![64, 4],
+                rnd(31, 64 * 4, up),
+            ),
         ]
     };
     let forward = |l: Option<&LoraFile>| -> Vec<f32> {
@@ -1146,7 +1412,13 @@ fn krea2_spec_lora() {
         }
         r.step = vec![("sigma".into(), Val::Num(0.5))];
         let vars = [("h", num(h)), ("w", num(w)), ("nt", num(n))];
-        run1(&mut r, "denoiser", &vars, vec![F32(lat.clone()), F32(ctx.clone())], "out")
+        run1(
+            &mut r,
+            "denoiser",
+            &vars,
+            vec![F32(lat.clone()), F32(ctx.clone())],
+            "out",
+        )
     };
     let base = forward(None);
     // Parity of the low-rank pair against the old Krea 2 LoRA loader (pinned: subsampled output of
@@ -1155,15 +1427,27 @@ fn krea2_spec_lora() {
     let got = forward(Some(&pair_file));
     let pin = sub(&got).iter().step_by(64).copied().collect::<Vec<f32>>();
     let (e, c) = gibbs_engine::arch::testing::compare(&pin, &KREA2_LORA_PIN);
-    assert!(e < 1e-3 && c > 0.9999, "LoRA vs pinned old output: rel {e} cos {c}");
+    assert!(
+        e < 1e-3 && c > 0.9999,
+        "LoRA vs pinned old output: rel {e} cos {c}"
+    );
     let changed = |y: &[f32]| y.iter().zip(&base).any(|(a, b)| (a - b).abs() > 1e-4);
     assert!(changed(&got));
     let mut bias = pair("first", 0.0);
-    bias.push(("diffusion_model.first.diff_b".into(), vec![64], rnd(32, 64, 0.5)));
-    assert!(changed(&forward(Some(&lora("bias.safetensors", bias)))), "diff_b bias delta not applied");
+    bias.push((
+        "diffusion_model.first.diff_b".into(),
+        vec![64],
+        rnd(32, 64, 0.5),
+    ));
+    assert!(
+        changed(&forward(Some(&lora("bias.safetensors", bias)))),
+        "diff_b bias delta not applied"
+    );
     let stray = lora("stray.safetensors", pair("blocks.9.attn.wq", 0.5));
     let mut r = spec_runner(&dir, "krea2_tiny.safetensors", Some("krea2"), Device::Cpu);
-    let e = stray.apply(Part::Denoiser, &mut r.model, reg, 1.0).unwrap_err();
+    let e = stray
+        .apply(Part::Denoiser, &mut r.model, reg, 1.0)
+        .unwrap_err();
     assert!(e.contains("matches no weight"), "{e}");
 }
 
@@ -1178,10 +1462,19 @@ fn krea2_spec_lora() {
 fn qwen_tokenizer_json() -> Value {
     let words = "system user assistant Describe the image by detailing color shape size texture quantity text spatial relationships of objects and background Comprehend analyze provided prompt";
     let mut vocab = serde_json::Map::new();
-    for (i, w) in ["<|im_start|>", "<|im_end|>", "<unk>", "\n", ",", ":", ".", "<|endoftext|>"]
-        .into_iter()
-        .chain(words.split(' '))
-        .enumerate()
+    for (i, w) in [
+        "<|im_start|>",
+        "<|im_end|>",
+        "<unk>",
+        "\n",
+        ",",
+        ":",
+        ".",
+        "<|endoftext|>",
+    ]
+    .into_iter()
+    .chain(words.split(' '))
+    .enumerate()
     {
         vocab.insert(w.into(), json!(i));
     }
@@ -1212,7 +1505,11 @@ fn qwen_tokenizer_json() -> Value {
 /// `text_config`, interleaved M-RoPE, `model.language_model.`) or `qwen2_5_vl` (qkv biases).
 fn write_qwen_te(dir: &std::path::Path, kind: &str, hidden: usize, layers: usize, seed: u64) {
     let (heads, kv, hd, inter, vocab) = (4usize, 2usize, 16usize, 64usize, 96usize);
-    let p = if kind == "qwen3_vl" { "model.language_model" } else { "model" };
+    let p = if kind == "qwen3_vl" {
+        "model.language_model"
+    } else {
+        "model"
+    };
     let mut w = Weights::new(seed);
     w.w(format!("{p}.embed_tokens.weight"), &[vocab, hidden]);
     for l in 0..layers {
@@ -1229,7 +1526,11 @@ fn write_qwen_te(dir: &std::path::Path, kind: &str, hidden: usize, layers: usize
                 .s(format!("{a}.k_proj.bias"), &[kv * hd], 0.2)
                 .s(format!("{a}.v_proj.bias"), &[kv * hd], 0.2);
         } else {
-            w.norm(format!("{a}.q_norm.weight"), hd, 1.0).norm(format!("{a}.k_norm.weight"), hd, 1.0);
+            w.norm(format!("{a}.q_norm.weight"), hd, 1.0).norm(
+                format!("{a}.k_norm.weight"),
+                hd,
+                1.0,
+            );
         }
         w.w(format!("{lp}.mlp.gate_proj.weight"), &[inter, hidden])
             .w(format!("{lp}.mlp.up_proj.weight"), &[inter, hidden])
@@ -1272,27 +1573,42 @@ fn flow_scheduler(dir: &std::path::Path, dynamic: bool) {
 }
 
 /// Runs `req` through the public image loader on every device; pixels every k-th value.
-fn pipeline_golden(case: &str, dir: &std::path::Path, req: gibbs_engine::runtime::diffusion::ImageRequest) {
+fn pipeline_golden(
+    case: &str,
+    dir: &std::path::Path,
+    req: gibbs_engine::runtime::diffusion::ImageRequest,
+) {
     use crate::diffa::{on, pin, stride};
     use gibbs_engine::model::hub::HuggingFaceHub;
     let hub = HuggingFaceHub::with_cache_dir(dir.join("hub"));
     let art = artifacts(dir, &format!("golden/{case}"), "none");
     let (w, h) = (req.width.unwrap(), req.height.unwrap());
-    frozen(case, Tol { rel: 2e-3, cos: 0.99999 }, |dev| {
-        // runner: runtime::diffusion::load_image (the public image loader), pinned to `dev`
-        let p = gibbs_engine::runtime::diffusion::load_image(&art, &hub, pin(dev))
-            .expect("image repo")
-            .unwrap_or_else(|e| panic!("{case}: {e}"));
-        let img = on(dev, || p.text_to_image(&req)).unwrap_or_else(|e| panic!("{case}: {e}"));
-        assert_eq!((img.width, img.height), (w, h));
-        let px: Vec<f32> = img.data.iter().map(|&v| v as f32).collect();
-        let mut o = Out::default();
-        o.f("pixels", &stride(&px));
-        o
-    });
+    frozen(
+        case,
+        Tol {
+            rel: 2e-3,
+            cos: 0.99999,
+        },
+        |dev| {
+            // runner: runtime::diffusion::load_image (the public image loader), pinned to `dev`
+            let p = gibbs_engine::runtime::diffusion::load_image(&art, &hub, pin(dev))
+                .expect("image repo")
+                .unwrap_or_else(|e| panic!("{case}: {e}"));
+            let img = on(dev, || p.text_to_image(&req)).unwrap_or_else(|e| panic!("{case}: {e}"));
+            assert_eq!((img.width, img.height), (w, h));
+            let px: Vec<f32> = img.data.iter().map(|&v| v as f32).collect();
+            let mut o = Out::default();
+            o.f("pixels", &stride(&px));
+            o
+        },
+    );
 }
 
-fn request(prompt: &str, guidance: f32, seed: u64) -> gibbs_engine::runtime::diffusion::ImageRequest {
+fn request(
+    prompt: &str,
+    guidance: f32,
+    seed: u64,
+) -> gibbs_engine::runtime::diffusion::ImageRequest {
     gibbs_engine::runtime::diffusion::ImageRequest {
         prompt: prompt.into(),
         width: Some(32),
@@ -1310,9 +1626,15 @@ fn request(prompt: &str, guidance: f32, seed: u64) -> gibbs_engine::runtime::dif
 fn zimage_pipeline() {
     let case = "diffb_zimage_pipeline";
     let dir = fixture_dir(case);
-    write_json(&dir.join("model_index.json"), &json!({"_class_name": "ZImagePipeline"}));
+    write_json(
+        &dir.join("model_index.json"),
+        &json!({"_class_name": "ZImagePipeline"}),
+    );
     flow_scheduler(&dir, false);
-    write_json(&dir.join("tokenizer/tokenizer.json"), &qwen_tokenizer_json());
+    write_json(
+        &dir.join("tokenizer/tokenizer.json"),
+        &qwen_tokenizer_json(),
+    );
     write_qwen_te(&dir.join("text_encoder"), "qwen3", 48, 3, 0x5A01);
     zimage_fixture(&format!("{case}/transformer"));
     crate::diffa::write_sd_vae(&dir, &[32, 32, 32, 32]);
@@ -1325,9 +1647,15 @@ fn zimage_pipeline() {
 fn qwen_image_v1_pipeline() {
     let case = "diffb_qwen_image_v1_pipeline";
     let dir = fixture_dir(case);
-    write_json(&dir.join("model_index.json"), &json!({"_class_name": "QwenImagePipeline"}));
+    write_json(
+        &dir.join("model_index.json"),
+        &json!({"_class_name": "QwenImagePipeline"}),
+    );
     flow_scheduler(&dir, true);
-    write_json(&dir.join("tokenizer/tokenizer.json"), &qwen_tokenizer_json());
+    write_json(
+        &dir.join("tokenizer/tokenizer.json"),
+        &qwen_tokenizer_json(),
+    );
     write_qwen_te(&dir.join("text_encoder"), "qwen2_5_vl", 48, 3, 0x5A02);
     write_qwen_image_v1(&fixture_dir(&format!("{case}/transformer")));
     write_qwen_vae(&fixture_dir(&format!("{case}/vae")), 4, [1, 2, 4, 4], 16);
@@ -1346,15 +1674,27 @@ fn qwen_image21_pipeline() {
 
 /// The tiny Qwen-Image 2.1 diffusers pipeline in `dir`.
 fn write_qwen21_pipeline(dir: &std::path::Path) {
-    write_json(&dir.join("model_index.json"), &json!({"_class_name": "QwenImage21Pipeline"}));
+    write_json(
+        &dir.join("model_index.json"),
+        &json!({"_class_name": "QwenImage21Pipeline"}),
+    );
     flow_scheduler(dir, true);
-    write_json(&dir.join("processor/tokenizer.json"), &qwen_tokenizer_json());
+    write_json(
+        &dir.join("processor/tokenizer.json"),
+        &qwen_tokenizer_json(),
+    );
     write_qwen_te(&dir.join("text_encoder"), "qwen3_vl", 48, 3, 0x5A03);
     let (split, _, cfg) = qwen_image21_fixture();
     let t = dir.join("transformer");
     write_st(&t.join("diffusion_pytorch_model.safetensors"), &split);
     write_json(&t.join("config.json"), &cfg);
-    write_qwen_vae21(&dir.join("vae"), &[1, 1, 1, 1, 1], 4, 64, &[false, true, false, false]);
+    write_qwen_vae21(
+        &dir.join("vae"),
+        &[1, 1, 1, 1, 1],
+        4,
+        64,
+        &[false, true, false, false],
+    );
 }
 
 /// Krea 2 (Raw): 12 taps of a 36-layer Qwen3-VL tower fused in-model, the 2-block DiT on 2x2-packed
@@ -1363,9 +1703,15 @@ fn write_qwen21_pipeline(dir: &std::path::Path) {
 fn krea2_pipeline() {
     let case = "diffb_krea2_pipeline";
     let dir = fixture_dir(case);
-    write_json(&dir.join("model_index.json"), &json!({"_class_name": "Krea2Pipeline", "is_distilled": false}));
+    write_json(
+        &dir.join("model_index.json"),
+        &json!({"_class_name": "Krea2Pipeline", "is_distilled": false}),
+    );
     flow_scheduler(&dir, true);
-    write_json(&dir.join("tokenizer/tokenizer.json"), &qwen_tokenizer_json());
+    write_json(
+        &dir.join("tokenizer/tokenizer.json"),
+        &qwen_tokenizer_json(),
+    );
     write_qwen_te(&dir.join("text_encoder"), "qwen3_vl", 32, 36, 0x5A04);
     krea2_fixture(&format!("{case}/transformer"));
     write_qwen_vae(&fixture_dir(&format!("{case}/vae")), 4, [1, 2, 4, 4], 16);
@@ -1394,7 +1740,10 @@ fn qwen_image21_derived_repo() {
     let file = ft.join("qwen21-ft.safetensors");
     let (split, _, _) = qwen_image21_fixture();
     // A "finetune": the base transformer, every weight scaled.
-    let tuned: Vec<T> = split.iter().map(|(n, s, v)| (n.clone(), s.clone(), v.iter().map(|x| x * 0.9).collect())).collect();
+    let tuned: Vec<T> = split
+        .iter()
+        .map(|(n, s, v)| (n.clone(), s.clone(), v.iter().map(|x| x * 0.9).collect()))
+        .collect();
     write_st(&file, &tuned);
     let card = "---\nbase_model: golden/qwen21-base\n---\nSTEPS, SIGMAS = 3, [1.0, 0.7, 0.3]\n";
     std::fs::write(ft.join("README.md"), card).unwrap();
@@ -1405,27 +1754,45 @@ fn qwen_image21_derived_repo() {
     let derived = artifacts(&ft, "golden/qwen21-ft", "qwen21-ft.safetensors");
     let base_art = artifacts(&base, "golden/qwen21-base", "none");
     for dev in devices() {
-        let p = load_image(&derived, &hub, pin(dev)).expect("derived repo").unwrap();
+        let p = load_image(&derived, &hub, pin(dev))
+            .expect("derived repo")
+            .unwrap();
         let extra = Extras {
             weights: vec![("transformer".into(), file.clone())],
             scheduler: Some(sched.clone()),
             card: Some(card.into()),
             ..Default::default()
         };
-        let want = SpecDiffusion::load(&base_art, &hub, pin(dev), Some("qwen_image21"), &extra).unwrap();
-        let plain = SpecDiffusion::load(&base_art, &hub, pin(dev), Some("qwen_image21"), &Extras {
-            weights: vec![("transformer".into(), file.clone())],
-            ..Default::default()
-        })
+        let want =
+            SpecDiffusion::load(&base_art, &hub, pin(dev), Some("qwen_image21"), &extra).unwrap();
+        let plain = SpecDiffusion::load(
+            &base_art,
+            &hub,
+            pin(dev),
+            Some("qwen_image21"),
+            &Extras {
+                weights: vec![("transformer".into(), file.clone())],
+                ..Default::default()
+            },
+        )
         .unwrap();
         let mut req = request("t3 t7 t11", 0.0, 4);
         req.steps = None;
         let got = pixels(on(dev, || p.text_to_image(&req)).unwrap());
         req.steps = Some(3);
         let (e, c) = compare(&got, &pixels(on(dev, || want.text_to_image(&req)).unwrap()));
-        assert!(e < 1e-6 && c > 0.999999, "{dev:?}: derived vs base + repo schedule: rel {e} cos {c}");
-        let (e, _) = compare(&got, &pixels(on(dev, || plain.text_to_image(&req)).unwrap()));
-        assert!(e > 1e-3, "{dev:?}: the repo schedule changed nothing (rel {e})");
+        assert!(
+            e < 1e-6 && c > 0.999999,
+            "{dev:?}: derived vs base + repo schedule: rel {e} cos {c}"
+        );
+        let (e, _) = compare(
+            &got,
+            &pixels(on(dev, || plain.text_to_image(&req)).unwrap()),
+        );
+        assert!(
+            e > 1e-3,
+            "{dev:?}: the repo schedule changed nothing (rel {e})"
+        );
     }
 }
 
@@ -1443,8 +1810,14 @@ fn krea2_split_files() {
     let case = "diffb_krea2_split";
     let dir = fixture_dir(case);
     let twin = dir.join("diffusers");
-    write_json(&twin.join("model_index.json"), &json!({"_class_name": "Krea2Pipeline", "is_distilled": false}));
-    write_json(&twin.join("tokenizer/tokenizer.json"), &qwen_tokenizer_json());
+    write_json(
+        &twin.join("model_index.json"),
+        &json!({"_class_name": "Krea2Pipeline", "is_distilled": false}),
+    );
+    write_json(
+        &twin.join("tokenizer/tokenizer.json"),
+        &qwen_tokenizer_json(),
+    );
     write_qwen_te(&twin.join("text_encoder"), "qwen3_vl", 32, 36, 0x5A04);
     krea2_fixture(&format!("{case}/diffusers/transformer"));
     write_qwen_vae(&twin.join("vae"), 4, [1, 2, 4, 4], 16);
@@ -1455,30 +1828,70 @@ fn krea2_split_files() {
         std::fs::create_dir_all(split.join(to).parent().unwrap()).unwrap();
         std::fs::copy(twin.join(from), split.join(to)).unwrap();
     };
-    cp("transformer/krea2_tiny.safetensors", "diffusion_models/krea2_raw_bf16.safetensors");
-    cp("transformer/krea2_tiny.safetensors", "diffusion_models/krea2_turbo_bf16.safetensors");
+    cp(
+        "transformer/krea2_tiny.safetensors",
+        "diffusion_models/krea2_raw_bf16.safetensors",
+    );
+    cp(
+        "transformer/krea2_tiny.safetensors",
+        "diffusion_models/krea2_turbo_bf16.safetensors",
+    );
     // Sorts first; would fail to load as the text encoder.
-    cp("vae/qwen_image_vae.safetensors", "text_encoders/a_fp8.safetensors");
-    cp("text_encoder/model.safetensors", "text_encoders/qwen3vl_tiny_bf16.safetensors");
-    cp("vae/qwen_image_vae.safetensors", "vae/qwen_image_vae.safetensors");
-    write_json(&dir.join("hub/models--Qwen--Qwen3-VL-4B-Instruct/snapshots/main/tokenizer.json"), &qwen_tokenizer_json());
+    cp(
+        "vae/qwen_image_vae.safetensors",
+        "text_encoders/a_fp8.safetensors",
+    );
+    cp(
+        "text_encoder/model.safetensors",
+        "text_encoders/qwen3vl_tiny_bf16.safetensors",
+    );
+    cp(
+        "vae/qwen_image_vae.safetensors",
+        "vae/qwen_image_vae.safetensors",
+    );
+    write_json(
+        &dir.join("hub/models--Qwen--Qwen3-VL-4B-Instruct/snapshots/main/tokenizer.json"),
+        &qwen_tokenizer_json(),
+    );
     let hub = HuggingFaceHub::with_cache_dir(dir.join("hub"));
-    let mut files: Vec<(String, String)> = EMBEDDED.iter().map(|(p, t)| (p.to_string(), t.to_string())).collect();
+    let mut files: Vec<(String, String)> = EMBEDDED
+        .iter()
+        .map(|(p, t)| (p.to_string(), t.to_string()))
+        .collect();
     files.push(("overrides/tiny_krea2_split.json5".into(), r#"{applies_to: {family: "krea2"}, patch: {runtime: {split: {files: {
         "text_encoder/config.json": {text_config: {hidden_size: 32, intermediate_size: 64, num_hidden_layers: 36,
           num_attention_heads: 4, num_key_value_heads: 2, head_dim: 16, rms_norm_eps: 1e-6, rope_theta: 10000,
           rope_scaling: {mrope_interleaved: true, mrope_section: [4, 2, 2], rope_type: "default"}}}}}}}}"#.into()));
     let reg = Registry::from_files(&files, &[]).unwrap();
-    let raw = artifacts(&split, "golden/krea-split", "diffusion_models/krea2_raw_bf16.safetensors");
-    let turbo = artifacts(&split, "golden/krea-split", "diffusion_models/krea2_turbo_bf16.safetensors");
+    let raw = artifacts(
+        &split,
+        "golden/krea-split",
+        "diffusion_models/krea2_raw_bf16.safetensors",
+    );
+    let turbo = artifacts(
+        &split,
+        "golden/krea-split",
+        "diffusion_models/krea2_turbo_bf16.safetensors",
+    );
     let twin_art = artifacts(&twin, "golden/krea-diffusers", "none");
     let req = request("t3 t7 t11", 4.5, 12);
     for dev in devices() {
-        let load = |a| load_image_in(&reg, a, &hub, pin(dev)).expect("image repo").unwrap_or_else(|e| panic!("{e}"));
+        let load = |a| {
+            load_image_in(&reg, a, &hub, pin(dev))
+                .expect("image repo")
+                .unwrap_or_else(|e| panic!("{e}"))
+        };
         let (p, t, w) = (load(&raw), load(&turbo), load(&twin_art));
-        assert_eq!((p.defaults().steps, t.defaults().steps), (28, 8), "raw / turbo defaults");
+        assert_eq!(
+            (p.defaults().steps, t.defaults().steps),
+            (28, 8),
+            "raw / turbo defaults"
+        );
         let got = pixels(on(dev, || p.text_to_image(&req)).unwrap());
         let (e, c) = compare(&got, &pixels(on(dev, || w.text_to_image(&req)).unwrap()));
-        assert!(e < 1e-6 && c > 0.999999, "{dev:?}: split vs diffusers: rel {e} cos {c}");
+        assert!(
+            e < 1e-6 && c > 0.999999,
+            "{dev:?}: split vs diffusers: rel {e} cos {c}"
+        );
     }
 }

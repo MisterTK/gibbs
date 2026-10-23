@@ -137,6 +137,69 @@ impl Mat {
             *o = bf16_to_f32(v);
         }
     }
+    /// Decodes `dst.len()` values starting at column `p0` of row `r` into `dst`.
+    /// `p0` must be a multiple of the packed format's block size (e.g. 256 in [`crate::model::nn::matmul_rows`]).
+    pub fn decode_slice_f32(&self, r: usize, p0: usize, dst: &mut [f32]) {
+        if let Buf::Packed(p) = &self.buf {
+            let row_bytes = p.format.tensor_bytes(self.cols);
+            let row_off = p.off + r * row_bytes;
+            let n = dst.len();
+            if p.format == crate::hardware::QuantFormat::FP16 {
+                let start = row_off + p0 * 2;
+                for (o, c) in dst
+                    .iter_mut()
+                    .zip(p.map[start..start + n * 2].chunks_exact(2))
+                {
+                    *o = crate::model::f16_to_f32(u16::from_le_bytes([c[0], c[1]]));
+                }
+                return;
+            }
+            if p.format == crate::hardware::QuantFormat::BF16 {
+                let start = row_off + p0 * 2;
+                for (o, c) in dst
+                    .iter_mut()
+                    .zip(p.map[start..start + n * 2].chunks_exact(2))
+                {
+                    *o = crate::model::bf16_to_f32(u16::from_le_bytes([c[0], c[1]]));
+                }
+                return;
+            }
+            if p.format == crate::hardware::QuantFormat::FP32 {
+                let start = row_off + p0 * 4;
+                for (o, c) in dst
+                    .iter_mut()
+                    .zip(p.map[start..start + n * 4].chunks_exact(4))
+                {
+                    *o = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+                }
+                return;
+            }
+            if let Some((elems, block_bytes, decode)) =
+                crate::model::layers::gguf_block_codec(p.format)
+            {
+                if p0 % elems == 0 && n % elems == 0 {
+                    let start = row_off + (p0 / elems) * block_bytes;
+                    let bytes = (n / elems) * block_bytes;
+                    if start + bytes <= p.map.len() {
+                        for (b, out_blk) in p.map[start..start + bytes]
+                            .chunks_exact(block_bytes)
+                            .zip(dst.chunks_exact_mut(elems))
+                        {
+                            decode(b, out_blk);
+                        }
+                        return;
+                    }
+                }
+            }
+            let mut full_row = vec![0.0f32; self.cols];
+            self.decode_row_f32(r, &mut full_row);
+            dst.copy_from_slice(&full_row[p0..p0 + n]);
+            return;
+        }
+        for (o, &v) in dst.iter_mut().zip(&self.row(r)[p0..]) {
+            *o = bf16_to_f32(v);
+        }
+    }
     /// Vector-matrix product `x` [k] · `self`^T [k x n] -> `out` [n] for decode (single-row GEMV).
     /// If self is packed Q4_0, executes vector GEMV directly on the packed blocks without dequantization allocations.
     pub fn gemv_f32(&self, x: &[f32], out: &mut [f32]) {

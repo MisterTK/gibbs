@@ -819,7 +819,9 @@ fn call(f: &str, args: &[Expr], env: &dyn Env) -> Result<Val, String> {
         "str" => Val::Str(arg(0)?.to_string()),
         "int" => Val::Num(arg(0)?.num()?.trunc()),
         // The value rounded to bf16 (round-to-nearest-even), e.g. a bf16 checkpoint's in-graph constant.
-        "bf16" => Val::Num(crate::model::bf16_to_f32(crate::model::f32_to_bf16(arg(0)?.num()? as f32)) as f64),
+        "bf16" => Val::Num(crate::model::bf16_to_f32(crate::model::f32_to_bf16(
+            arg(0)?.num()? as f32
+        )) as f64),
         "list" => {
             // list(n, x): n copies of x.
             let n = arg(0)?.usize()?;
@@ -831,9 +833,13 @@ fn call(f: &str, args: &[Expr], env: &dyn Env) -> Result<Val, String> {
             None => Val::Null,
         },
         // dtype(name): the stored dtype of a source tensor (null when absent).
-        "dtype" => env.dtype(arg(0)?.str()?).map_or(Val::Null, |d| Val::Str(d.into())),
+        "dtype" => env
+            .dtype(arg(0)?.str()?)
+            .map_or(Val::Null, |d| Val::Str(d.into())),
         // token(s): the vocabulary id of token string `s` (null when absent).
-        "token" => env.token(arg(0)?.str()?).map_or(Val::Null, |t| Val::Num(t as f64)),
+        "token" => env
+            .token(arg(0)?.str()?)
+            .map_or(Val::Null, |t| Val::Num(t as f64)),
         // rfind(list, x, end): the last index below `end` (default len) holding x, else -1.
         "rfind" => {
             let l = arg(0)?.list()?;
@@ -842,7 +848,34 @@ fn call(f: &str, args: &[Expr], env: &dyn Env) -> Result<Val, String> {
                 None => l.len(),
             };
             let x = arg(1)?;
-            Val::Num(l[..end].iter().rposition(|y| eq(y, x)).map_or(-1.0, |i| i as f64))
+            Val::Num(
+                l[..end]
+                    .iter()
+                    .rposition(|y| eq(y, x))
+                    .map_or(-1.0, |i| i as f64),
+            )
+        }
+        // unary_act(name[, fallback]): HF activation string -> graph::UnaryKind name.
+        "unary_act" => {
+            let s = arg(0)?.str()?;
+            Val::Str(match s {
+                "silu" | "swish" | "gated-silu" | "gated-swish" => "Silu".into(),
+                "gelu" => "GeluErf".into(),
+                "gelu_new"
+                | "gelu_fast"
+                | "gelu_pytorch_tanh"
+                | "gated-gelu"
+                | "gated-gelu_new"
+                | "gated-gelu_pytorch_tanh" => "GeluTanh".into(),
+                "relu" | "gated-relu" => "Relu".into(),
+                "relu2" | "relu_squared" => "Relu2".into(),
+                "tanh" => "Tanh".into(),
+                "sigmoid" => "Sigmoid".into(),
+                _ => match v.get(1) {
+                    Some(fb) => fb.str()?.to_string(),
+                    None => "Silu".into(),
+                },
+            })
         }
         _ => return Err(format!("unknown function `{f}`")),
     })
@@ -928,10 +961,19 @@ mod tests {
             ev("range(3)"),
             Val::List(vec![Val::Num(0.0), Val::Num(1.0), Val::Num(2.0)])
         );
-        assert_eq!(ev("at(values('x.w'), 1) + len(values('y.w'))"), Val::Num(1.0));
-        assert_eq!(ev("dtype('x.w') == 'bf16' && dtype('y.w') == null"), Val::Bool(true));
+        assert_eq!(
+            ev("at(values('x.w'), 1) + len(values('y.w'))"),
+            Val::Num(1.0)
+        );
+        assert_eq!(
+            ev("dtype('x.w') == 'bf16' && dtype('y.w') == null"),
+            Val::Bool(true)
+        );
         assert_eq!(ev("bf16(sqrt(1536))"), Val::Num(39.25));
-        assert_eq!(ev("rfind([1, 0, 1, 1, 0], 1, 3) + rfind([1, 0], 0) + rfind(cfg.layer_types, 'x')"), Val::Num(2.0));
+        assert_eq!(
+            ev("rfind([1, 0, 1, 1, 0], 1, 3) + rfind([1, 0], 0) + rfind(cfg.layer_types, 'x')"),
+            Val::Num(2.0)
+        );
     }
 
     #[test]

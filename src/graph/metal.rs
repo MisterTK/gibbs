@@ -163,6 +163,16 @@ pub(crate) fn profile_requested() -> bool {
 
 /// A greedy decode stream ([`Session::submit_fed`]): each token's command buffers are queued before
 /// the previous token is read back, and token ids flow between tokens on the device through `ring`.
+#[derive(Clone, Copy, Debug)]
+pub struct SampleGpuSpec {
+    pub vocab: u32,
+    pub top_k: u32,
+    pub inv_temp: f32,
+    pub top_p: f32,
+    pub rep_penalty: f32,
+    pub rng_seed: u64,
+}
+
 pub struct FedStream {
     /// Slot `t % 4` (16 bytes at `16 * (t % 4)`) holds token `t`'s `[position, picked token, -, -]`;
     /// byte 64 holds the stream's first input token.
@@ -178,8 +188,10 @@ pub struct FedStream {
     pub(crate) last: u32,
     /// When the last [`Session::wait_fed`] returned.
     last_wait: Option<Instant>,
+    pub(crate) sample_spec: Option<SampleGpuSpec>,
+    pub(crate) recent_buf: Option<Buffer>,
+    pub(crate) recent_len: u32,
 }
-
 impl FedStream {
     pub(crate) fn in_flight(&self) -> usize {
         self.inflight.len()
@@ -460,7 +472,7 @@ const ATTN_MAX_SPLITS: usize = 32;
 const ATTN_TARGET_TGS: usize = 64;
 /// Query heads a split-attention threadgroup owns (`ATTN_HPT` in the kernel source).
 const ATTN_HPT: usize = 4;
-const BASE_KERNELS: [&str; 75] = [
+const BASE_KERNELS: [&str; 76] = [
     "embedding_f32",
     "layer_norm_f32",
     "mean_pool_f32",
@@ -536,6 +548,7 @@ const BASE_KERNELS: [&str; 75] = [
     "attn_cached_merge_f32",
     "causal_conv1d_f32",
     "delta_rule_f32",
+    "sample_logits_gpu",
 ];
 const MPP_KERNELS: [&str; 18] = [
     "gemm_mpp_none",
@@ -2122,6 +2135,32 @@ impl Session {
             })
             .max()
             .unwrap_or(0);
+        if mlp_scratch_size > 0 {
+            let need = mlp_scratch_size.max(256);
+            let mut guard = self.mlp_scratch.lock();
+            if guard.as_ref().is_none_or(|b| (b.length() as usize) < need) {
+                *guard = Some(new_shared_buffer(&self.rt.device, need)?);
+            }
+        }
+        let attn_scratch_need = steps
+            .iter()
+            .filter_map(|s| match s.op {
+                Step::CachedAttention {
+                    heads, head_dim, ..
+                } => Some(heads * 32 * (head_dim + 2) * 4),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0);
+        if attn_scratch_need > 0 {
+            let mut guard = self.attn_scratch.lock();
+            if guard
+                .as_ref()
+                .is_none_or(|b| (b.length() as usize) < attn_scratch_need)
+            {
+                *guard = Some(new_shared_buffer(&self.rt.device, attn_scratch_need)?);
+            }
+        }
         let mut embedding_checks = Vec::new();
         let mut attn_pos_inputs = Vec::new();
         let mut state_write_checks = Vec::new();
@@ -2564,9 +2603,39 @@ impl Session {
         pos: u32,
         budget: usize,
     ) -> Result<FedStream, String> {
+        self.new_fed_stream_with_sample(graph, plan, state, last, pos, budget, None, &[])
+    }
+
+    pub(crate) fn new_fed_stream_with_sample(
+        &self,
+        graph: &Graph,
+        plan: &PreparedPlan,
+        state: &mut crate::graph::StateStore,
+        last: u32,
+        pos: u32,
+        budget: usize,
+        sample_spec: Option<SampleGpuSpec>,
+        recent: &[u32],
+    ) -> Result<FedStream, String> {
         let ring = new_shared_buffer(&self.rt.device, 128)?;
         // SAFETY: a fresh 128-byte shared buffer no command buffer uses yet.
         unsafe { *(ring.contents() as *mut u32).add(16) = last };
+        let (recent_buf, recent_len) = if sample_spec.is_some() {
+            let buf = new_shared_buffer(&self.rt.device, 64 * 4)?;
+            let n = recent.len().min(64);
+            if n > 0 {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        recent[recent.len() - n..].as_ptr(),
+                        buf.contents() as *mut u32,
+                        n,
+                    );
+                }
+            }
+            (Some(buf), n as u32)
+        } else {
+            (None, 0)
+        };
         let state_bufs =
             self.resolve_state_bufs(graph, plan, Some(state), pos as usize + budget)?;
         Ok(FedStream {
@@ -2579,6 +2648,9 @@ impl Session {
             next_pos: pos,
             last,
             last_wait: None,
+            sample_spec,
+            recent_buf,
+            recent_len,
         })
     }
 
@@ -2632,12 +2704,49 @@ impl Session {
                 self.fed_ids.store(true, Relaxed);
                 let r = self.encode_chunks(&plan.steps, &loc, mlp_scratch_buf.as_ref());
                 self.fed_ids.store(false, Relaxed);
-                let (cbs, dispatches, encode_dur) = r?;
+                let (cbs, mut dispatches, encode_dur) = r?;
                 let last = cbs.last().expect("encode_chunks returns a buffer");
                 let (ob, oo) = loc(out);
-                let blit = last.new_blit_command_encoder();
-                blit.copy_from_buffer(ob, oo as u64, ring, (16 * slot + 4) as u64, 4);
-                blit.end_encoding();
+                if let (Some(sp), Some(rb)) = (s.sample_spec, s.recent_buf.as_ref()) {
+                    #[repr(C)]
+                    struct SampleGpuParams {
+                        vocab: u32,
+                        top_k: u32,
+                        inv_temp: f32,
+                        top_p: f32,
+                        rep_penalty: f32,
+                        n_recent: u32,
+                        rng_seed: u64,
+                    }
+                    let enc = last.new_compute_command_encoder();
+                    enc.set_compute_pipeline_state(self.rt.pso("sample_logits_gpu")?);
+                    enc.set_buffer(0, Some(ob), oo as u64);
+                    enc.set_buffer(1, Some(ring), (16 * slot + 4) as u64);
+                    enc.set_buffer(2, Some(rb), 0);
+                    let p = SampleGpuParams {
+                        vocab: sp.vocab,
+                        top_k: sp.top_k,
+                        inv_temp: sp.inv_temp,
+                        top_p: sp.top_p,
+                        rep_penalty: sp.rep_penalty,
+                        n_recent: s.recent_len.max(1).min(64),
+                        rng_seed: sp
+                            .rng_seed
+                            .wrapping_add((t as u64).wrapping_mul(0x9E3779B97F4A7C15)),
+                    };
+                    enc.set_bytes(
+                        3,
+                        std::mem::size_of::<SampleGpuParams>() as u64,
+                        &p as *const SampleGpuParams as *const c_void,
+                    );
+                    enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(256, 1, 1));
+                    enc.end_encoding();
+                    dispatches += 1;
+                } else {
+                    let blit = last.new_blit_command_encoder();
+                    blit.copy_from_buffer(ob, oo as u64, ring, (16 * slot + 4) as u64, 4);
+                    blit.end_encoding();
+                }
                 last.commit();
                 *self.fed_tail.lock() = Some(last.clone());
                 Ok::<_, String>((cbs, dispatches, encode_dur))
@@ -3898,29 +4007,50 @@ impl Session {
                     Epi::None,
                 )?;
 
-                // 3. Up GEMV: scratch[off_norm] * up_w -> scratch[off_up]
-                self.encode_gemv_or_gemm(
-                    enc,
-                    (scratch, off_norm),
-                    loc(up_w),
-                    variants[1],
-                    up_name,
-                    None,
-                    (scratch, off_up),
-                    inter,
-                    hidden,
-                    Epi::None,
-                )?;
-
-                // 4. SwiGLU / GeGLU: scratch[off_gate] * scratch[off_up] -> scratch[off_gate]
-                let pso_name = if is_geglu { "geglu_f32" } else { "swiglu_f32" };
-                enc.set_compute_pipeline_state(rt.pso(pso_name)?);
-                enc.set_buffer(0, Some(scratch), off_gate as u64);
-                enc.set_buffer(1, Some(scratch), off_up as u64);
-                enc.set_buffer(2, Some(scratch), off_gate as u64);
-                set_bytes(enc, 3, &u32_of(inter)?);
-                grid1(inter);
-
+                // 3. Up GEMV + SwiGLU / GeGLU (fused into Up GEMV epilogue for non-F32 weights):
+                let up_fmt = self
+                    .weights
+                    .get(up_name)
+                    .map(|w| w.3)
+                    .unwrap_or(WeightFormat::F32);
+                if up_fmt != WeightFormat::F32 {
+                    self.encode_gemv_or_gemm(
+                        enc,
+                        (scratch, off_norm),
+                        loc(up_w),
+                        variants[1],
+                        up_name,
+                        Some((scratch, off_gate)),
+                        (scratch, off_gate),
+                        inter,
+                        hidden,
+                        if is_geglu {
+                            Epi::UpGeGlu
+                        } else {
+                            Epi::UpSwiGlu
+                        },
+                    )?;
+                } else {
+                    self.encode_gemv_or_gemm(
+                        enc,
+                        (scratch, off_norm),
+                        loc(up_w),
+                        variants[1],
+                        up_name,
+                        None,
+                        (scratch, off_up),
+                        inter,
+                        hidden,
+                        Epi::None,
+                    )?;
+                    let pso_name = if is_geglu { "geglu_f32" } else { "swiglu_f32" };
+                    enc.set_compute_pipeline_state(rt.pso(pso_name)?);
+                    enc.set_buffer(0, Some(scratch), off_gate as u64);
+                    enc.set_buffer(1, Some(scratch), off_up as u64);
+                    enc.set_buffer(2, Some(scratch), off_gate as u64);
+                    set_bytes(enc, 3, &u32_of(inter)?);
+                    grid1(inter);
+                }
                 // 5. Down GEMV with residual addition: scratch[off_gate] * down_w + x -> s.out
                 if let Some(pn) = post_norm_w {
                     // 5. Down GEMV into scratch[off_norm]: scratch[off_gate] * down_w -> scratch[off_norm]

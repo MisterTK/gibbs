@@ -5,6 +5,7 @@ use crate::kv::{BlockId, PagedKVPool, TOKENS_PER_BLOCK};
 use crate::model::native::{MediaInput, NativeLm, PrepareCtx, SeqState};
 use crate::model::tokenizer::Tokenizer;
 use crate::runtime::lm::sample_logits;
+use crate::runtime::noise_draft::{DraftKnobs, DraftMode, LiveDraftKnobs};
 use crate::telemetry::{EngineTelemetry, GapSample};
 use parking_lot::{Condvar, Mutex, RwLock};
 use spec::{Drafter, KTuner, SpecSeq};
@@ -93,6 +94,27 @@ impl ExecutableModel {
     ) -> Result<Option<u32>, String> {
         match state {
             Some(st) => self.0.stream_greedy_token(last, pos - 1, max_new, st),
+            None => Ok(None),
+        }
+    }
+
+    /// Device decode stream supporting both greedy (`temp <= 1e-4`) and stochastic (`temp > 1e-4`) sampling.
+    #[allow(clippy::too_many_arguments)]
+    pub fn stream_token(
+        &self,
+        last: u32,
+        pos: usize,
+        max_new: usize,
+        temp: f32,
+        top_p: f32,
+        all_tokens: &[u32],
+        state: &mut Option<SeqState>,
+    ) -> Result<Option<u32>, String> {
+        match state {
+            Some(st) => {
+                self.0
+                    .stream_token(last, pos - 1, max_new, temp, top_p, recent(all_tokens), st)
+            }
             None => Ok(None),
         }
     }
@@ -224,6 +246,26 @@ impl ExecutableModel {
     /// [`Self::prepare`]'s id count without building state ([`NativeLm::prompt_len`]).
     fn prompt_len(&self, ids: Vec<u32>, media: &[MediaInput]) -> Result<usize, String> {
         self.0.prompt_len(ids, media)
+    }
+
+    pub fn export_kv_snapshot(
+        &self,
+        state: &Option<SeqState>,
+        token_len: usize,
+    ) -> Option<crate::kv::CachedKvSnapshot> {
+        self.0.export_kv_snapshot(state.as_ref()?, token_len)
+    }
+
+    pub fn restore_kv_prefix(
+        &self,
+        state: &mut Option<SeqState>,
+        snap: &crate::kv::CachedKvSnapshot,
+        prefix_len: usize,
+    ) -> bool {
+        let Some(st) = state.as_mut() else {
+            return false;
+        };
+        self.0.restore_kv_prefix(st, snap, prefix_len)
     }
 }
 
@@ -553,17 +595,37 @@ pub struct ContinuousBatchScheduler {
     /// Drafter for speculative decoding: the model's own (MTP heads) unless replaced.
     drafter: RwLock<Option<Arc<dyn Drafter>>>,
     k_tuner: Mutex<KTuner>,
+    draft_knobs: Arc<LiveDraftKnobs>,
     pub logprob_tx: Arc<RwLock<Option<UnboundedSender<TokenLogprobInfo>>>>,
     work_signal: (Mutex<bool>, Condvar),
 }
 
-/// The drafter `model` ships, unless `GIBBS_SPEC=off`.
-fn builtin_drafter(model: Option<&ExecutableModel>) -> Option<Arc<dyn Drafter>> {
+/// The drafter `model` ships (or an [`OnlineNoiseDrafter`] when `knobs.mode` is `Noise`/`Suffix`
+/// or `GIBBS_SPEC=noise|suffix`), unless `GIBBS_SPEC=off` or `knobs.mode == DraftMode::Off`.
+fn resolve_drafter(
+    model: Option<&ExecutableModel>,
+    knobs: &Arc<LiveDraftKnobs>,
+) -> Option<Arc<dyn Drafter>> {
     let m = model?;
-    if spec_enabled() {
-        m.0.drafter()
-    } else {
-        None
+    if !spec_enabled() {
+        return None;
+    }
+    match knobs.snapshot().mode {
+        DraftMode::Off => None,
+        DraftMode::Noise | DraftMode::Suffix => {
+            m.0.online_drafter(knobs.clone()).or_else(|| m.0.drafter())
+        }
+        DraftMode::Model => m.0.drafter(),
+        DraftMode::Auto => {
+            if matches!(
+                std::env::var("GIBBS_SPEC").as_deref(),
+                Ok("noise" | "online" | "suffix")
+            ) {
+                m.0.online_drafter(knobs.clone()).or_else(|| m.0.drafter())
+            } else {
+                m.0.drafter()
+            }
+        }
     }
 }
 
@@ -593,10 +655,17 @@ impl ContinuousBatchScheduler {
                 .unwrap_or_else(Tokenizer::default_bpe),
         );
         let has_model = model.is_some();
+        let mut init_knobs = crate::tui::settings::load_settings().draft;
+        if let Ok(env_spec) = std::env::var("GIBBS_SPEC") {
+            if let Ok(mode) = env_spec.parse::<DraftMode>() {
+                init_knobs.mode = mode;
+            }
+        }
+        let draft_knobs = Arc::new(LiveDraftKnobs::new(init_knobs));
         let s = Self {
             model_id: RwLock::new(model_id.into()),
             kv_pool,
-            drafter: RwLock::new(builtin_drafter(model.as_ref())),
+            drafter: RwLock::new(resolve_drafter(model.as_ref(), &draft_knobs)),
             model: RwLock::new(model),
             tokenizer: RwLock::new(tokenizer),
             telemetry,
@@ -607,6 +676,7 @@ impl ContinuousBatchScheduler {
             prefill_tuner: Mutex::new(PrefillTuner::default()),
             view: Mutex::new(SchedulerView::default()),
             k_tuner: Mutex::new(KTuner::default()),
+            draft_knobs,
             logprob_tx: Arc::new(RwLock::new(None)),
             work_signal: (Mutex::new(false), Condvar::new()),
         };
@@ -717,12 +787,13 @@ impl ContinuousBatchScheduler {
             &format!("{MODEL_SWAPPED}{model_id}"),
         );
         *self.tokenizer.write() = Arc::new(model.tokenizer());
-        *self.drafter.write() = builtin_drafter(Some(&model));
+        *self.drafter.write() = resolve_drafter(Some(&model), &self.draft_knobs);
         *self.model.write() = Some(model);
         *self.model_id.write() = model_id.to_string();
         // Prefill and decode costs were measured on the old model.
         *self.prefill_tuner.lock() = PrefillTuner::default();
         *self.k_tuner.lock() = KTuner::default();
+        self.kv_pool.radix_cache.clear();
         self.log_drafter();
     }
 
@@ -732,6 +803,37 @@ impl ContinuousBatchScheduler {
         *self.drafter.write() = drafter.filter(|_| spec_enabled());
         *self.k_tuner.lock() = KTuner::default();
         self.log_drafter();
+    }
+
+    /// Current speculative decoding & online noise drafter tuning knobs.
+    pub fn draft_knobs(&self) -> DraftKnobs {
+        self.draft_knobs.snapshot()
+    }
+
+    /// Shared atomic handle to the live draft knobs.
+    pub fn live_draft_knobs(&self) -> Arc<LiveDraftKnobs> {
+        self.draft_knobs.clone()
+    }
+
+    /// Updates [`DraftKnobs`] live and reconfigures the active drafter when the mode changes.
+    pub fn set_draft_knobs(&self, knobs: DraftKnobs) {
+        let prev = self.draft_knobs.snapshot();
+        let next = knobs.sanitized();
+        self.draft_knobs.store(next);
+        if prev.mode != next.mode || self.drafter.read().is_none() != (next.mode == DraftMode::Off)
+        {
+            let model = self.model.read().clone();
+            *self.drafter.write() = resolve_drafter(model.as_ref(), &self.draft_knobs);
+            *self.k_tuner.lock() = KTuner::default();
+            self.log_drafter();
+        } else if prev.max_k != next.max_k {
+            *self.k_tuner.lock() = KTuner::default();
+        }
+    }
+
+    /// Per-`k` `(k, tok_per_sec, accept_rate)` summary from [`KTuner`].
+    pub fn k_tuner_rates(&self) -> Vec<(usize, f64, f64)> {
+        self.k_tuner.lock().rates_summary()
     }
 
     /// Ends every in-flight sequence with `reason`; their streams close with an error.
@@ -930,7 +1032,8 @@ impl ContinuousBatchScheduler {
             Some(m) => match m.prepare(prompt_tokens.clone(), &[], &PrepareCtx::default()) {
                 Ok(r) => r,
                 Err(e) => {
-                    self.telemetry.log_warn(&format!("sequence {id}: cannot prepare the prompt: {e}"));
+                    self.telemetry
+                        .log_warn(&format!("sequence {id}: cannot prepare the prompt: {e}"));
                     (prompt_tokens, None)
                 }
             },
@@ -1026,10 +1129,50 @@ impl ContinuousBatchScheduler {
         let decoding = active.iter().any(|s| s.state == SequenceState::Decoding);
         let prefill_budget = self.prefill_tuner.lock().budget(decoding);
 
-        // 1. Promote waiting sequences if KV blocks are available
+        // 1. Cache-aware promotion of waiting sequences if KV blocks are available:
+        // When multiple sequences wait and some share cached prefix tokens, promote cache hits first.
+        if waiting.len() > 1 {
+            let mut vec: Vec<Sequence> = waiting.drain(..).collect();
+            vec.sort_by_key(|s| {
+                let hit = self.kv_pool.radix_cache.peek_match_len(&s.prompt_tokens);
+                (usize::MAX - hit, s.submitted)
+            });
+            waiting.extend(vec);
+        }
         while let Some(mut seq) = waiting.pop_front() {
-            let (matched_blocks, matched_tokens) =
-                self.kv_pool.radix_cache.match_prefix(&seq.prompt_tokens);
+            let (mut matched_blocks, mut matched_tokens, snapshot) = self
+                .kv_pool
+                .radix_cache
+                .match_prefix_with_snapshot(&seq.prompt_tokens);
+            let max_reusable = seq.prompt_tokens.len().saturating_sub(1);
+            let mut restored_tokens = 0usize;
+            if drafter.is_none() && max_reusable > 0 {
+                if let (Some(m), Some(snap)) = (model.as_ref(), snapshot.as_ref()) {
+                    let usable = if snap.has_recurrent {
+                        if snap.token_len <= max_reusable {
+                            snap.token_len
+                        } else {
+                            0
+                        }
+                    } else {
+                        matched_tokens.min(snap.token_len).min(max_reusable)
+                    };
+                    if usable > 0 && m.restore_kv_prefix(&mut seq.kv_cache, snap, usable) {
+                        restored_tokens = usable;
+                    }
+                }
+            }
+            if restored_tokens == 0 {
+                matched_blocks.clear();
+                matched_tokens = 0;
+            } else {
+                matched_tokens = restored_tokens;
+                let keep_blocks = (matched_tokens + TOKENS_PER_BLOCK - 1) / TOKENS_PER_BLOCK;
+                matched_blocks.truncate(keep_blocks);
+                for &b in &matched_blocks {
+                    let _ = self.kv_pool.retain_block(b, current_step);
+                }
+            }
 
             seq.allocated_blocks = matched_blocks;
             let needed_tokens = seq
@@ -1037,7 +1180,9 @@ impl ContinuousBatchScheduler {
                 .len()
                 .saturating_sub(matched_tokens)
                 .min(prefill_budget);
-            let needed_blocks = (needed_tokens + TOKENS_PER_BLOCK - 1) / TOKENS_PER_BLOCK;
+            let total_initial = matched_tokens + needed_tokens;
+            let total_blocks = (total_initial + TOKENS_PER_BLOCK - 1) / TOKENS_PER_BLOCK;
+            let needed_blocks = total_blocks.saturating_sub(seq.allocated_blocks.len());
 
             let mut all_allocated = true;
             for _ in 0..needed_blocks {
@@ -1050,7 +1195,7 @@ impl ContinuousBatchScheduler {
             }
 
             if all_allocated {
-                seq.prefilled_tokens = 0;
+                seq.prefilled_tokens = matched_tokens;
                 seq.state = SequenceState::Prefilling;
                 active.push(seq);
             } else {
@@ -1188,9 +1333,14 @@ impl ContinuousBatchScheduler {
 
                     if is_last {
                         seq.state = SequenceState::Decoding;
-                        self.kv_pool
-                            .radix_cache
-                            .insert_prefix(&seq.prompt_tokens, &seq.allocated_blocks);
+                        let snap = m
+                            .export_kv_snapshot(&seq.kv_cache, seq.prompt_tokens.len())
+                            .map(Arc::new);
+                        self.kv_pool.radix_cache.insert_prefix_with_snapshot(
+                            &seq.prompt_tokens,
+                            &seq.allocated_blocks,
+                            snap,
+                        );
                         if seq.params.max_new_tokens == 0 {
                             let _ = seq.finish.set(FinishReason::Length);
                             seq.state = SequenceState::Finished;
@@ -1216,10 +1366,11 @@ impl ContinuousBatchScheduler {
                 let mut all = seq.prompt_tokens.clone();
                 all.extend_from_slice(&seq.output_tokens);
                 // Draft no more than the sequence may still emit (the target adds one) or hold.
+                let knobs_snap = self.draft_knobs.snapshot();
                 let spec_k = seq.spec.as_ref().map(|sp| {
                     self.k_tuner
                         .lock()
-                        .choose(sp.max_k())
+                        .choose_with_knobs(sp.max_k(), &knobs_snap)
                         .min(
                             seq.params
                                 .max_new_tokens
@@ -1243,10 +1394,13 @@ impl ContinuousBatchScheduler {
                         spec::decode(m, sp, &all, &mut seq.kv_cache, temp, top_p, vocab, k).map(
                             |s| {
                                 if s.synced {
-                                    let msg = self.k_tuner.lock().record(
+                                    let msg = self.k_tuner.lock().record_with_knobs(
                                         k,
                                         s.tokens.len(),
+                                        s.drafted,
+                                        s.accepted,
                                         started.elapsed(),
+                                        &knobs_snap,
                                     );
                                     if let Some(msg) = msg {
                                         self.telemetry.log_info(&msg);
@@ -1266,14 +1420,17 @@ impl ContinuousBatchScheduler {
                     _ => {
                         let last = all.last().copied().unwrap_or(1);
                         let logprobs = seq.params.top_logprobs;
-                        let streamed = if temp <= 1e-4 && logprobs.is_none() {
-                            m.stream_greedy_token(
+                        let streamed = if logprobs.is_none() {
+                            m.stream_token(
                                 last,
                                 all.len(),
                                 seq.params
                                     .max_new_tokens
                                     .saturating_sub(seq.output_tokens.len())
                                     .min(context_len.saturating_sub(all.len())),
+                                temp,
+                                top_p,
+                                &all,
                                 &mut seq.kv_cache,
                             )
                         } else {
@@ -1353,8 +1510,28 @@ impl ContinuousBatchScheduler {
         }
 
         // 4. Release blocks for finished sequences
-        active.retain(|seq| {
+        active.retain_mut(|seq| {
             if seq.state == SequenceState::Finished {
+                if let Some(m) = &model {
+                    let _ = m.stream_end(&mut seq.kv_cache);
+                    if seq.output_tokens.len() > 1 {
+                        let committed_out = seq.output_tokens.len() - 1;
+                        let total_committed = seq.prompt_tokens.len() + committed_out;
+                        if let Some(snap) = m.export_kv_snapshot(&seq.kv_cache, total_committed) {
+                            let mut full = Vec::with_capacity(total_committed);
+                            full.extend_from_slice(&seq.prompt_tokens);
+                            full.extend_from_slice(&seq.output_tokens[..committed_out]);
+                            let n_blocks = ((total_committed + TOKENS_PER_BLOCK - 1)
+                                / TOKENS_PER_BLOCK)
+                                .min(seq.allocated_blocks.len());
+                            self.kv_pool.radix_cache.insert_prefix_with_snapshot(
+                                &full,
+                                &seq.allocated_blocks[..n_blocks],
+                                Some(Arc::new(snap)),
+                            );
+                        }
+                    }
+                }
                 for &b in &seq.allocated_blocks {
                     self.kv_pool.release_block(b);
                 }
@@ -1757,33 +1934,67 @@ mod tests {
         let cpu = cpu_exec(SHORT);
         let prompt = vec![5u32, 9, 13, 2];
         let close = |what: &str, got: &[f32], want: &[f32]| {
-            let d = got.iter().zip(want).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+            let d = got
+                .iter()
+                .zip(want)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
             assert!(d < 1e-3, "{what}: max logit difference {d}");
         };
         let want = cpu.prompt_logits(prompt.clone()).unwrap();
-        close("prompt logits vs CPU", &m.prompt_logits(prompt.clone()).unwrap(), &want);
+        close(
+            "prompt logits vs CPU",
+            &m.prompt_logits(prompt.clone()).unwrap(),
+            &want,
+        );
         // A picked token is right when its reference logit ties the argmax's (synthetic weights
         // can tie the top logits within an ulp).
         let tied = |what: &str, tok: u32, logits: &[f32]| {
             let best = logits[argmax(&logits[..256]) as usize];
-            assert!((logits[tok as usize] - best).abs() < 1e-4, "{what}: token {tok}");
+            assert!(
+                (logits[tok as usize] - best).abs() < 1e-4,
+                "{what}: token {tok}"
+            );
         };
         let (mut st, mut st2) = (
-            m.prepare(prompt.clone(), &[], &PrepareCtx::default()).unwrap().1,
-            m.prepare(prompt.clone(), &[], &PrepareCtx::default()).unwrap().1,
+            m.prepare(prompt.clone(), &[], &PrepareCtx::default())
+                .unwrap()
+                .1,
+            m.prepare(prompt.clone(), &[], &PrepareCtx::default())
+                .unwrap()
+                .1,
         );
-        assert_eq!(m.step_prefill_chunk(&prompt[..2], 0, false, &prompt, 0.0, 1.0, &mut st).unwrap(), None);
-        let t = m.step_prefill_chunk(&prompt[2..], 2, true, &prompt, 0.0, 1.0, &mut st).unwrap().unwrap();
+        assert_eq!(
+            m.step_prefill_chunk(&prompt[..2], 0, false, &prompt, 0.0, 1.0, &mut st)
+                .unwrap(),
+            None
+        );
+        let t = m
+            .step_prefill_chunk(&prompt[2..], 2, true, &prompt, 0.0, 1.0, &mut st)
+            .unwrap()
+            .unwrap();
         tied("chunked prefill", t, &want);
         // Prefill all but the last token, then the greedy step on it.
         m.prefill_logits(&prompt[..3], 0, &mut st2).unwrap();
-        let (next, _) = m.step_token_with_kv(&prompt, prompt[3], prompt.len(), 0.0, 1.0, None, &mut st2).unwrap();
+        let (next, _) = m
+            .step_token_with_kv(&prompt, prompt[3], prompt.len(), 0.0, 1.0, None, &mut st2)
+            .unwrap();
         tied("greedy step", next, &want);
         let full = [&prompt[..], &[next]].concat();
-        let (dec, _) = m.step_token_with_kv(&full, next, full.len(), 0.0, 1.0, None, &mut st2).unwrap();
-        tied("decode step", dec, &cpu.prompt_logits(full.clone()).unwrap());
+        let (dec, _) = m
+            .step_token_with_kv(&full, next, full.len(), 0.0, 1.0, None, &mut st2)
+            .unwrap();
+        tied(
+            "decode step",
+            dec,
+            &cpu.prompt_logits(full.clone()).unwrap(),
+        );
         let long: Vec<u32> = (0..20).map(|i| (i * 7 + 3) % 256).collect();
-        close("20-row prefill vs CPU", &m.prompt_logits(long.clone()).unwrap(), &cpu.prompt_logits(long).unwrap());
+        close(
+            "20-row prefill vs CPU",
+            &m.prompt_logits(long.clone()).unwrap(),
+            &cpu.prompt_logits(long).unwrap(),
+        );
     }
 
     #[test]
@@ -1797,5 +2008,101 @@ mod tests {
         if crate::hardware::available_devices().contains(&Device::Metal) {
             prefill_and_decode_parity(Device::Metal);
         }
+    }
+
+    /// OnlineNoiseDrafter (`DraftMode::Noise` and `DraftMode::Suffix`) produces bit-exact greedy
+    /// tokens identical to plain decoding (`DraftMode::Off`).
+    #[test]
+    fn test_online_noise_drafter_matches_plain_greedy_decode() {
+        let prompt = vec![5u32, 9, 13, 5, 9, 13, 2];
+        let params = SamplingParams {
+            temperature: Some(0.0),
+            top_p: None,
+            max_new_tokens: 16,
+            top_logprobs: None,
+        };
+        let plain_sched = ContinuousBatchScheduler::new(
+            "",
+            Arc::new(PagedKVPool::new(512)),
+            Some(cpu_exec(SHORT)),
+        );
+        plain_sched.set_draft_knobs(DraftKnobs {
+            mode: DraftMode::Off,
+            ..DraftKnobs::default()
+        });
+        let (_, rx_plain, ..) = plain_sched.submit_with_params(params, |_| prompt.clone());
+        let want = run_to_completion(&plain_sched, rx_plain);
+        assert_eq!(want.len(), 16);
+
+        for mode in [DraftMode::Noise, DraftMode::Suffix] {
+            let spec_sched = ContinuousBatchScheduler::new(
+                "",
+                Arc::new(PagedKVPool::new(512)),
+                Some(cpu_exec(SHORT)),
+            );
+            spec_sched.set_draft_knobs(DraftKnobs {
+                mode,
+                max_k: 3,
+                suffix_min_match: 2,
+                ..DraftKnobs::default()
+            });
+            assert!(spec_sched.view().spec.is_none());
+            let (_, rx_spec, ..) = spec_sched.submit_with_params(params, |_| prompt.clone());
+            let got = run_to_completion(&spec_sched, rx_spec);
+            assert_eq!(got, want, "mode {mode:?} diverged from plain greedy decode");
+            assert!(
+                spec_sched.telemetry.get_summary().spec_forwards > 0,
+                "mode {mode:?} should run speculative verify steps"
+            );
+        }
+    }
+
+    /// Physical PagedRadixKv prefix reuse skips prefilling the cached prefix and produces
+    /// bit-identical tokens to a fresh full-prompt prefill.
+    #[test]
+    fn test_physical_prefix_cache_skips_prefill_and_matches_fresh_decode() {
+        let prefix: Vec<u32> = (0..24).map(|i| 5 + (i % 40) as u32).collect();
+        let mut ext = prefix.clone();
+        ext.extend_from_slice(&[91, 92, 93, 94, 95, 96]);
+        let params = SamplingParams {
+            temperature: Some(0.0),
+            top_p: None,
+            max_new_tokens: 8,
+            top_logprobs: None,
+        };
+
+        // Reference: fresh scheduler prefills all 30 tokens of `ext` from scratch.
+        let fresh = ContinuousBatchScheduler::new(
+            "",
+            Arc::new(PagedKVPool::new(512)),
+            Some(cpu_exec(SHORT)),
+        );
+        let (_, rx_fresh, ..) = fresh.submit_with_params(params, |_| ext.clone());
+        let want = run_to_completion(&fresh, rx_fresh);
+        assert_eq!(want.len(), 8);
+
+        // Cached scheduler: first runs `prefix` (24 tokens), then runs `ext` (30 tokens).
+        let cached = ContinuousBatchScheduler::new(
+            "",
+            Arc::new(PagedKVPool::new(512)),
+            Some(cpu_exec(SHORT)),
+        );
+        let (_, rx1, ..) = cached.submit_with_params(params, |_| prefix.clone());
+        let _ = run_to_completion(&cached, rx1);
+
+        let (_, mut rx2, ..) = cached.submit_with_params(params, |_| ext.clone());
+        let step1 = cached.step();
+        // Only the 6 uncached suffix tokens should be prefilled in step1!
+        assert_eq!(
+            step1.prefill.1, 6,
+            "expected physical prefix cache to skip 24 cached tokens and prefill only 6, got {}",
+            step1.prefill.1
+        );
+        let mut got: Vec<u32> = std::iter::from_fn(|| rx2.try_recv().ok()).collect();
+        got.extend(run_to_completion(&cached, rx2));
+        assert_eq!(
+            got, want,
+            "physical prefix reuse output diverged from fresh prefill"
+        );
     }
 }

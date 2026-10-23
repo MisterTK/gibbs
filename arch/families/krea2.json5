@@ -128,7 +128,12 @@
   },
   components: {
     // The Qwen3-VL-4B text encoder is the `qwen3_vl` family (Phase 5).
-    text_encoder: {family: "qwen3_vl_text", dir: "text_encoder"},
+    text_encoder: {
+      family: "qwen3_vl",
+      dir: "text_encoder",
+      ignore: ["lm_head.weight", "score.weight", "model.layers.*.self_attn.rotary_emb.inv_freq", "model.visual.*", "visual.*"],
+      patch: {config: {has_vision: "false"}},
+    },
     transformer: {family: "krea2", dir: "transformer"},
     vae: {family: "qwen_vae", dir: "vae"},
     // Text features [nt, dim] from the `nl` tapped encoder layers stacked per token

@@ -969,40 +969,59 @@ impl WeightStore {
         cols: usize,
         shape: &[usize],
     ) -> Option<Packed> {
-        let cache = self.reencode_cache.as_ref()?;
-        let ct = cache.index.get(name)?;
-        let valid_fmt = !crate::model::reencode::is_float(ct.format)
-            && crate::graph::codec::codec(ct.format).is_some()
-            && cols % crate::graph::codec::block_geometry(ct.format).map_or(1, |g| g.0) == 0;
-        let valid = valid_fmt
-            && ct.rows == rows
-            && ct.cols == cols
-            && ct.bytes == rows * ct.format.tensor_bytes(cols)
-            && ct.offset % 64 == 0
-            && ct
-                .offset
-                .checked_add(ct.bytes)
-                .is_some_and(|end| end <= cache.map.len());
-        if valid {
-            crate::model::reencode::record_cache_hit(
-                &cache.key,
+        if let Some(cache) = self.reencode_cache.as_ref() {
+            let ct = cache.index.get(name)?;
+            let valid_fmt = !crate::model::reencode::is_float(ct.format)
+                && crate::graph::codec::codec(ct.format).is_some()
+                && cols % crate::graph::codec::block_geometry(ct.format).map_or(1, |g| g.0) == 0;
+            let valid = valid_fmt
+                && ct.rows == rows
+                && ct.cols == cols
+                && ct.bytes == rows * ct.format.tensor_bytes(cols)
+                && ct.offset % 64 == 0
+                && ct
+                    .offset
+                    .checked_add(ct.bytes)
+                    .is_some_and(|end| end <= cache.map.len());
+            if valid {
+                crate::model::reencode::record_cache_hit(
+                    &cache.key,
+                    name,
+                    src,
+                    ct.format,
+                    cache.map.clone(),
+                    ct.offset,
+                    ct.bytes,
+                    rows,
+                    cols,
+                );
+                return Some(Packed {
+                    map: cache.map.clone(),
+                    off: ct.offset,
+                    format: ct.format,
+                    shape: shape.to_vec(),
+                });
+            }
+            crate::model::reencode::record_cache_mismatch();
+            return None;
+        }
+        if let Some(key) = &self.reencode_key {
+            if let Some(pt) = crate::model::reencode::reuse_retained_pending(
+                key,
+                &self.reencode,
                 name,
                 src,
-                ct.format,
-                cache.map.clone(),
-                ct.offset,
-                ct.bytes,
                 rows,
                 cols,
-            );
-            return Some(Packed {
-                map: cache.map.clone(),
-                off: ct.offset,
-                format: ct.format,
-                shape: shape.to_vec(),
-            });
+            ) {
+                return Some(Packed {
+                    map: pt.map,
+                    off: pt.off,
+                    format: pt.format,
+                    shape: shape.to_vec(),
+                });
+            }
         }
-        crate::model::reencode::record_cache_mismatch();
         None
     }
 
@@ -1622,7 +1641,41 @@ fn xf_shapes(
             Ok(vec![(None, perm.iter().map(|&p| s[p]).collect())])
         }
         "reshape" => {
-            let shape = arg_us(a, "shape")?;
+            let raw_dims = a["shape"].as_array().ok_or("arg `shape` must be a list")?;
+            let mut shape = Vec::with_capacity(raw_dims.len());
+            let mut infer_idx = None;
+            for (idx, v) in raw_dims.iter().enumerate() {
+                let d = Val::from_json(v)
+                    .num()
+                    .map_err(|e| format!("arg `shape`: {e}"))? as i64;
+                if d == 0 {
+                    let kept = s.get(idx).copied().ok_or_else(|| {
+                        format!("reshape dim 0 at axis {idx} out of bounds for {s:?}")
+                    })?;
+                    shape.push(kept);
+                } else if d == -1 {
+                    if infer_idx.replace(idx).is_some() {
+                        return Err(format!("reshape {raw_dims:?} has multiple -1 dimensions"));
+                    }
+                    shape.push(1);
+                } else if d > 0 {
+                    shape.push(d as usize);
+                } else {
+                    return Err(format!("cannot reshape {s:?} to {raw_dims:?}"));
+                }
+            }
+            if let Some(ii) = infer_idx {
+                let known: usize = shape
+                    .iter()
+                    .enumerate()
+                    .filter(|&(i, _)| i != ii)
+                    .map(|(_, &v)| v)
+                    .product();
+                if known == 0 || numel % known != 0 {
+                    return Err(format!("cannot reshape {s:?} to {raw_dims:?}"));
+                }
+                shape[ii] = numel / known;
+            }
             if shape.iter().product::<usize>() != numel {
                 return Err(format!("cannot reshape {s:?} to {shape:?}"));
             }
@@ -1675,8 +1728,16 @@ fn xf_shapes(
             if ins.iter().any(|x| *x != s) {
                 return Err("experts differ in shape".into());
             }
-            let mut o = vec![ins.len()];
-            o.extend_from_slice(s);
+            let flatten_2d = a.get("flatten_2d").and_then(J::as_bool).unwrap_or(false);
+            let o = if flatten_2d && !s.is_empty() {
+                let mut o = vec![ins.len() * s[0]];
+                o.extend_from_slice(&s[1..]);
+                o
+            } else {
+                let mut o = vec![ins.len()];
+                o.extend_from_slice(s);
+                o
+            };
             Ok(vec![(None, o)])
         }
         "conv_to_linear" | "last_temporal_tap" => Err(format!("`{op}` needs rank >= 3, got {s:?}")),
@@ -2446,17 +2507,18 @@ impl Model {
     /// Component `name` declared as `{family, dir}`: that family's spec over `<dir>` (a checkpoint
     /// subfolder with its own config.json and weights), or over this checkpoint without `dir`.
     pub fn component(&self, reg: &Registry, name: &str) -> Result<Model, String> {
-        let Component::Ref { family, dir } = self.spec.component(name)? else {
+        let Component::Ref { dir, .. } = self.spec.component(name)? else {
             return Err(format!(
                 "{}: component `{name}` is a network, not a family",
                 self.spec.family
             ));
         };
+        let comp_spec = format!("{}.{name}", self.spec.family);
         let Some(sub) = dir else {
             return load_from(
                 self.ckpt.clone(),
                 reg,
-                Some(&family),
+                Some(&comp_spec),
                 self.tokenizer.clone(),
                 self.store.reencode.clone(),
             );
@@ -2477,7 +2539,7 @@ impl Model {
             is_cached: true,
             ..Default::default()
         };
-        load_with(&a, reg, Some(&family), self.store.reencode.clone())
+        load_with(&a, reg, Some(&comp_spec), self.store.reencode.clone())
     }
 }
 
@@ -2669,11 +2731,14 @@ pub fn gated<T>(
                 result = Some(Ok(cand));
                 break;
             }
-            Ok(r) => log(format!(
-                "reencode: {label} rejected (mean KL {:.4} nats, top-1 {:.1}%)",
-                r.mean_kl,
-                r.top1 * 100.0
-            )),
+            Ok(r) => {
+                crate::model::reencode::retain_pending_reencode(policy, pending);
+                log(format!(
+                    "reencode: {label} rejected (mean KL {:.4} nats, top-1 {:.1}%)",
+                    r.mean_kl,
+                    r.top1 * 100.0
+                ));
+            }
             Err(e) => {
                 log(format!("reencode: gate unavailable ({e}); using bit-exact"));
                 result = other_exact(&load_as, user.force);
@@ -2681,6 +2746,7 @@ pub fn gated<T>(
             }
         }
     }
+    crate::model::reencode::clear_retained_pending();
     set_gate_context(None);
     set_reencode_override(previous);
     result

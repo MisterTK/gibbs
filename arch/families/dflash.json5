@@ -110,7 +110,7 @@
   transforms: [
     // DFlash2 base kernels [2, kernel, hidden] (input side, output side) as f32 rows.
     {tensor: "layers.{i}.{c:*}_conv.base_kernel", op: "reshape",
-     args: {shape: ["2 * at(shape(fmt('layers.{i}.{c}_conv.base_kernel')), 1)", "hidden"]}},
+     args: {shape: [-1, "hidden"]}},
     {tensor: "layers.{i}.{c:*}_conv.base_kernel", op: "to_f32"},
   ],
   constants: {

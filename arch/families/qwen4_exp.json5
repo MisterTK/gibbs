@@ -76,11 +76,10 @@
       ["model.layers.{i}.self_attn.indexer.index_k_proj.weight", "indexer_dim"]]}},
     // n-gram table: transformers `[parts, rows, dim]` (or one tensor per part) -> `[parts * rows, dim]`.
     {tensor: "model.layers.{i}.ple.ple_embedding.ngram_embedding.shard_{e}.weight", op: "stack_experts",
-     args: {out: "model.layers.{i}.ple.ple_embedding.table"}},
+     args: {out: "model.layers.{i}.ple.ple_embedding.table", flatten_2d: true}},
     {tensor: "model.layers.{i}.ple.ple_embedding.table", op: "reshape",
      when: "len(shape(fmt('model.layers.{i}.ple.ple_embedding.table'))) == 3",
-     args: {shape: ["at(shape(fmt('model.layers.{i}.ple.ple_embedding.table')), 0) * at(shape(fmt('model.layers.{i}.ple.ple_embedding.table')), 1)",
-                    "at(shape(fmt('model.layers.{i}.ple.ple_embedding.table')), 2)"]}},
+     args: {shape: [-1, "at(shape(fmt('model.layers.{i}.ple.ple_embedding.table')), 2)"]}},
     {tensor: "model.layers.{i}.ple.conv1d.weight", op: "reshape", args: {shape: ["hc_count * hidden", "ple_kernel"]}},
     {tensor: "model.layers.{i}.ple.conv1d.weight", op: "to_f32"},
   ],

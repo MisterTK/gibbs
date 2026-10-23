@@ -215,19 +215,16 @@
     {tensor: "model.language_model.layers.{i}.router.per_expert_scale", op: "to_f32"},
     {tensor: "model.language_model.layers.{i}.router.per_expert_scale", op: "reshape", args: {shape: [1, "experts"]}},
     // Expert banks [experts, out, in] as the [experts * out, in] rows `MoeLinear` reads.
-    {tensor: "model.language_model.layers.{i}.mlp.experts.{n:*}", op: "reshape", args: {shape: [
-      "shape(fmt('model.language_model.layers.{i}.mlp.experts.{n}'))[0] * shape(fmt('model.language_model.layers.{i}.mlp.experts.{n}'))[1]",
-      "shape(fmt('model.language_model.layers.{i}.mlp.experts.{n}'))[2]"]}},
+    {tensor: "model.language_model.layers.{i}.mlp.experts.{n:*}", op: "reshape",
+     args: {shape: [-1, "shape(fmt('model.language_model.layers.{i}.mlp.experts.{n}'))[2]"]}},
     // mmproj patch embedder: the [out, c, y, x] conv kernel as the HF [out, (y, x, c)] linear.
     {tensor: "model.vision_tower.patch_embedder.input_proj.weight", op: "conv_to_linear", args: {order: "k_in"}, when: "gg && v_ok"},
     {tensor: "model.vision_tower.patch_embedder.input_proj.weight", op: "to_bf16", when: "gg && v_ok"},
     // Vision position tables [2 (x, y), size, d] as [size, (x, y) d] rows one gather reads.
     {tensor: "model.vision_tower.patch_embedder.position_embedding_table", op: "transpose", args: {perm: [1, 0, 2]}, when: "v_ok"},
-    {tensor: "{t:*}.position_embedding_table", op: "reshape", args: {shape: ["shape(fmt('{t}.position_embedding_table'))[0]",
-      "shape(fmt('{t}.position_embedding_table'))[1] * shape(fmt('{t}.position_embedding_table'))[2]"]}},
+    {tensor: "{t:*}.position_embedding_table", op: "reshape", args: {shape: [0, -1]}},
     // gemma4_unified: [size, 2 (x, y), d] already in row order.
-    {tensor: "model.vision_embedder.pos_embedding", op: "reshape", args: {shape: ["shape('model.vision_embedder.pos_embedding')[0]",
-      "shape('model.vision_embedder.pos_embedding')[1] * shape('model.vision_embedder.pos_embedding')[2]"]}},
+    {tensor: "model.vision_embedder.pos_embedding", op: "reshape", args: {shape: [0, -1]}},
     // Audio q scale per head dim: softplus(per_dim_scale) / (sqrt(head_dim) ln 2).
     {tensor: "model.audio_tower.layers.{i}.self_attn.per_dim_scale", op: "softplus"},
     {tensor: "model.audio_tower.layers.{i}.self_attn.per_dim_scale", op: "scale", args: {value: "a_hd ** -0.5 / ln(2)"}},
@@ -235,8 +232,7 @@
     {tensor: "model.audio_tower.subsample_conv_projection.layer{i}.conv.weight", op: "round_bf16", when: "gg"},
     {tensor: "model.audio_tower.layers.{i}.lconv1d.depthwise_conv1d.weight", op: "reshape",
      when: "gg && len(shape(fmt('model.audio_tower.layers.{i}.lconv1d.depthwise_conv1d.weight'))) == 2",
-     args: {shape: ["shape(fmt('model.audio_tower.layers.{i}.lconv1d.depthwise_conv1d.weight'))[0]", 1,
-                    "shape(fmt('model.audio_tower.layers.{i}.lconv1d.depthwise_conv1d.weight'))[1]"]}},
+     args: {shape: [0, 1, -1]}},
     {tensor: "model.audio_tower.layers.{i}.lconv1d.depthwise_conv1d.weight", op: "to_f32"},
   ],
   constants: {

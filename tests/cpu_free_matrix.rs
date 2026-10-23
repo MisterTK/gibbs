@@ -24,13 +24,25 @@ fn classifier_on_gpu(name: &str, (cfg, ts): (serde_json::Value, synth::Ts)) {
     let before = cpu_compute::entered();
     for pair in [None, Some(synth::PAIR)] {
         for _ in 0..2 {
-            let (scores, _) = c.classify(synth::TEXT, pair).unwrap_or_else(|e| panic!("{name}: {e}"));
-            assert!(scores.iter().all(|s| s.score.is_finite()), "{name}: non-finite scores");
+            let (scores, _) = c
+                .classify(synth::TEXT, pair)
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert!(
+                scores.iter().all(|s| s.score.is_finite()),
+                "{name}: non-finite scores"
+            );
             let sum: f32 = scores.iter().map(|s| s.score).sum();
-            assert!((sum - 1.0).abs() < 1e-4, "{name}: softmax scores sum to {sum}");
+            assert!(
+                (sum - 1.0).abs() < 1e-4,
+                "{name}: softmax scores sum to {sum}"
+            );
         }
     }
-    assert_eq!(cpu_compute::entered(), before, "{name}: entered CPU compute");
+    assert_eq!(
+        cpu_compute::entered(),
+        before,
+        "{name}: entered CPU compute"
+    );
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -74,14 +86,24 @@ fn spec_fixture_on_gpu(
     let lm = gibbs_engine::runtime::lm::load(&a, reg, family, PlacementMode::Pin(Device::Metal))
         .unwrap_or_else(|e| panic!("{name}: {e}"));
     assert_eq!(lm.device(), Device::Metal, "{name}");
-    let (ids, mut st) = lm.prepare(ids.to_vec(), media).unwrap_or_else(|e| panic!("{name}: {e}"));
+    let (ids, mut st) = lm
+        .prepare(ids.to_vec(), media)
+        .unwrap_or_else(|e| panic!("{name}: {e}"));
     let before = cpu_compute::entered();
-    let mut l = lm.forward(&ids, 0, &mut st).unwrap_or_else(|e| panic!("{name}: {e}"));
+    let mut l = lm
+        .forward(&ids, 0, &mut st)
+        .unwrap_or_else(|e| panic!("{name}: {e}"));
     for q in 0..2 {
         assert!(l.iter().all(|v| v.is_finite()), "{name}: non-finite logits");
-        l = lm.forward(&[1], ids.len() + q, &mut st).unwrap_or_else(|e| panic!("{name}: {e}"));
+        l = lm
+            .forward(&[1], ids.len() + q, &mut st)
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
     }
-    assert_eq!(cpu_compute::entered(), before, "{name}: entered CPU compute");
+    assert_eq!(
+        cpu_compute::entered(),
+        before,
+        "{name}: entered CPU compute"
+    );
     Outcome::Ran
 }
 
@@ -125,12 +147,21 @@ fn net_on_gpu(
         given.push((p.name.as_str(), t));
     }
     let _ = step;
-    let step = [("t", 500.0), ("timestep", 500.0), ("sigma", 0.5), ("guidance", 3.5)];
+    let step = [
+        ("t", 500.0),
+        ("timestep", 500.0),
+        ("sigma", 0.5),
+        ("guidance", 3.5),
+    ];
     let before = cpu_compute::entered();
     let out = net
         .run(&val_vars, &given, &step)
         .unwrap_or_else(|e| panic!("{family}/{net_name} run: {e}"));
-    assert_eq!(cpu_compute::entered(), before, "{family}/{net_name}: entered CPU compute");
+    assert_eq!(
+        cpu_compute::entered(),
+        before,
+        "{family}/{net_name}: entered CPU compute"
+    );
     for (oname, t) in out {
         if let Ok(s) = t.as_f32() {
             assert!(
@@ -145,7 +176,10 @@ fn net_on_gpu(
 /// 16 kHz mono 16-bit WAV: 0.5 s of a 440 Hz tone.
 fn tone_wav() -> Vec<u8> {
     let pcm: Vec<u8> = (0..8000)
-        .flat_map(|i| (((i as f32 / 16000.0 * 440.0 * std::f32::consts::TAU).sin() * 8000.0) as i16).to_le_bytes())
+        .flat_map(|i| {
+            (((i as f32 / 16000.0 * 440.0 * std::f32::consts::TAU).sin() * 8000.0) as i16)
+                .to_le_bytes()
+        })
         .collect();
     let mut b = b"RIFF".to_vec();
     b.extend((36 + pcm.len() as u32).to_le_bytes());
@@ -171,10 +205,20 @@ const IDEFICS3_IMG: u32 = 120;
 /// Media soft tokens placed over prompt rows by the GPU `Scatter`.
 fn scatter_fixture(name: &str) {
     let base: Vec<f32> = (0..4 * 8).map(|i| i as f32).collect();
-    let out = gibbs_engine::model::vision_graph::scatter_rows(base.clone(), 4, 8, &[1, 3], vec![-1.0; 16], PlacementMode::Auto)
-        .unwrap_or_else(|e| panic!("{name} scatter: {e}"));
+    let out = gibbs_engine::model::vision_graph::scatter_rows(
+        base.clone(),
+        4,
+        8,
+        &[1, 3],
+        vec![-1.0; 16],
+        PlacementMode::Auto,
+    )
+    .unwrap_or_else(|e| panic!("{name} scatter: {e}"));
     assert_eq!(&out[..8], &base[..8], "{name}");
-    assert!(out[8..16].iter().chain(&out[24..]).all(|&v| v == -1.0), "{name}");
+    assert!(
+        out[8..16].iter().chain(&out[24..]).all(|&v| v == -1.0),
+        "{name}"
+    );
 }
 
 /// Deterministic f32 tensors written as a safetensors checkpoint.
@@ -186,7 +230,10 @@ impl Ckpt {
     fn s(&mut self, n: impl Into<String>, shape: &[usize], scale: f32) -> &mut Self {
         let v = (0..shape.iter().product::<usize>())
             .map(|_| {
-                self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                self.0 = self
+                    .0
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 ((self.0 >> 40) as f32 / (1u64 << 24) as f32 * 2.0 - 1.0) * scale
             })
             .collect();
@@ -207,7 +254,10 @@ impl Ckpt {
         for (n, shape, v) in &self.1 {
             let a = data.len();
             data.extend(v.iter().flat_map(|x| x.to_le_bytes()));
-            h.insert(n.clone(), json!({"dtype": "F32", "shape": shape, "data_offsets": [a, data.len()]}));
+            h.insert(
+                n.clone(),
+                json!({"dtype": "F32", "shape": shape, "data_offsets": [a, data.len()]}),
+            );
         }
         let mut hb = serde_json::to_vec(&h).unwrap();
         hb.resize(hb.len().next_multiple_of(8), b' ');
@@ -216,7 +266,8 @@ impl Ckpt {
         out.extend(data);
         std::fs::write(dir.join("model.safetensors"), out).unwrap();
         std::fs::write(dir.join("config.json"), cfg.to_string()).unwrap();
-        let vm: serde_json::Map<String, serde_json::Value> = (0..vocab).map(|i| (format!("t{i}"), json!(i))).collect();
+        let vm: serde_json::Map<String, serde_json::Value> =
+            (0..vocab).map(|i| (format!("t{i}"), json!(i))).collect();
         let tok = json!({"version": "1.0", "added_tokens": [], "normalizer": null,
             "pre_tokenizer": {"type": "WhitespaceSplit"}, "post_processor": null, "decoder": null,
             "model": {"type": "WordLevel", "vocab": vm, "unk_token": "t0"}});
@@ -239,9 +290,9 @@ fn artifacts(dir: &std::path::Path) -> gibbs_engine::model::hub::ModelArtifacts 
 /// A tiny random T5 (gated) or BART (3-beam search, forking beam state) through
 /// `runtime::encdec` on Metal: encoder, search and decoder steps all on the GPU.
 fn encdec_on_gpu(name: &str, bart: bool) {
-    use serde_json::json;
-    use gibbs_engine::runtime::encdec::SpecEncDec;
     use gibbs_engine::model::native::NativeLm;
+    use gibbs_engine::runtime::encdec::SpecEncDec;
+    use serde_json::json;
     let (v, d) = (40, 32);
     let dir = std::env::temp_dir().join(format!("gibbs-matrix-encdec-{name}"));
     let mut w = Ckpt::new(7);
@@ -250,20 +301,38 @@ fn encdec_on_gpu(name: &str, bart: bool) {
         for side in ["encoder", "decoder"] {
             let p = format!("model.{side}");
             w.s(format!("{p}.embed_positions.weight"), &[66, d], 0.3);
-            w.norm(format!("{p}.layernorm_embedding.weight"), d, 1.0).s(format!("{p}.layernorm_embedding.bias"), &[d], 0.1);
+            w.norm(format!("{p}.layernorm_embedding.weight"), d, 1.0).s(
+                format!("{p}.layernorm_embedding.bias"),
+                &[d],
+                0.1,
+            );
             let mut attns = vec!["self_attn"];
             if side == "decoder" {
                 attns.push("encoder_attn");
             }
             for a in attns {
                 for proj in ["q_proj", "k_proj", "v_proj", "out_proj"] {
-                    w.w(format!("{p}.layers.0.{a}.{proj}.weight"), &[d, d]).s(format!("{p}.layers.0.{a}.{proj}.bias"), &[d], 0.1);
+                    w.w(format!("{p}.layers.0.{a}.{proj}.weight"), &[d, d]).s(
+                        format!("{p}.layers.0.{a}.{proj}.bias"),
+                        &[d],
+                        0.1,
+                    );
                 }
-                w.norm(format!("{p}.layers.0.{a}_layer_norm.weight"), d, 1.0).s(format!("{p}.layers.0.{a}_layer_norm.bias"), &[d], 0.1);
+                w.norm(format!("{p}.layers.0.{a}_layer_norm.weight"), d, 1.0)
+                    .s(format!("{p}.layers.0.{a}_layer_norm.bias"), &[d], 0.1);
             }
-            w.w(format!("{p}.layers.0.fc1.weight"), &[64, d]).s(format!("{p}.layers.0.fc1.bias"), &[64], 0.1);
-            w.w(format!("{p}.layers.0.fc2.weight"), &[d, 64]).s(format!("{p}.layers.0.fc2.bias"), &[d], 0.1);
-            w.norm(format!("{p}.layers.0.final_layer_norm.weight"), d, 1.0).s(format!("{p}.layers.0.final_layer_norm.bias"), &[d], 0.1);
+            w.w(format!("{p}.layers.0.fc1.weight"), &[64, d]).s(
+                format!("{p}.layers.0.fc1.bias"),
+                &[64],
+                0.1,
+            );
+            w.w(format!("{p}.layers.0.fc2.weight"), &[d, 64]).s(
+                format!("{p}.layers.0.fc2.bias"),
+                &[d],
+                0.1,
+            );
+            w.norm(format!("{p}.layers.0.final_layer_norm.weight"), d, 1.0)
+                .s(format!("{p}.layers.0.final_layer_norm.bias"), &[d], 0.1);
         }
         json!({"architectures": ["BartForConditionalGeneration"], "model_type": "bart", "vocab_size": v,
             "d_model": d, "max_position_embeddings": 64, "encoder_layers": 1, "decoder_layers": 1,
@@ -284,10 +353,15 @@ fn encdec_on_gpu(name: &str, bart: bool) {
                     w.w(format!("{b}.{l}.{m}.{p}.weight"), &[d, d]);
                 }
             }
-            w.s(format!("{b}.0.SelfAttention.relative_attention_bias.weight"), &[8, 4], 1.0);
+            w.s(
+                format!("{b}.0.SelfAttention.relative_attention_bias.weight"),
+                &[8, 4],
+                1.0,
+            );
             let f = if stack == "decoder" { 2 } else { 1 };
             w.norm(format!("{b}.{f}.layer_norm.weight"), d, 1.0);
-            w.w(format!("{b}.{f}.DenseReluDense.wi_0.weight"), &[48, d]).w(format!("{b}.{f}.DenseReluDense.wi_1.weight"), &[48, d]);
+            w.w(format!("{b}.{f}.DenseReluDense.wi_0.weight"), &[48, d])
+                .w(format!("{b}.{f}.DenseReluDense.wi_1.weight"), &[48, d]);
             w.w(format!("{b}.{f}.DenseReluDense.wo.weight"), &[d, 48]);
             w.norm(format!("{stack}.final_layer_norm.weight"), d, 1.0);
         }
@@ -297,15 +371,27 @@ fn encdec_on_gpu(name: &str, bart: bool) {
     };
     w.write_checkpoint(&dir, &cfg, v);
     let reg = gibbs_engine::arch::registry().unwrap();
-    let m = gibbs_engine::arch::load::load(&artifacts(&dir), reg, None).unwrap_or_else(|e| panic!("{name}: {e}"));
-    let lm = SpecEncDec::new(m, PlacementMode::Pin(Device::Metal)).unwrap_or_else(|e| panic!("{name}: {e}"));
+    let m = gibbs_engine::arch::load::load(&artifacts(&dir), reg, None)
+        .unwrap_or_else(|e| panic!("{name}: {e}"));
+    let lm = SpecEncDec::new(m, PlacementMode::Pin(Device::Metal))
+        .unwrap_or_else(|e| panic!("{name}: {e}"));
     assert_eq!(lm.device(), Device::Metal, "{name}");
-    let src = if bart { b"t3 t5 t7".iter().map(|&b| b as u32).collect() } else { vec![3u32, 5, 7] };
-    let (prompt, mut st) = lm.prepare(src, &[]).unwrap_or_else(|e| panic!("{name}: {e}"));
-    let mut l = lm.forward(&prompt, 0, &mut st).unwrap_or_else(|e| panic!("{name}: {e}"));
+    let src = if bart {
+        b"t3 t5 t7".iter().map(|&b| b as u32).collect()
+    } else {
+        vec![3u32, 5, 7]
+    };
+    let (prompt, mut st) = lm
+        .prepare(src, &[])
+        .unwrap_or_else(|e| panic!("{name}: {e}"));
+    let mut l = lm
+        .forward(&prompt, 0, &mut st)
+        .unwrap_or_else(|e| panic!("{name}: {e}"));
     for pos in prompt.len()..prompt.len() + 2 {
         let t = (0..l.len()).max_by(|&a, &b| l[a].total_cmp(&l[b])).unwrap() as u32;
-        l = lm.forward(&[t], pos, &mut st).unwrap_or_else(|e| panic!("{name}: {e}"));
+        l = lm
+            .forward(&[t], pos, &mut st)
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
     }
     assert_eq!(lm.cpu_node_count(), 0, "{name}: nodes run on the CPU");
 }
@@ -346,8 +432,11 @@ fn qwen35_on_gpu(name: &str, moe: bool, vl: bool) {
     w.w(format!("{p}.embed_tokens.weight"), &[96, H]);
     for l in 0..3 {
         let lp = format!("{p}.layers.{l}");
-        w.norm(format!("{lp}.input_layernorm.weight"), H, 0.0)
-            .norm(format!("{lp}.post_attention_layernorm.weight"), H, 0.0);
+        w.norm(format!("{lp}.input_layernorm.weight"), H, 0.0).norm(
+            format!("{lp}.post_attention_layernorm.weight"),
+            H,
+            0.0,
+        );
         if l < 2 {
             let a = format!("{lp}.linear_attn");
             w.w(format!("{a}.in_proj_qkv.weight"), &[64, H])
@@ -364,11 +453,18 @@ fn qwen35_on_gpu(name: &str, moe: bool, vl: bool) {
         }
         mlp(&mut w, &lp, moe);
     }
-    w.norm(format!("{p}.norm.weight"), H, 0.0).w("lm_head.weight", &[96, H]);
+    w.norm(format!("{p}.norm.weight"), H, 0.0)
+        .w("lm_head.weight", &[96, H]);
     let mtp = !moe && !vl;
     if mtp {
         w.w("mtp.fc.weight", &[H, 2 * H]);
-        for n in ["pre_fc_norm_embedding", "pre_fc_norm_hidden", "norm", "layers.0.input_layernorm", "layers.0.post_attention_layernorm"] {
+        for n in [
+            "pre_fc_norm_embedding",
+            "pre_fc_norm_hidden",
+            "norm",
+            "layers.0.input_layernorm",
+            "layers.0.post_attention_layernorm",
+        ] {
             w.norm(format!("mtp.{n}.weight"), H, 0.0);
         }
         attn(&mut w, "mtp.layers.0.self_attn");
@@ -391,7 +487,12 @@ fn qwen35_on_gpu(name: &str, moe: bool, vl: bool) {
     if moe {
         let c = text.as_object_mut().unwrap();
         c.remove("intermediate_size");
-        for (k, v) in [("num_experts", 8), ("num_experts_per_tok", 2), ("moe_intermediate_size", 32), ("shared_expert_intermediate_size", 32)] {
+        for (k, v) in [
+            ("num_experts", 8),
+            ("num_experts_per_tok", 2),
+            ("moe_intermediate_size", 32),
+            ("shared_expert_intermediate_size", 32),
+        ] {
             c.insert(k.into(), json!(v));
         }
     }
@@ -405,10 +506,17 @@ fn qwen35_on_gpu(name: &str, moe: bool, vl: bool) {
         for b in 0..2 {
             let bp = format!("{v}.blocks.{b}");
             for n in ["norm1", "norm2"] {
-                w.norm(format!("{bp}.{n}.weight"), d, 1.0).s(format!("{bp}.{n}.bias"), &[d], 0.1);
+                w.norm(format!("{bp}.{n}.weight"), d, 1.0)
+                    .s(format!("{bp}.{n}.bias"), &[d], 0.1);
             }
-            for (n, r, c) in [("attn.qkv", 3 * d, d), ("attn.proj", d, d), ("mlp.linear_fc1", 64, d), ("mlp.linear_fc2", d, 64)] {
-                w.w(format!("{bp}.{n}.weight"), &[r, c]).s(format!("{bp}.{n}.bias"), &[r], 0.1);
+            for (n, r, c) in [
+                ("attn.qkv", 3 * d, d),
+                ("attn.proj", d, d),
+                ("mlp.linear_fc1", 64, d),
+                ("mlp.linear_fc2", d, 64),
+            ] {
+                w.w(format!("{bp}.{n}.weight"), &[r, c])
+                    .s(format!("{bp}.{n}.bias"), &[r], 0.1);
             }
         }
         for (m, wide) in [("merger", d), ("deepstack_merger_list.0", 4 * d)] {
@@ -439,8 +547,12 @@ fn qwen35_on_gpu(name: &str, moe: bool, vl: bool) {
             "image_std":[0.5,0.5,0.5],"patch_size":2,"temporal_patch_size":2,"merge_size":2}"#,
     )
     .unwrap();
-    let m = gibbs_engine::arch::load::load(&artifacts(&dir), gibbs_engine::arch::registry().unwrap(), None)
-        .unwrap_or_else(|e| panic!("{name}: {e}"));
+    let m = gibbs_engine::arch::load::load(
+        &artifacts(&dir),
+        gibbs_engine::arch::registry().unwrap(),
+        None,
+    )
+    .unwrap_or_else(|e| panic!("{name}: {e}"));
     assert_eq!(m.spec.family, "qwen3_5", "{name}");
     let lm = gibbs_engine::runtime::lm::SpecLm::new(m, PlacementMode::Pin(Device::Metal))
         .unwrap_or_else(|e| panic!("{name}: {e}"));
@@ -449,20 +561,30 @@ fn qwen35_on_gpu(name: &str, moe: bool, vl: bool) {
     let media = match vl {
         true => {
             let mut img = gibbs_engine::model::image::ImageBuffer::new(16, 24);
-            img.data.iter_mut().enumerate().for_each(|(i, px)| *px = (i * 37 % 251) as u8);
+            img.data
+                .iter_mut()
+                .enumerate()
+                .for_each(|(i, px)| *px = (i * 37 % 251) as u8);
             vec![MediaInput::Image(img.to_png())]
         }
         false => Vec::new(),
     };
-    let prompt = if vl { vec![3, 7, IMAGE, 11, 5] } else { vec![4, 8, 15, 16, 23] };
-    let (ids, mut st) = lm.prepare(prompt, &media).unwrap_or_else(|e| panic!("{name}: {e}"));
+    let prompt = if vl {
+        vec![3, 7, IMAGE, 11, 5]
+    } else {
+        vec![4, 8, 15, 16, 23]
+    };
+    let (ids, mut st) = lm
+        .prepare(prompt, &media)
+        .unwrap_or_else(|e| panic!("{name}: {e}"));
     let n = ids.len();
     let drafter = lm.drafter();
     assert_eq!(drafter.is_some(), mtp, "{name}: shipped MTP drafter");
     let mut l = match &drafter {
         Some(d) => {
             lm.set_taps(&mut st, &d.tap_layers()).unwrap();
-            lm.forward(&ids[..n - 1], 0, &mut st).unwrap_or_else(|e| panic!("{name}: {e}"));
+            lm.forward(&ids[..n - 1], 0, &mut st)
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
             let h = lm.take_taps(&mut st);
             let drafts = d
                 .propose(&mut d.new_state(), &ids, &h, 3, &mut |l: &[f32]| argmax(l))
@@ -475,7 +597,9 @@ fn qwen35_on_gpu(name: &str, moe: bool, vl: bool) {
     .unwrap_or_else(|e| panic!("{name}: {e}"));
     for pos in n..n + 2 {
         assert!(l.iter().all(|x| x.is_finite()), "{name}: non-finite logits");
-        l = lm.forward(&[argmax(&l)], pos, &mut st).unwrap_or_else(|e| panic!("{name}: {e}"));
+        l = lm
+            .forward(&[argmax(&l)], pos, &mut st)
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -485,7 +609,10 @@ type Specs = Vec<(String, Vec<usize>)>;
 struct Lcg(u64);
 impl Lcg {
     fn next(&mut self) -> f32 {
-        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         ((self.0 >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
     }
     fn vec(&mut self, n: usize, scale: f32) -> Vec<f32> {
@@ -521,7 +648,8 @@ fn write_f32_safetensors(
             serde_json::json!({"dtype": "F32", "shape": shape, "data_offsets": [start, data.len()]}),
         );
     }
-    let mut h = serde_json::to_vec(&serde_json::Value::Object(header)).map_err(|e| e.to_string())?;
+    let mut h =
+        serde_json::to_vec(&serde_json::Value::Object(header)).map_err(|e| e.to_string())?;
     h.resize(h.len().next_multiple_of(8), b' ');
     let mut out = (h.len() as u64).to_le_bytes().to_vec();
     out.extend(h);
@@ -565,22 +693,40 @@ fn tiny_vae_on_gpu() -> Result<(), String> {
             s.push((format!("first_stage_model.{p}.{n}.bias"), vec![c]));
         }
         for (n, ci, co, k) in [("conv1", i, o, 3), ("conv2", o, o, 3)] {
-            s.push((format!("first_stage_model.{p}.{n}.weight"), vec![co, ci, k, k]));
+            s.push((
+                format!("first_stage_model.{p}.{n}.weight"),
+                vec![co, ci, k, k],
+            ));
             s.push((format!("first_stage_model.{p}.{n}.bias"), vec![co]));
         }
         if i != o {
-            s.push((format!("first_stage_model.{p}.nin_shortcut.weight"), vec![o, i, 1, 1]));
+            s.push((
+                format!("first_stage_model.{p}.nin_shortcut.weight"),
+                vec![o, i, 1, 1],
+            ));
             s.push((format!("first_stage_model.{p}.nin_shortcut.bias"), vec![o]));
         }
     }
     let mid = |s: &mut Specs, p: &str, c: usize| {
         resnet(s, &format!("{p}.mid.block_1"), c, c);
         resnet(s, &format!("{p}.mid.block_2"), c, c);
-        s.push((format!("first_stage_model.{p}.mid.attn_1.norm.weight"), vec![c]));
-        s.push((format!("first_stage_model.{p}.mid.attn_1.norm.bias"), vec![c]));
+        s.push((
+            format!("first_stage_model.{p}.mid.attn_1.norm.weight"),
+            vec![c],
+        ));
+        s.push((
+            format!("first_stage_model.{p}.mid.attn_1.norm.bias"),
+            vec![c],
+        ));
         for n in ["q", "k", "v", "proj_out"] {
-            s.push((format!("first_stage_model.{p}.mid.attn_1.{n}.weight"), vec![c, c, 1, 1]));
-            s.push((format!("first_stage_model.{p}.mid.attn_1.{n}.bias"), vec![c]));
+            s.push((
+                format!("first_stage_model.{p}.mid.attn_1.{n}.weight"),
+                vec![c, c, 1, 1],
+            ));
+            s.push((
+                format!("first_stage_model.{p}.mid.attn_1.{n}.bias"),
+                vec![c],
+            ));
         }
     };
     conv(&mut s, "encoder.conv_in", 3, 32, 3);
@@ -603,11 +749,24 @@ fn tiny_vae_on_gpu() -> Result<(), String> {
     conv(&mut s, "decoder.conv_out", 32, 3, 3);
     let d = std::env::temp_dir().join(format!("gibbs-tiny-vae-{}", std::process::id()));
     std::fs::create_dir_all(&d).map_err(|e| e.to_string())?;
-    write_f32_safetensors(&d.join("diffusion_pytorch_model.safetensors"), &values(&s, 7))?;
-    let de = gibbs_engine::runtime::diffusion::Net::open(&d, "sd_vae", "decoder", PlacementMode::Pin(Device::Metal))?;
+    write_f32_safetensors(
+        &d.join("diffusion_pytorch_model.safetensors"),
+        &values(&s, 7),
+    )?;
+    let de = gibbs_engine::runtime::diffusion::Net::open(
+        &d,
+        "sd_vae",
+        "decoder",
+        PlacementMode::Pin(Device::Metal),
+    )?;
     let (h, w) = (6, 5);
     let vars = [("h", Val::Num(h as f64)), ("w", Val::Num(w as f64))];
-    let img = de.run_one(&vars, &[("z", Tensor::F32(Lcg(3).vec(4 * h * w, 1.0)))], &[], None)?;
+    let img = de.run_one(
+        &vars,
+        &[("z", Tensor::F32(Lcg(3).vec(4 * h * w, 1.0)))],
+        &[],
+        None,
+    )?;
     std::fs::remove_dir_all(&d).ok();
     if img.len() != 3 * 2 * h * 2 * w {
         return Err(format!("sd vae: {} values", img.len()));
@@ -649,11 +808,23 @@ fn tiny_video_on_gpu() -> Result<(), String> {
     s.push(("scale_shift_table".into(), vec![2, d]));
     let dir = tmp.path().join("ltx");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    write_f32_safetensors(&dir.join("diffusion_pytorch_model.safetensors"), &values(&s, 3))?;
+    write_f32_safetensors(
+        &dir.join("diffusion_pytorch_model.safetensors"),
+        &values(&s, 3),
+    )?;
     let net = Net::open(&dir, "ltx", "denoiser", PlacementMode::Pin(Device::Metal))?;
     let (f, h, w, nt) = (2, 2, 2, 3);
-    let vars = [("frames", num(f)), ("h", num(h)), ("w", num(w)), ("nt", num(nt)), ("clean", num(h * w))];
-    let given = [("x", Tensor::F32(Lcg(4).vec(f * h * w * 128, 1.0))), ("context", Tensor::F32(Lcg(5).vec(nt * ti, 1.0)))];
+    let vars = [
+        ("frames", num(f)),
+        ("h", num(h)),
+        ("w", num(w)),
+        ("nt", num(nt)),
+        ("clean", num(h * w)),
+    ];
+    let given = [
+        ("x", Tensor::F32(Lcg(4).vec(f * h * w * 128, 1.0))),
+        ("context", Tensor::F32(Lcg(5).vec(nt * ti, 1.0))),
+    ];
     let v = net.run_one(&vars, &given, &[("t", 500.0)], None)?;
     if v.iter().any(|x| !x.is_finite()) {
         return Err("non-finite LTX output".into());
@@ -673,7 +844,13 @@ fn tiny_video_on_gpu() -> Result<(), String> {
     res(&mut s, "decoder.mid_block.resnets.0");
     for i in 0..4 {
         if i == 3 {
-            c3(&mut s, "decoder.up_blocks.3.upsamplers.0.conv.conv", ch, 8 * ch, 3);
+            c3(
+                &mut s,
+                "decoder.up_blocks.3.upsamplers.0.conv.conv",
+                ch,
+                8 * ch,
+                3,
+            );
         }
         res(&mut s, &format!("decoder.up_blocks.{i}.resnets.0"));
     }
@@ -682,7 +859,13 @@ fn tiny_video_on_gpu() -> Result<(), String> {
     for i in 0..4 {
         res(&mut s, &format!("encoder.down_blocks.{i}.resnets.0"));
         if i == 0 {
-            c3(&mut s, "encoder.down_blocks.0.downsamplers.0.conv", ch, ch, 3);
+            c3(
+                &mut s,
+                "encoder.down_blocks.0.downsamplers.0.conv",
+                ch,
+                ch,
+                3,
+            );
         }
     }
     res(&mut s, "encoder.mid_block.resnets.0");
@@ -691,7 +874,10 @@ fn tiny_video_on_gpu() -> Result<(), String> {
     s.push(("latents_std".into(), vec![lat]));
     let dir = tmp.path().join("ltx_vae");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    write_f32_safetensors(&dir.join("diffusion_pytorch_model.safetensors"), &values(&s, 9))?;
+    write_f32_safetensors(
+        &dir.join("diffusion_pytorch_model.safetensors"),
+        &values(&s, 9),
+    )?;
     let cfg = serde_json::json!({"_class_name": "AutoencoderKLLTXVideo", "block_out_channels": [ch, ch, ch, ch],
         "layers_per_block": [1, 1, 1, 1, 1], "spatio_temporal_scaling": [true, false, false, false], "patch_size": p, "latent_channels": lat});
     std::fs::write(dir.join("config.json"), cfg.to_string()).map_err(|e| e.to_string())?;
@@ -699,13 +885,23 @@ fn tiny_video_on_gpu() -> Result<(), String> {
     let dec = Net::open(&dir, "ltx_vae", "decoder", mode)?;
     let (f, h, w) = (2, 2, 3);
     let vars = [("frames", num(f)), ("h", num(h)), ("w", num(w))];
-    let rgb = dec.run_one(&vars, &[("z", Tensor::F32(Lcg(10).vec(f * lat * h * w, 1.0)))], &[], None)?;
+    let rgb = dec.run_one(
+        &vars,
+        &[("z", Tensor::F32(Lcg(10).vec(f * lat * h * w, 1.0)))],
+        &[],
+        None,
+    )?;
     if rgb.len() != 3 * 3 * (2 * p * h) * (2 * p * w) || rgb.iter().any(|x| !x.is_finite()) {
         return Err(format!("LTX VAE decode: {} values", rgb.len()));
     }
     let enc = Net::open(&dir, "ltx_vae", "encoder", mode)?;
     let img = Lcg(11).vec(3 * (2 * p * h) * (2 * p * w), 1.0);
-    let z = enc.run_one(&[("h", num(h)), ("w", num(w))], &[("image", Tensor::F32(img))], &[], None)?;
+    let z = enc.run_one(
+        &[("h", num(h)), ("w", num(w))],
+        &[("image", Tensor::F32(img))],
+        &[],
+        None,
+    )?;
     if z.len() != lat * h * w || z.iter().any(|x| !x.is_finite()) {
         return Err(format!("LTX VAE encode: {} values", z.len()));
     }
@@ -741,7 +937,10 @@ fn tiny_video_on_gpu() -> Result<(), String> {
         }
         for i in 1..=4 {
             nrm(s, &format!("{base}.temp_convs.{j}.conv{i}.0"), c);
-            let cw = format!("{base}.temp_convs.{j}.conv{i}.{}", if i == 1 { 2 } else { 3 });
+            let cw = format!(
+                "{base}.temp_convs.{j}.conv{i}.{}",
+                if i == 1 { 2 } else { 3 }
+            );
             s.push((format!("{cw}.weight"), vec![c, c, 3, 1, 1]));
             s.push((format!("{cw}.bias"), vec![c]));
         }
@@ -774,14 +973,30 @@ fn tiny_video_on_gpu() -> Result<(), String> {
     conv(&mut s, "conv_out", c, 4, 3);
     let dir = tmp.path().join("unet3d");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    write_f32_safetensors(&dir.join("diffusion_pytorch_model.safetensors"), &values(&s, 6))?;
+    write_f32_safetensors(
+        &dir.join("diffusion_pytorch_model.safetensors"),
+        &values(&s, 6),
+    )?;
     let cfg = serde_json::json!({"_class_name": "UNet3DConditionModel", "in_channels": 4, "block_out_channels": [c, c],
         "cross_attention_dim": ctx, "attention_head_dim": 32, "layers_per_block": 2, "norm_num_groups": 32});
     std::fs::write(dir.join("config.json"), cfg.to_string()).map_err(|e| e.to_string())?;
-    let net = Net::open(&dir, "modelscope_t2v", "denoiser", PlacementMode::Pin(Device::Metal))?;
+    let net = Net::open(
+        &dir,
+        "modelscope_t2v",
+        "denoiser",
+        PlacementMode::Pin(Device::Metal),
+    )?;
     let (f, h, w, nt) = (2, 8, 8, 3);
-    let vars = [("frames", num(f)), ("h", num(h)), ("w", num(w)), ("nt", num(nt))];
-    let given = [("x", Tensor::F32(Lcg(7).vec(f * 4 * h * w, 1.0))), ("context", Tensor::F32(Lcg(8).vec(nt * ctx, 1.0)))];
+    let vars = [
+        ("frames", num(f)),
+        ("h", num(h)),
+        ("w", num(w)),
+        ("nt", num(nt)),
+    ];
+    let given = [
+        ("x", Tensor::F32(Lcg(7).vec(f * 4 * h * w, 1.0))),
+        ("context", Tensor::F32(Lcg(8).vec(nt * ctx, 1.0))),
+    ];
     let e = net.run_one(&vars, &given, &[("t", 900.0)], None)?;
     if e.len() != f * 4 * h * w || e.iter().any(|x| !x.is_finite()) {
         return Err("bad UNet3D output".into());
@@ -795,7 +1010,16 @@ fn bert_gguf_on_gpu() {
     const H: usize = 16;
     const INTER: usize = 32;
     const POS: usize = 16;
-    const TOKENS: [&str; 8] = ["[PAD]", "[UNK]", "[CLS]", "[SEP]", "\u{2581}hello", "\u{2581}world", "\u{2581}the", "ing"];
+    const TOKENS: [&str; 8] = [
+        "[PAD]",
+        "[UNK]",
+        "[CLS]",
+        "[SEP]",
+        "\u{2581}hello",
+        "\u{2581}world",
+        "\u{2581}the",
+        "ing",
+    ];
     let s = |v: &str| {
         let mut b = (v.len() as u64).to_le_bytes().to_vec();
         b.extend_from_slice(v.as_bytes());
@@ -805,7 +1029,15 @@ fn bert_gguf_on_gpu() {
     let mut ts: Vec<(String, Vec<usize>, u32, Vec<u8>)> = Vec::new();
     let mut push = |name: String, shape: &[usize], gain: bool| {
         let n: usize = shape.iter().product();
-        let v: Vec<f32> = (0..n).map(|_| if gain { 1.0 + 0.1 * r.next() } else { 0.3 * r.next() }).collect();
+        let v: Vec<f32> = (0..n)
+            .map(|_| {
+                if gain {
+                    1.0 + 0.1 * r.next()
+                } else {
+                    0.3 * r.next()
+                }
+            })
+            .collect();
         let dims: Vec<usize> = shape.iter().rev().copied().collect();
         let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
         ts.push((name, dims, 0, bytes));
@@ -815,7 +1047,14 @@ fn bert_gguf_on_gpu() {
     push("token_types.weight".into(), &[2, H], false);
     push("token_embd_norm.weight".into(), &[H], true);
     push("token_embd_norm.bias".into(), &[H], false);
-    for (m, o, i) in [("attn_q", H, H), ("attn_k", H, H), ("attn_v", H, H), ("attn_output", H, H), ("ffn_up", INTER, H), ("ffn_down", H, INTER)] {
+    for (m, o, i) in [
+        ("attn_q", H, H),
+        ("attn_k", H, H),
+        ("attn_v", H, H),
+        ("attn_output", H, H),
+        ("ffn_up", INTER, H),
+        ("ffn_down", H, INTER),
+    ] {
         push(format!("blk.0.{m}.weight"), &[o, i], false);
         push(format!("blk.0.{m}.bias"), &[o], false);
     }
@@ -838,10 +1077,27 @@ fn bert_gguf_on_gpu() {
         ("bert.block_count", 4, u32b(1)),
         ("bert.attention.head_count", 4, u32b(2)),
         ("bert.feed_forward_length", 4, u32b(INTER as u32)),
-        ("bert.attention.layer_norm_epsilon", 6, 1e-12f32.to_le_bytes().to_vec()),
+        (
+            "bert.attention.layer_norm_epsilon",
+            6,
+            1e-12f32.to_le_bytes().to_vec(),
+        ),
         ("tokenizer.ggml.model", 8, s("bert")),
-        ("tokenizer.ggml.tokens", 9, arr(8, TOKENS.iter().map(|t| s(t)).collect())),
-        ("tokenizer.ggml.token_type", 9, arr(5, (0..TOKENS.len()).map(|i| u32b(if i < 4 { 3 } else { 1 })).collect())),
+        (
+            "tokenizer.ggml.tokens",
+            9,
+            arr(8, TOKENS.iter().map(|t| s(t)).collect()),
+        ),
+        (
+            "tokenizer.ggml.token_type",
+            9,
+            arr(
+                5,
+                (0..TOKENS.len())
+                    .map(|i| u32b(if i < 4 { 3 } else { 1 }))
+                    .collect(),
+            ),
+        ),
     ];
     let mut b = b"GGUF".to_vec();
     b.extend_from_slice(&3u32.to_le_bytes());
@@ -875,25 +1131,36 @@ fn bert_gguf_on_gpu() {
         .unwrap_or_else(|e| panic!("bert_gguf: {e}"));
     assert_eq!(c.device(), Device::Metal, "bert_gguf");
     let before = cpu_compute::entered();
-    let (scores, _) = c.classify("hello world", None).unwrap_or_else(|e| panic!("bert_gguf: {e}"));
-    assert!(scores.iter().all(|s| s.score.is_finite()), "bert_gguf: non-finite scores");
-    assert_eq!(cpu_compute::entered(), before, "bert_gguf: entered CPU compute");
+    let (scores, _) = c
+        .classify("hello world", None)
+        .unwrap_or_else(|e| panic!("bert_gguf: {e}"));
+    assert!(
+        scores.iter().all(|s| s.score.is_finite()),
+        "bert_gguf: non-finite scores"
+    );
+    assert_eq!(
+        cpu_compute::entered(),
+        before,
+        "bert_gguf: entered CPU compute"
+    );
 }
 
 /// Families that are pure rename-rule or single-file wrappers over already-exercised components.
 const EXEMPT: &[(&str, &str)] = &[
-    ("ldm_clip", "extends clip_text (LDM rename rules)"),
-    ("ldm_openclip", "extends clip_text (OpenCLIP rename rules)"),
-    ("sdxl_clip_l", "extends clip_text (SDXL CLIP-L config)"),
-    ("sdxl_clip_g", "extends clip_text (SDXL CLIP-G config)"),
-    ("ldm_unet", "extends sd (LDM UNet rename rules)"),
-    ("ldm_vae", "extends sd_vae (LDM VAE rename rules)"),
-    ("sd1_file", "single-file wrapper over ldm_clip + ldm_unet + ldm_vae"),
-    ("sd2_file", "single-file wrapper over ldm_openclip + ldm_unet + ldm_vae"),
-    ("sdxl_file", "single-file wrapper over sdxl_clip + ldm_unet + ldm_vae"),
-    ("sd2_gguf", "GGUF wrapper over ldm_openclip + ldm_unet + ldm_vae"),
+    (
+        "sd1_file",
+        "single-file wrapper over clip_text + sd + sd_vae",
+    ),
+    (
+        "sd2_file",
+        "single-file wrapper over clip_text + sd + sd_vae",
+    ),
+    (
+        "sdxl_file",
+        "single-file wrapper over clip_text + sd + sd_vae",
+    ),
+    ("sd2_gguf", "GGUF wrapper over clip_text + sd + sd_vae"),
     ("fsmt", "extends bart (FSMT config/rename rules)"),
-    ("qwen3_vl", "extends qwen3 (text encoder tested via qwen3_vl_text; vision tower not covered separately)"),
 ];
 
 fn gpu_fixture(family: &str) -> Outcome {
@@ -903,11 +1170,31 @@ fn gpu_fixture(family: &str) -> Outcome {
     match family {
         "llama" => {
             classifier_on_gpu("llama-seqcls", synth::llama_seqcls());
-            spec_fixture_on_gpu("llama spec", "lm_graphlm_llama", Some("llama"), &[5, 17, 42, 99], &[])
+            spec_fixture_on_gpu(
+                "llama spec",
+                "lm_graphlm_llama",
+                Some("llama"),
+                &[5, 17, 42, 99],
+                &[],
+            )
         }
-        "glm" => spec_fixture_on_gpu("glm", "lm_graphlm_qk_norm", Some("glm"), &[5, 17, 42, 99], &[]),
-        "granite" => spec_fixture_on_gpu("granite", "lm_graphlm_granite", Some("granite"), &[5, 17, 42, 99], &[]),
-        "bitnet" => spec_fixture_on_gpu("bitnet", "lm_bitnet", Some("bitnet"), &[5, 17, 42, 99], &[]),
+        "glm" => spec_fixture_on_gpu(
+            "glm",
+            "lm_graphlm_qk_norm",
+            Some("glm"),
+            &[5, 17, 42, 99],
+            &[],
+        ),
+        "granite" => spec_fixture_on_gpu(
+            "granite",
+            "lm_graphlm_granite",
+            Some("granite"),
+            &[5, 17, 42, 99],
+            &[],
+        ),
+        "bitnet" => {
+            spec_fixture_on_gpu("bitnet", "lm_bitnet", Some("bitnet"), &[5, 17, 42, 99], &[])
+        }
         "gpt_neox" => {
             classifier_on_gpu("gpt-neox-seqcls", synth::gpt_neox_seqcls());
             Outcome::Ran
@@ -926,9 +1213,21 @@ fn gpu_fixture(family: &str) -> Outcome {
             &[2, 5, 7],
             &[],
         ),
-        "lfm2" => spec_fixture_on_gpu("lfm2", "lm_graphlm_lfm2", Some("lfm2"), &[5, 17, 42, 99], &[]),
+        "lfm2" => spec_fixture_on_gpu(
+            "lfm2",
+            "lm_graphlm_lfm2",
+            Some("lfm2"),
+            &[5, 17, 42, 99],
+            &[],
+        ),
         "nano" => spec_fixture_on_gpu("nano", "lm_nano", Some("nano"), &[5, 17, 42, 99], &[]),
-        "gemma2" => net_on_gpu("gemma2", "diffa_sana/text_encoder", "text", &[("rows", 4.0)], &[]),
+        "gemma2" => net_on_gpu(
+            "gemma2",
+            "diffa_sana/text_encoder",
+            "text",
+            &[("rows", 4.0)],
+            &[],
+        ),
         "gemma3" => spec_fixture_on_gpu(
             "gemma3",
             "gemma_gemma3_seqcls/models--gibbs-golden--gemma3-seqcls-tiny/snapshots/main",
@@ -937,32 +1236,85 @@ fn gpu_fixture(family: &str) -> Outcome {
             &[],
         ),
         "gemma4" => {
-            let r1 = spec_fixture_on_gpu("Gemma4", "gemma_gemma4_ple", Some("gemma4"), &[2, 10, 11, 12], &[]);
-            let _ = spec_fixture_on_gpu("Gemma4 MoE", "gemma_gemma4_moe", Some("gemma4"), &[2, 10, 11, 12], &[]);
+            let r1 = spec_fixture_on_gpu(
+                "Gemma4",
+                "gemma_gemma4_ple",
+                Some("gemma4"),
+                &[2, 10, 11, 12],
+                &[],
+            );
+            let _ = spec_fixture_on_gpu(
+                "Gemma4 MoE",
+                "gemma_gemma4_moe",
+                Some("gemma4"),
+                &[2, 10, 11, 12],
+                &[],
+            );
             let img = gibbs_engine::model::image::ImageBuffer::new(32, 24).to_png();
             let media = [gibbs_engine::model::native::MediaInput::Image(img)];
-            let _ = spec_fixture_on_gpu("Gemma4Media vision", "gemma_gemma4_image_prefill", Some("gemma4"), &[2, 10, 120, 12], &media);
+            let _ = spec_fixture_on_gpu(
+                "Gemma4Media vision",
+                "gemma_gemma4_image_prefill",
+                Some("gemma4"),
+                &[2, 10, 120, 12],
+                &media,
+            );
             let media = [gibbs_engine::model::native::MediaInput::Audio(tone_wav())];
-            let _ = spec_fixture_on_gpu("Audio conformer", "gemma_gemma4_audio", Some("gemma4"), &[2, 10, 121, 12], &media);
+            let _ = spec_fixture_on_gpu(
+                "Audio conformer",
+                "gemma_gemma4_audio",
+                Some("gemma4"),
+                &[2, 10, 121, 12],
+                &media,
+            );
             scatter_fixture("gemma4");
             r1
         }
         "gemma4_unified" => {
             let img = gibbs_engine::model::image::ImageBuffer::new(32, 24).to_png();
             let media = [gibbs_engine::model::native::MediaInput::Image(img)];
-            spec_fixture_on_gpu("gemma4_unified", "gemma_gemma4_unified_vision", Some("gemma4_unified"), &[2, 10, 120, 12], &media)
+            spec_fixture_on_gpu(
+                "gemma4_unified",
+                "gemma_gemma4_unified_vision",
+                Some("gemma4_unified"),
+                &[2, 10, 120, 12],
+                &media,
+            )
         }
-        "qwen3" => spec_fixture_on_gpu("qwen3", "qwen_qwen3_decode", Some("qwen3"), &[5, 17, 42, 60], &[]),
-        "hunyuan" => spec_fixture_on_gpu("hunyuan", "qwen_hunyuan_v1_dense_decode", Some("hunyuan"), &[5, 17, 42, 60], &[]),
+        "qwen3" => spec_fixture_on_gpu(
+            "qwen3",
+            "qwen_qwen3_decode",
+            Some("qwen3"),
+            &[5, 17, 42, 60],
+            &[],
+        ),
+        "hunyuan" => spec_fixture_on_gpu(
+            "hunyuan",
+            "qwen_hunyuan_v1_dense_decode",
+            Some("hunyuan"),
+            &[5, 17, 42, 60],
+            &[],
+        ),
         "qwen3_5" => {
             qwen35_on_gpu("qwen3_5", false, false);
             qwen35_on_gpu("qwen3_5_moe", true, false);
             qwen35_on_gpu("qwen3_5_vl", false, true);
             Outcome::Ran
         }
-        "qwen3_vl_text" => net_on_gpu("qwen3_vl_text", "text_enc_qwen3_vl_spec", "text", &[("rows", 4.0)], &[]),
-        "qwen2_5_vl_text" => net_on_gpu("qwen2_5_vl_text", "text_enc_qwen2_5_vl_spec", "text", &[("rows", 4.0)], &[]),
-        "qwen4_exp" => spec_fixture_on_gpu("qwen4_exp", "qwen_qwen4_exp", Some("qwen4_exp"), &[5, 17, 42, 60], &[]),
+        "qwen3_vl" => net_on_gpu(
+            "krea2.text_encoder",
+            "text_enc_qwen3_vl_spec",
+            "text",
+            &[("rows", 4.0)],
+            &[],
+        ),
+        "qwen4_exp" => spec_fixture_on_gpu(
+            "qwen4_exp",
+            "qwen_qwen4_exp",
+            Some("qwen4_exp"),
+            &[5, 17, 42, 60],
+            &[],
+        ),
         "dflash" => {
             let dir = find_fixture("qwen_dflash");
             let d = gibbs_engine::runtime::draft::load_drafter(
@@ -980,13 +1332,23 @@ fn gpu_fixture(family: &str) -> Outcome {
                 .propose(&mut st, &toks, &hidden, d.max_k(), &mut |_| 5)
                 .unwrap_or_else(|e| panic!("dflash propose: {e}"));
             assert!(!ids.is_empty(), "dflash produced no drafts");
-            assert_eq!(cpu_compute::entered(), before, "dflash: entered CPU compute");
+            assert_eq!(
+                cpu_compute::entered(),
+                before,
+                "dflash: entered CPU compute"
+            );
             Outcome::Ran
         }
         "idefics3" => {
             let img = gibbs_engine::model::image::ImageBuffer::new(24, 24).to_png();
             let media = [gibbs_engine::model::native::MediaInput::Image(img)];
-            let r = spec_fixture_on_gpu("idefics3 spec", "enc_smolvlm_grid", Some("idefics3"), &[1, 10, 11, IDEFICS3_IMG, 12, 13], &media);
+            let r = spec_fixture_on_gpu(
+                "idefics3 spec",
+                "enc_smolvlm_grid",
+                Some("idefics3"),
+                &[1, 10, 11, IDEFICS3_IMG, 12, 13],
+                &media,
+            );
             scatter_fixture("idefics3");
             r
         }
@@ -1010,7 +1372,12 @@ fn gpu_fixture(family: &str) -> Outcome {
             ts.w("embeddings.token_type_embeddings.weight", &[2, 16]);
             ts.ln("embeddings.LayerNorm", 16);
             let p = "encoder.layer.0";
-            for s in ["attention.self.query", "attention.self.key", "attention.self.value", "attention.output.dense"] {
+            for s in [
+                "attention.self.query",
+                "attention.self.key",
+                "attention.self.value",
+                "attention.output.dense",
+            ] {
                 ts.lin(&format!("{p}.{s}"), 16, 16);
             }
             ts.ln(&format!("{p}.attention.output.LayerNorm"), 16);
@@ -1021,7 +1388,8 @@ fn gpu_fixture(family: &str) -> Outcome {
                 "num_hidden_layers": 1, "num_attention_heads": 2, "intermediate_size": 32,
                 "max_position_embeddings": 32, "type_vocab_size": 2, "layer_norm_eps": 1e-5});
             let hub = HuggingFaceHub::with_cache_dir(synth::write_repo("system1", cfg, &ts));
-            let m = JevSystem1Model::load(&hub, "t/system1", Device::Metal).expect("System 1 loads on Metal");
+            let m = JevSystem1Model::load(&hub, "t/system1", Device::Metal)
+                .expect("System 1 loads on Metal");
             assert_eq!(m.encoder().map(|e| e.device()), Some(Device::Metal));
             for _ in 0..3 {
                 assert_eq!(m.embed(synth::TEXT).expect("System 1 runs").len(), 16);
@@ -1034,13 +1402,25 @@ fn gpu_fixture(family: &str) -> Outcome {
         }
         "fasttext" => {
             let path = find_fixture("enc_fasttext/model.bin");
-            let c = gibbs_engine::model::classifier::SequenceClassifier::from_fasttext("golden/fasttext", &path)
-                .unwrap_or_else(|e| panic!("fasttext: {e}"));
+            let c = gibbs_engine::model::classifier::SequenceClassifier::from_fasttext(
+                "golden/fasttext",
+                &path,
+            )
+            .unwrap_or_else(|e| panic!("fasttext: {e}"));
             assert_eq!(c.device(), Device::Metal, "fasttext");
             let before = cpu_compute::entered();
-            let (scores, _) = c.classify("the cat sat", None).unwrap_or_else(|e| panic!("fasttext: {e}"));
-            assert!(scores.iter().all(|s| s.score.is_finite()), "fasttext: non-finite scores");
-            assert_eq!(cpu_compute::entered(), before, "fasttext: entered CPU compute");
+            let (scores, _) = c
+                .classify("the cat sat", None)
+                .unwrap_or_else(|e| panic!("fasttext: {e}"));
+            assert!(
+                scores.iter().all(|s| s.score.is_finite()),
+                "fasttext: non-finite scores"
+            );
+            assert_eq!(
+                cpu_compute::entered(),
+                before,
+                "fasttext: entered CPU compute"
+            );
             Outcome::Ran
         }
         "modernbert" => {
@@ -1060,30 +1440,134 @@ fn gpu_fixture(family: &str) -> Outcome {
             classifier_on_gpu("deberta-v1", synth::deberta_v1());
             Outcome::Ran
         }
-        "clip_text" => net_on_gpu("clip_text", "diffa_clip_quick_gelu/text_encoder", "text", &[("rows", 77.0)], &[]),
-        "sd" => net_on_gpu("sd", "diffa_unet_sd/unet", "denoiser", &[("b", 1.0), ("h", 8.0), ("w", 8.0), ("nt", 4.0), ("adm", 0.0)], &[("t", 500.0)]),
-        "sdxl" => net_on_gpu("sdxl", "diffa_unet_xl_lcm/unet", "denoiser", &[("b", 1.0), ("h", 8.0), ("w", 8.0), ("nt", 4.0), ("adm", 56.0)], &[("t", 500.0)]),
+        "clip_text" => net_on_gpu(
+            "clip_text",
+            "diffa_clip_quick_gelu/text_encoder",
+            "text",
+            &[("rows", 77.0)],
+            &[],
+        ),
+        "sd" => net_on_gpu(
+            "sd",
+            "diffa_unet_sd/unet",
+            "denoiser",
+            &[
+                ("b", 1.0),
+                ("h", 8.0),
+                ("w", 8.0),
+                ("nt", 4.0),
+                ("adm", 0.0),
+            ],
+            &[("t", 500.0)],
+        ),
+        "sdxl" => net_on_gpu(
+            "sdxl",
+            "diffa_unet_xl_lcm/unet",
+            "denoiser",
+            &[
+                ("b", 1.0),
+                ("h", 8.0),
+                ("w", 8.0),
+                ("nt", 4.0),
+                ("adm", 56.0),
+            ],
+            &[("t", 500.0)],
+        ),
         "sd_vae" => {
             tiny_vae_on_gpu().expect("tiny VAEs run on Metal");
             Outcome::Ran
         }
-        "dcae" => net_on_gpu("dcae", "diffa_dcae/vae", "decoder", &[("h", 2.0), ("w", 2.0)], &[]),
-        "sana" => net_on_gpu("sana", "diffa_sana/transformer", "denoiser", &[("h", 4.0), ("w", 4.0), ("nt", 5.0)], &[("t", 500.0)]),
-        "sd3" => net_on_gpu("sd3", "diffa_sd3_plain/transformer", "denoiser", &[("h", 4.0), ("w", 4.0), ("nt", 5.0)], &[("t", 500.0)]),
-        "flux" => net_on_gpu("flux", "diffa_flux1/transformer", "denoiser", &[("h", 2.0), ("w", 2.0), ("nt", 4.0)], &[("t", 500.0), ("g", 3500.0)]),
-        "chroma" => net_on_gpu("chroma", "diffa_flux_chroma/transformer", "denoiser", &[("h", 2.0), ("w", 2.0), ("nt", 4.0)], &[("t", 500.0)]),
-        "flux2" => net_on_gpu("flux2", "diffa_flux2/transformer", "denoiser", &[("h", 2.0), ("w", 2.0), ("nt", 4.0)], &[("t", 500.0), ("g", 3500.0)]),
-        "zimage" => net_on_gpu("zimage", "diffb_zimage", "denoiser", &[("h", 2.0), ("w", 2.0), ("nt", 4.0)], &[("t", 500.0)]),
-        "qwen_image" => net_on_gpu("qwen_image", "diffb_qwen_image_v1", "denoiser", &[("h", 2.0), ("w", 2.0), ("nt", 4.0)], &[("t", 500.0)]),
-        "qwen_image21" => net_on_gpu("qwen_image21", "diffb_qwen_image21", "denoiser", &[("h", 2.0), ("w", 2.0), ("nt", 4.0)], &[("t", 500.0)]),
-        "qwen_vae" => net_on_gpu("qwen_vae", "diffb_qwen_vae", "decoder", &[("h", 2.0), ("w", 2.0)], &[]),
-        "qwen_vae21" => net_on_gpu("qwen_vae21", "diffb_qwen_vae21", "decoder", &[("h", 2.0), ("w", 2.0)], &[]),
-        "krea2" => net_on_gpu("krea2", "diffb_krea2", "denoiser", &[("h", 2.0), ("w", 2.0), ("nt", 6.0)], &[("t", 500.0)]),
+        "dcae" => net_on_gpu(
+            "dcae",
+            "diffa_dcae/vae",
+            "decoder",
+            &[("h", 2.0), ("w", 2.0)],
+            &[],
+        ),
+        "sana" => net_on_gpu(
+            "sana",
+            "diffa_sana/transformer",
+            "denoiser",
+            &[("h", 4.0), ("w", 4.0), ("nt", 5.0)],
+            &[("t", 500.0)],
+        ),
+        "sd3" => net_on_gpu(
+            "sd3",
+            "diffa_sd3_plain/transformer",
+            "denoiser",
+            &[("h", 4.0), ("w", 4.0), ("nt", 5.0)],
+            &[("t", 500.0)],
+        ),
+        "flux" => net_on_gpu(
+            "flux",
+            "diffa_flux1/transformer",
+            "denoiser",
+            &[("h", 2.0), ("w", 2.0), ("nt", 4.0)],
+            &[("t", 500.0), ("g", 3500.0)],
+        ),
+        "chroma" => net_on_gpu(
+            "chroma",
+            "diffa_flux_chroma/transformer",
+            "denoiser",
+            &[("h", 2.0), ("w", 2.0), ("nt", 4.0)],
+            &[("t", 500.0)],
+        ),
+        "flux2" => net_on_gpu(
+            "flux2",
+            "diffa_flux2/transformer",
+            "denoiser",
+            &[("h", 2.0), ("w", 2.0), ("nt", 4.0)],
+            &[("t", 500.0), ("g", 3500.0)],
+        ),
+        "zimage" => net_on_gpu(
+            "zimage",
+            "diffb_zimage",
+            "denoiser",
+            &[("h", 2.0), ("w", 2.0), ("nt", 4.0)],
+            &[("t", 500.0)],
+        ),
+        "qwen_image" => net_on_gpu(
+            "qwen_image",
+            "diffb_qwen_image_v1",
+            "denoiser",
+            &[("h", 2.0), ("w", 2.0), ("nt", 4.0)],
+            &[("t", 500.0)],
+        ),
+        "qwen_image21" => net_on_gpu(
+            "qwen_image21",
+            "diffb_qwen_image21",
+            "denoiser",
+            &[("h", 2.0), ("w", 2.0), ("nt", 4.0)],
+            &[("t", 500.0)],
+        ),
+        "qwen_vae" => net_on_gpu(
+            "qwen_vae",
+            "diffb_qwen_vae",
+            "decoder",
+            &[("h", 2.0), ("w", 2.0)],
+            &[],
+        ),
+        "qwen_vae21" => net_on_gpu(
+            "qwen_vae21",
+            "diffb_qwen_vae21",
+            "decoder",
+            &[("h", 2.0), ("w", 2.0)],
+            &[],
+        ),
+        "krea2" => net_on_gpu(
+            "krea2",
+            "diffb_krea2",
+            "denoiser",
+            &[("h", 2.0), ("w", 2.0), ("nt", 6.0)],
+            &[("t", 500.0)],
+        ),
         "ltx" | "ltx_vae" | "modelscope_t2v" => {
             tiny_video_on_gpu().expect("tiny video denoisers run on Metal");
             Outcome::Ran
         }
-        other => panic!("unhandled family `{other}` in cpu_free_matrix: add a GPU fixture or EXEMPT entry"),
+        other => panic!(
+            "unhandled family `{other}` in cpu_free_matrix: add a GPU fixture or EXEMPT entry"
+        ),
     }
 }
 

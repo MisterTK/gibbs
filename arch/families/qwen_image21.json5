@@ -62,7 +62,12 @@
   },
   components: {
     // The Qwen3-VL text encoder is the `qwen3_vl` family (Phase 5).
-    text_encoder: {family: "qwen3_vl_text", dir: "text_encoder"},
+    text_encoder: {
+      family: "qwen3_vl",
+      dir: "text_encoder",
+      ignore: ["lm_head.weight", "score.weight", "model.layers.*.self_attn.rotary_emb.inv_freq", "model.visual.*", "visual.*"],
+      patch: {config: {has_vision: "false"}},
+    },
     transformer: {family: "qwen_image21", dir: "transformer"},
     vae: {family: "qwen_vae21", dir: "vae"},
     // Velocity [h * w, in_ch] for latent tokens on an h x w grid and `nt` text rows.

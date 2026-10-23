@@ -11,6 +11,7 @@ pub mod graph;
 pub mod hardware;
 pub use hardware::*;
 
+pub mod compact;
 pub mod kv;
 
 /// Architecture-agnostic model ingestion, dynamic fingerprinting, weights loading, and IR representations.

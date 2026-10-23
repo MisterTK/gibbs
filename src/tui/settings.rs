@@ -11,6 +11,12 @@ pub struct GibbsSettings {
     pub variant: VariantPolicy,
     /// Mean-KL limit of the GPU re-encode gate (nats); `None` keeps the policy's own.
     pub reencode_max_kl: Option<f32>,
+    /// Speculative decoding and online noise drafter tuning knobs.
+    #[serde(default)]
+    pub draft: crate::runtime::noise_draft::DraftKnobs,
+    /// Automatic session compaction configuration.
+    #[serde(default)]
+    pub compact: crate::compact::CompactionConfig,
 }
 
 #[cfg(not(test))]
@@ -83,19 +89,27 @@ mod tests {
             ReencodePolicy::LowBitNative,
             ReencodePolicy::BitExact,
         ] {
-            assert_eq!(serde_json::to_string(&p).unwrap(), format!("\"{}\"", p.name()));
+            assert_eq!(
+                serde_json::to_string(&p).unwrap(),
+                format!("\"{}\"", p.name())
+            );
         }
         for v in [
             VariantPolicy::Fastest,
             VariantPolicy::Fastest4Bit,
             VariantPolicy::BestQuality,
         ] {
-            assert_eq!(serde_json::to_string(&v).unwrap(), format!("\"{}\"", v.name()));
+            assert_eq!(
+                serde_json::to_string(&v).unwrap(),
+                format!("\"{}\"", v.name())
+            );
         }
         let s = GibbsSettings {
             reencode: ReencodePolicy::LowBitNative,
             variant: VariantPolicy::Fastest4Bit,
             reencode_max_kl: Some(0.05),
+            draft: crate::runtime::noise_draft::DraftKnobs::default(),
+            compact: crate::compact::CompactionConfig::default(),
         };
         save_settings(&s).unwrap();
         assert_eq!(load_settings(), s);

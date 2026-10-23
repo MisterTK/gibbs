@@ -854,6 +854,50 @@ impl NativeLm for SpecLm {
         out
     }
 
+    fn stream_token(
+        &self,
+        last: u32,
+        start_pos: usize,
+        max_new: usize,
+        temp: f32,
+        top_p: f32,
+        recent: &[u32],
+        state: &mut SeqState,
+    ) -> Result<Option<u32>, String> {
+        if temp <= 1e-4 {
+            return self.stream_greedy_token(last, start_pos, max_new, state);
+        }
+        let seq = Self::seq(state)?;
+        if !self.streams
+            || seq.recurrent_ahead
+            || !seq.taps.is_empty()
+            || start_pos != seq.asked
+            || seq.len != seq.asked
+        {
+            return Ok(None);
+        }
+        let mut p = self.program.lock();
+        std::mem::swap(&mut p.state, &mut seq.state);
+        let out = p.stream_next_sampled(
+            last,
+            start_pos as u32,
+            max_new,
+            self.tok.vocab_size(),
+            temp,
+            top_p,
+            1.1,
+            recent,
+        );
+        std::mem::swap(&mut p.state, &mut seq.state);
+        if let Ok(Some(_)) = out {
+            (seq.len, seq.asked) = (start_pos + 1, start_pos + 1);
+            seq.ids.truncate(start_pos);
+            seq.ids.push(last);
+            seq.ckpt.clear();
+        }
+        out
+    }
+
     fn stream_end(&self, state: &mut SeqState) -> Result<(), String> {
         let seq = Self::seq(state)?;
         self.drain_stream(seq)
@@ -921,6 +965,75 @@ impl NativeLm for SpecLm {
                     .flatten()
             })
             .clone()
+    }
+
+    fn online_drafter(
+        &self,
+        knobs: Arc<crate::runtime::noise_draft::LiveDraftKnobs>,
+    ) -> Option<Arc<dyn crate::scheduler::spec::Drafter>> {
+        let layers = self.model.env.var("layers").and_then(|v| v.usize()).ok()?;
+        let hidden = self.model.env.var("hidden").and_then(|v| v.usize()).ok()?;
+        let vocab = self.model.env.var("vocab").and_then(|v| v.usize()).ok()?;
+        Some(crate::runtime::noise_draft::OnlineNoiseDrafter::new(
+            layers, hidden, vocab, knobs,
+        ))
+    }
+
+    fn export_kv_snapshot(
+        &self,
+        state: &SeqState,
+        token_len: usize,
+    ) -> Option<crate::kv::CachedKvSnapshot> {
+        let seq = state.downcast_ref::<Seq>()?;
+        if token_len == 0
+            || seq.len < token_len
+            || seq.recurrent_ahead
+            || !seq.blocks.is_empty()
+            || !seq.media.media_index.is_empty()
+            || !seq.taps.is_empty()
+        {
+            return None;
+        }
+        if !self.recurrent.is_empty() && seq.len != token_len {
+            return None;
+        }
+        Some(crate::kv::CachedKvSnapshot {
+            state: seq.state.fork_prefix(),
+            token_len,
+            has_recurrent: !self.recurrent.is_empty(),
+        })
+    }
+
+    fn restore_kv_prefix(
+        &self,
+        state: &mut SeqState,
+        snap: &crate::kv::CachedKvSnapshot,
+        prefix_len: usize,
+    ) -> bool {
+        let Ok(seq) = Self::seq(state) else {
+            return false;
+        };
+        if prefix_len == 0
+            || prefix_len > snap.token_len
+            || prefix_len > seq.prompt.len()
+            || !seq.blocks.is_empty()
+            || !seq.media.media_index.is_empty()
+            || !seq.taps.is_empty()
+        {
+            return false;
+        }
+        if (snap.has_recurrent || !self.recurrent.is_empty()) && prefix_len != snap.token_len {
+            return false;
+        }
+        seq.state = snap.state.fork_prefix();
+        seq.len = prefix_len;
+        seq.asked = prefix_len;
+        seq.ids = seq.prompt[..prefix_len].to_vec();
+        seq.ahead.clear();
+        seq.ckpt.clear();
+        seq.ckpt_from = 0;
+        seq.recurrent_ahead = false;
+        true
     }
 }
 

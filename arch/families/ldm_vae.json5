@@ -1,8 +1,0 @@
-// The AutoencoderKL of an LDM single-file / GGUF checkpoint (`first_stage_model.*` via `ldm_vae`)
-// under its reference repo's `vae/config.json`; the other components' tensors are ignored.
-{
-  family: "ldm_vae",
-  extends: "sd_vae",
-  use_lib: ["vae", "ldm"],
-  "ignore+": ["model.diffusion_model.*", "cond_stage_model.*", "conditioner.*", "denoiser.*"],
-}

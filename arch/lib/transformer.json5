@@ -184,5 +184,17 @@
       {let: {sw: "first(w, 'score')"}},
       {op: "Linear", in: ["x", "w:{sw}.weight", "w?:{sw}.bias"], out: "out", name: "score"},
     ]},
+    // Causal-LM / seq-cls output tail: last_row (`last` / `score`), final norm `{norm}`, optional
+    // `project_out`, `score_head` (`head == 'score'`), `lm_head` (`head == 'last' || head == 'all'`).
+    decoder_tail: {params: ["x"], returns: ["v?:logits", "x"], body: [
+      {use: "last_row", in: ["x"], out: "x", name: "last", when: "head == 'last' && (!first(skip_last_single, false) || rows > 1)"},
+      {use: "last_row", args: {index: true}, in: ["x", "i:last_index"], out: "x", name: "last", when: "head == 'score'"},
+      {use: "norm", args: {w: "norm", norm_kind: "first(norm_kind, 'rms')"}, in: ["x"], out: "x", name: "final_norm", when: "first(final_ln, true)"},
+      {op: "Linear", in: ["x", "w:{project_out}.weight", "w?:{project_out}.bias"], out: "x", name: "project_out",
+       when: "first(project_out, '') != '' && has(fmt('{project_out}.weight'))"},
+      {use: "score_head", args: {w: "'score'"}, in: ["x"], out: "logits", name: "score", when: "head == 'score'"},
+      {use: "lm_head", args: {w: "w", logit_scale: "first(logit_scale, 1)", softcap: "first(softcap, 0)"}, in: ["x"], out: "logits",
+       name: "lm_head", when: "head == 'last' || head == 'all'"},
+    ]},
   },
 }

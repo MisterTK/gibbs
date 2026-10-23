@@ -9,17 +9,23 @@ pub mod avenues;
 pub mod codec;
 pub mod codegen;
 pub mod cpu;
+pub mod cuda;
 pub mod egraph;
+pub mod extropic;
+pub mod intel_xpu;
 #[cfg(target_os = "macos")]
 pub mod metal;
 pub mod passes;
 pub mod pattern;
 pub mod placement;
+pub mod plan;
 pub mod program;
+pub mod rocm;
 pub mod shape;
 #[cfg(test)]
 pub(crate) mod synth_decoder;
 pub mod tune;
+pub mod xla;
 use crate::hardware::{Device, QuantFormat};
 use std::collections::HashMap;
 
@@ -78,7 +84,10 @@ pub enum ValueKind {
     /// Persistent per-sequence buffer (e.g. KV cache slots, Gated DeltaNet recurrent state, causal conv state).
     /// `recurrent`: the buffer is a running summary of every position so far (DeltaNet state, conv
     /// window), so it cannot rewind by position; a KV cache (row per position) can.
-    State { name: String, recurrent: bool },
+    State {
+        name: String,
+        recurrent: bool,
+    },
     Node(NodeId),
 }
 #[derive(Debug, Clone, PartialEq)]
@@ -346,10 +355,16 @@ pub enum Op {
     /// lower block first), in ascending block order, each expanded to its `ratio` keys, then the tail
     /// `blocks * ratio..visible`. Unused trailing slots hold 0. Ops are single-output, so the matching
     /// mask is the separate [`Op::QsaBias`].
-    QsaSelect { ratio: usize, top_blocks: usize },
+    QsaSelect {
+        ratio: usize,
+        top_blocks: usize,
+    },
     /// [`Op::QsaSelect`]'s operands → `[n, K]` F32 additive bias for the gathered keys: 0 where
     /// `QsaSelect`'s slot holds a selected key, `-inf` in unused slots.
-    QsaBias { ratio: usize, top_blocks: usize },
+    QsaBias {
+        ratio: usize,
+        top_blocks: usize,
+    },
     /// `[x [c_in, h, w], w [c_out, c_in/groups, kh, kw], bias? [c_out]]`; padding is
     /// `[top, left, bottom, right]`.
     Conv2d {
@@ -581,9 +596,10 @@ impl Graph {
         let operands = inputs
             .iter()
             .map(|v| {
-                let val = self.values.get(v.0 as usize).ok_or_else(|| {
-                    format!("node '{name}': operand {v:?} does not exist yet")
-                })?;
+                let val = self
+                    .values
+                    .get(v.0 as usize)
+                    .ok_or_else(|| format!("node '{name}': operand {v:?} does not exist yet"))?;
                 Ok((val.shape.as_slice(), val.dtype))
             })
             .collect::<Result<Vec<_>, String>>()?;
@@ -815,6 +831,41 @@ impl StateStore {
             self.buffers.insert(name, Tensor::F32(v));
         }
     }
+
+    /// Deep-forks this `StateStore` so a new sequence sharing a cached token prefix gets its own
+    /// independent CPU and Metal KV/state buffers without aliasing the cached snapshot.
+    pub fn fork_prefix(&self) -> Self {
+        let buffers = self.buffers.clone();
+        #[cfg(target_os = "macos")]
+        let (metal_buffers, metal_f16) = {
+            let mut mb = HashMap::with_capacity(self.metal_buffers.len());
+            if let Some(dev) = ::metal::Device::system_default() {
+                for (name, (src_buf, n)) in &self.metal_buffers {
+                    let byte_len = src_buf.length();
+                    let dst_buf =
+                        dev.new_buffer(byte_len, ::metal::MTLResourceOptions::StorageModeShared);
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            src_buf.contents() as *const u8,
+                            dst_buf.contents() as *mut u8,
+                            byte_len as usize,
+                        );
+                    }
+                    mb.insert(name.clone(), (std::sync::Arc::new(dst_buf), *n));
+                }
+            }
+            (mb, self.metal_f16.clone())
+        };
+        Self {
+            buffers,
+            #[cfg(target_os = "macos")]
+            metal_buffers,
+            #[cfg(target_os = "macos")]
+            metal_f16,
+            #[cfg(target_os = "macos")]
+            stream: crate::graph::metal::StreamSlot::default(),
+        }
+    }
 }
 
 /// Weight data by name, owned outside the graph.
@@ -904,7 +955,10 @@ mod state_tests {
     fn op_serde_round_trips() {
         use serde_json::json;
         let parse = |v: serde_json::Value| serde_json::from_value::<Op>(v).unwrap();
-        assert_eq!(parse(json!({"RmsNorm": {"eps": 1e-6}})), Op::RmsNorm { eps: 1e-6 });
+        assert_eq!(
+            parse(json!({"RmsNorm": {"eps": 1e-6}})),
+            Op::RmsNorm { eps: 1e-6 }
+        );
         assert_eq!(parse(json!("Linear")), Op::Linear);
         assert_eq!(
             parse(json!({"Attention": {"heads": 8, "kv_heads": 2, "causal": true}})),

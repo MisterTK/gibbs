@@ -155,7 +155,13 @@ impl Comp {
         let mut names = inst.weights.clone();
         for v in also {
             let other = shapes.get(v, || b.build(name, v))?;
-            names.extend(other.weights.iter().filter(|w| !inst.weights.contains(w)).cloned());
+            names.extend(
+                other
+                    .weights
+                    .iter()
+                    .filter(|w| !inst.weights.contains(w))
+                    .cloned(),
+            );
         }
         let w = b.materialize(&names)?;
         let program = GraphProgram::compile_reshapable(inst.graph.clone(), w, mode)
@@ -256,7 +262,13 @@ pub fn spec_drafter(
         shared: HashMap::new(),
     };
     // Compiled for the draft step; the catch-up (`tap`) instance also reads the final norm.
-    let (comp, _) = Comp::new(&b, &d.component, &mtp_vars(1, "draft"), &[mtp_vars(1, "tap")], mode)?;
+    let (comp, _) = Comp::new(
+        &b,
+        &d.component,
+        &mtp_vars(1, "draft"),
+        &[mtp_vars(1, "tap")],
+        mode,
+    )?;
     Ok(Some(Arc::new(Mtp {
         label: expr(&d.label, "label")?.to_string(),
         taps: usizes(expr(&d.taps, "taps")?)?,
@@ -463,6 +475,22 @@ pub fn refused_draft_gguf(arch: &str) -> Option<String> {
     })
 }
 
+/// Builds an [`OnlineNoiseDrafter`] parameterized by `target`'s layer count, hidden dimension,
+/// and vocabulary size.
+pub fn online_drafter_for_target(
+    target: &ModelArtifacts,
+    knobs: Arc<crate::runtime::noise_draft::LiveDraftKnobs>,
+) -> Result<Arc<dyn Drafter>, String> {
+    let reg = registry()?;
+    let tm = crate::arch::load::load(target, reg, None)?;
+    let layers = tm.env.var("layers")?.usize()?;
+    let hidden = tm.env.var("hidden")?.usize()?;
+    let vocab = tm.env.var("vocab")?.usize()?;
+    Ok(crate::runtime::noise_draft::OnlineNoiseDrafter::new(
+        layers, hidden, vocab, knobs,
+    ))
+}
+
 /// Loads `draft` as a drafter for the target loaded from `target`, computing on `mode`: a block
 /// drafter when a `pipeline: drafter` family claims it, else a [`Plain`] causal LM.
 pub fn load_drafter(
@@ -538,7 +566,10 @@ fn load_block(
     }
     let hidden = var("hidden")?.usize()?;
     for (t, n) in shared.values() {
-        let w = t.store.tensor(n).map_or(0, |(s, _)| *s.last().unwrap_or(&0));
+        let w = t
+            .store
+            .tensor(n)
+            .map_or(0, |(s, _)| *s.last().unwrap_or(&0));
         if w != hidden {
             return Err(format!(
                 "drafter hidden {hidden} != target embedding width {w}"
@@ -931,27 +962,79 @@ mod tests {
             ("fc.weight", "fc.weight", vec![H, 2 * H]),
             ("enc.output_norm.weight", "hidden_norm.weight", vec![H]),
             ("output_norm.weight", "norm.weight", vec![H]),
-            ("markov_w1.weight", "markov_head.markov_w1.weight", vec![V, 4]),
-            ("markov_w2.weight", "markov_head.markov_w2.weight", vec![V, 4]),
-            ("blk.0.attn_norm.weight", "layers.0.input_layernorm.weight", vec![H]),
-            ("blk.0.ffn_norm.weight", "layers.0.post_attention_layernorm.weight", vec![H]),
-            ("blk.0.attn_q.weight", "layers.0.self_attn.q_proj.weight", vec![8, H]),
-            ("blk.0.attn_k.weight", "layers.0.self_attn.k_proj.weight", vec![4, H]),
-            ("blk.0.attn_v.weight", "layers.0.self_attn.v_proj.weight", vec![4, H]),
-            ("blk.0.attn_output.weight", "layers.0.self_attn.o_proj.weight", vec![H, 8]),
-            ("blk.0.attn_q_norm.weight", "layers.0.self_attn.q_norm.weight", vec![4]),
-            ("blk.0.attn_k_norm.weight", "layers.0.self_attn.k_norm.weight", vec![4]),
-            ("blk.0.ffn_gate.weight", "layers.0.mlp.gate_proj.weight", vec![8, H]),
-            ("blk.0.ffn_up.weight", "layers.0.mlp.up_proj.weight", vec![8, H]),
-            ("blk.0.ffn_down.weight", "layers.0.mlp.down_proj.weight", vec![H, 8]),
+            (
+                "markov_w1.weight",
+                "markov_head.markov_w1.weight",
+                vec![V, 4],
+            ),
+            (
+                "markov_w2.weight",
+                "markov_head.markov_w2.weight",
+                vec![V, 4],
+            ),
+            (
+                "blk.0.attn_norm.weight",
+                "layers.0.input_layernorm.weight",
+                vec![H],
+            ),
+            (
+                "blk.0.ffn_norm.weight",
+                "layers.0.post_attention_layernorm.weight",
+                vec![H],
+            ),
+            (
+                "blk.0.attn_q.weight",
+                "layers.0.self_attn.q_proj.weight",
+                vec![8, H],
+            ),
+            (
+                "blk.0.attn_k.weight",
+                "layers.0.self_attn.k_proj.weight",
+                vec![4, H],
+            ),
+            (
+                "blk.0.attn_v.weight",
+                "layers.0.self_attn.v_proj.weight",
+                vec![4, H],
+            ),
+            (
+                "blk.0.attn_output.weight",
+                "layers.0.self_attn.o_proj.weight",
+                vec![H, 8],
+            ),
+            (
+                "blk.0.attn_q_norm.weight",
+                "layers.0.self_attn.q_norm.weight",
+                vec![4],
+            ),
+            (
+                "blk.0.attn_k_norm.weight",
+                "layers.0.self_attn.k_norm.weight",
+                vec![4],
+            ),
+            (
+                "blk.0.ffn_gate.weight",
+                "layers.0.mlp.gate_proj.weight",
+                vec![8, H],
+            ),
+            (
+                "blk.0.ffn_up.weight",
+                "layers.0.mlp.up_proj.weight",
+                vec![8, H],
+            ),
+            (
+                "blk.0.ffn_down.weight",
+                "layers.0.mlp.down_proj.weight",
+                vec![H, 8],
+            ),
         ]
     }
 
     /// Deterministic values in [-0.5, 0.5); norms near 1.
     fn values(name: &str, n: usize) -> Vec<f32> {
-        let mut s = name
-            .bytes()
-            .fold(0x9E37_79B9u32, |a, b| a.wrapping_mul(31).wrapping_add(b as u32));
+        let mut s = name.bytes().fold(0x9E37_79B9u32, |a, b| {
+            a.wrapping_mul(31).wrapping_add(b as u32)
+        });
         (0..n)
             .map(|_| {
                 s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
@@ -1002,7 +1085,11 @@ mod tests {
     fn gguf_sidecar_matches_the_safetensors_drafter() {
         let _g = crate::hardware::cpu_compute::allow();
         let dir = tempfile::tempdir().unwrap();
-        let (td, sd, gd) = (dir.path().join("t"), dir.path().join("s"), dir.path().join("g"));
+        let (td, sd, gd) = (
+            dir.path().join("t"),
+            dir.path().join("s"),
+            dir.path().join("g"),
+        );
         let mut t = W::new(1);
         t.put("model.embed_tokens.weight", &[V, H], values("embed", V * H));
         let tcfg = json!({"model_type": "llama", "architectures": ["LlamaForCausalLM"],
@@ -1015,12 +1102,16 @@ mod tests {
             let n = shape.iter().product();
             s.put(z, &shape, values(g, n));
         }
-        s.write_checkpoint(&sd, &json!({
+        s.write_checkpoint(
+            &sd,
+            &json!({
             "architectures": ["DSparkDraftModel"], "hidden_size": H, "num_hidden_layers": 1,
             "num_attention_heads": 2, "num_key_value_heads": 1, "head_dim": 4,
             "intermediate_size": 8, "rms_norm_eps": 1e-6, "block_size": 4, "mask_token_id": 3,
             "rope_parameters": {"rope_theta": 10000.0}, "target_layer_ids": [1, 2],
-            "sample_from_anchor": true}), V);
+            "sample_from_anchor": true}),
+            V,
+        );
 
         let u32_kv = |k: &'static str, v: u32| (k, 4u32, v.to_le_bytes().to_vec());
         let mut name = (b"dflash".len() as u64).to_le_bytes().to_vec();
@@ -1036,7 +1127,11 @@ mod tests {
             u32_kv("dflash.attention.head_count", 2),
             u32_kv("dflash.attention.head_count_kv", 1),
             u32_kv("dflash.attention.key_length", 4),
-            ("dflash.attention.layer_norm_rms_epsilon", 6, 1e-6f32.to_le_bytes().to_vec()),
+            (
+                "dflash.attention.layer_norm_rms_epsilon",
+                6,
+                1e-6f32.to_le_bytes().to_vec(),
+            ),
             ("dflash.rope.freq_base", 6, 10000f32.to_le_bytes().to_vec()),
             u32_kv("dflash.block_size", 4),
             ("dflash.target_layers", 9, taps),
@@ -1044,10 +1139,18 @@ mod tests {
         ];
         let tensors: Vec<(&str, Vec<usize>, Vec<f32>)> = layout()
             .into_iter()
-            .map(|(g, _, shape)| (g, shape.iter().rev().copied().collect(), values(g, shape.iter().product())))
+            .map(|(g, _, shape)| {
+                (
+                    g,
+                    shape.iter().rev().copied().collect(),
+                    values(g, shape.iter().product()),
+                )
+            })
             .collect();
-        let all: Vec<(&str, &[usize], &[f32])> =
-            tensors.iter().map(|(n, d, v)| (*n, &d[..], &v[..])).collect();
+        let all: Vec<(&str, &[usize], &[f32])> = tensors
+            .iter()
+            .map(|(n, d, v)| (*n, &d[..], &v[..]))
+            .collect();
         std::fs::create_dir_all(&gd).unwrap();
         let gguf = crate::model::loaders::gguf::test_gguf_file(&kv, &all);
         std::fs::write(gd.join("dflash.gguf"), &gguf).unwrap();
@@ -1065,8 +1168,14 @@ mod tests {
         let mut extra = all.clone();
         let post = vec![1.0f32; H];
         extra.push(("blk.0.attn_post_norm.weight", &[H], &post));
-        std::fs::write(gd.join("dflash.gguf"), crate::model::loaders::gguf::test_gguf_file(&kv, &extra)).unwrap();
-        let err = load_drafter(&artifacts(&gd, "dflash.gguf"), &target, cpu).err().unwrap();
+        std::fs::write(
+            gd.join("dflash.gguf"),
+            crate::model::loaders::gguf::test_gguf_file(&kv, &extra),
+        )
+        .unwrap();
+        let err = load_drafter(&artifacts(&gd, "dflash.gguf"), &target, cpu)
+            .err()
+            .unwrap();
         assert!(err.contains("blk.0.attn_post_norm.weight"), "{err}");
     }
 
@@ -1077,7 +1186,8 @@ mod tests {
         let _g = crate::hardware::cpu_compute::allow();
         let dir = tempfile::tempdir().unwrap();
         let mut w = W::new(7);
-        w.w("model.embed_tokens.weight", &[V, H]).norm("model.norm.weight", H, 1.0);
+        w.w("model.embed_tokens.weight", &[V, H])
+            .norm("model.norm.weight", H, 1.0);
         let p = "model.layers.0";
         w.norm(format!("{p}.input_layernorm.weight"), H, 1.0)
             .norm(format!("{p}.post_attention_layernorm.weight"), H, 1.0)
@@ -1093,24 +1203,42 @@ mod tests {
             "hidden_size": H, "num_hidden_layers": 1, "num_attention_heads": 2, "num_key_value_heads": 1,
             "intermediate_size": 16, "vocab_size": V, "max_position_embeddings": 64}), V);
         let a = artifacts(dir.path(), "model.safetensors");
-        let lm: Arc<dyn NativeLm> =
-            crate::runtime::lm::load(&a, registry().unwrap(), None, PlacementMode::Pin(Device::Cpu)).unwrap();
-        let argmax = |l: &[f32]| l.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0 as u32;
+        let lm: Arc<dyn NativeLm> = crate::runtime::lm::load(
+            &a,
+            registry().unwrap(),
+            None,
+            PlacementMode::Pin(Device::Cpu),
+        )
+        .unwrap();
+        let argmax = |l: &[f32]| {
+            l.iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .unwrap()
+                .0 as u32
+        };
         // The model's own greedy continuation of `toks`, `n` tokens.
         let greedy = |toks: &[u32], n: usize| {
             let (_, mut s) = lm.prepare(toks.to_vec(), &[]).unwrap();
             let mut out = vec![argmax(&lm.forward(toks, 0, &mut s).unwrap())];
             while out.len() < n {
-                let l = lm.forward(&out[out.len() - 1..], toks.len() + out.len() - 1, &mut s).unwrap();
+                let l = lm
+                    .forward(&out[out.len() - 1..], toks.len() + out.len() - 1, &mut s)
+                    .unwrap();
                 out.push(argmax(&l));
             }
             out
         };
-        let d = Plain { label: "self".into(), lm: lm.clone() };
+        let d = Plain {
+            label: "self".into(),
+            lm: lm.clone(),
+        };
         let mut st = d.new_state();
         let mut toks = vec![5u32, 9, 14, 3];
         for round in 0..3 {
-            let got = d.propose(&mut st, &toks, &[], 3, &mut |l| argmax(l)).unwrap();
+            let got = d
+                .propose(&mut st, &toks, &[], 3, &mut |l| argmax(l))
+                .unwrap();
             assert_eq!(got, greedy(&toks, 3), "round {round}");
             // Accept the first draft, reject the second.
             toks.push(got[0]);

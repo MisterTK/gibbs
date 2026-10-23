@@ -22,7 +22,7 @@
     enc_heads: "cfg.encoder_attention_heads",
     dec_heads: "cfg.decoder_attention_heads",
     activation: "first(cfg.activation_function, 'gelu')",
-    act: "activation == 'relu' ? 'Relu' : activation == 'gelu' ? 'GeluErf' : contains(['gelu_new', 'gelu_pytorch_tanh'], activation) ? 'GeluTanh' : 'Silu'",
+    act: "unary_act(activation)",
     pre_ln: "cfg.model_type == 'mbart'",
     // `learned`, or a `sinusoid_table` kind.
     pos_kind: "'learned'",

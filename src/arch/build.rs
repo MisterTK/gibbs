@@ -508,7 +508,7 @@ impl<'a> Builder<'a> {
             Some(n) => self.interp(n)?,
             None => out.to_string(),
         };
-        Ok(match self.prefix.last() {
+        Ok(match self.prefix.last().filter(|p| !p.is_empty()) {
             Some(p) => format!("{p}.{base}"),
             None => base,
         })
@@ -637,9 +637,14 @@ impl<'a> Builder<'a> {
             Some(n) => self.interp(n)?,
             None => out.first().cloned().unwrap_or_else(|| name.clone()),
         };
-        let pfx = match self.prefix.last() {
-            Some(p) => format!("{p}.{call_name}"),
-            None => call_name,
+        let pfx = match (
+            self.prefix.last().filter(|p| !p.is_empty()),
+            call_name.is_empty(),
+        ) {
+            (Some(p), false) => format!("{p}.{call_name}"),
+            (Some(p), true) => p.clone(),
+            (None, false) => call_name,
+            (None, true) => String::new(),
         };
         self.frames.push(frame);
         self.values.push(params);
@@ -654,10 +659,20 @@ impl<'a> Builder<'a> {
                 .collect(),
             other => return Err(format!("macro `{name}`: bad `returns` {other}")),
         };
-        let ret: Result<Vec<Option<ValueId>>, String> = r.and_then(|_| {
+        let ret: Result<Vec<(bool, Option<ValueId>)>, String> = r.and_then(|_| {
             returns
                 .iter()
-                .map(|n| Ok(self.values.last().unwrap().get(&self.interp(n)?).copied()))
+                .map(|n| {
+                    let (opt, n) = match n.strip_prefix("v?:") {
+                        Some(rest) => (true, rest),
+                        None => (false, n.as_str()),
+                    };
+                    let n = self.interp(n)?;
+                    let v = n
+                        .split('|')
+                        .find_map(|k| self.values.last().unwrap().get(k).copied());
+                    Ok((opt, v))
+                })
                 .collect()
         });
         self.prefix.pop();
@@ -672,9 +687,10 @@ impl<'a> Builder<'a> {
                 out.len()
             ));
         }
-        for (o, v) in out.into_iter().zip(ret) {
+        for (o, (opt, v)) in out.into_iter().zip(ret) {
             match v {
                 Some(v) => self.bind(o, v),
+                None if opt => {}
                 None => {
                     return Err(format!(
                         "macro `{name}` did not bind its return value for `{o}`"

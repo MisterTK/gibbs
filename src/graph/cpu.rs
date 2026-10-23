@@ -3,6 +3,9 @@
 use super::{Graph, Op, StateStore, Tensor, ValueId, ValueKind, Weights};
 use crate::model::nn;
 
+thread_local! {
+    static CPU_ARENA: std::cell::RefCell<Vec<Vec<f32>>> = const { std::cell::RefCell::new(Vec::new()) };
+}
 /// Runs `graph` with stateless temporary buffers (discarded after completion).
 pub fn run_stateless(
     graph: &Graph,
@@ -114,7 +117,9 @@ pub fn run(
                         .ok_or_else(|| format!("weight '{}' is missing", v.name))?,
                 );
             }
-            ValueKind::State { name: state_name, .. } => {
+            ValueKind::State {
+                name: state_name, ..
+            } => {
                 if let Some(t) = state.get(state_name) {
                     slots[i] = Some(t.clone());
                 } else {
@@ -630,6 +635,9 @@ pub fn run(
                         let head_offset = row_offset + h * hd;
                         for j in 0..half {
                             let freq = inv_freq[j];
+                            if freq == 0.0 && *mscale == 1.0 {
+                                continue;
+                            }
                             let p = match variant {
                                 super::RopeVariant::MRope {
                                     sections,
@@ -1523,7 +1531,14 @@ pub fn run(
 
         for v in ins {
             if last_use[v.0 as usize] == i {
-                slots[v.0 as usize] = None;
+                if let Some(Tensor::F32(recycled)) = slots[v.0 as usize].take() {
+                    CPU_ARENA.with(|a| {
+                        let mut pool = a.borrow_mut();
+                        if pool.len() < 64 && recycled.capacity() >= 64 {
+                            pool.push(recycled);
+                        }
+                    });
+                }
             }
         }
         slots[node.outputs[0].0 as usize] = Some(match out_u32 {
@@ -1539,7 +1554,7 @@ pub fn run(
             let id = v.0 as usize;
             bound[id]
                 .cloned()
-                .or_else(|| slots[id].take())
+                .or_else(|| slots[id].clone())
                 .ok_or_else(|| format!("output '{}' was never computed", graph.value(*v).name))
         })
         .collect()
@@ -2221,7 +2236,8 @@ pub(crate) fn qsa_select(
             (0..visible as u32).collect()
         } else {
             let row = &score[t * b..][..blocks];
-            let mut best: Vec<(f32, u32)> = (0..blocks as u32).map(|j| (row[j as usize], j)).collect();
+            let mut best: Vec<(f32, u32)> =
+                (0..blocks as u32).map(|j| (row[j as usize], j)).collect();
             best.select_nth_unstable_by(top_blocks.max(1) - 1, |x, y| {
                 y.0.total_cmp(&x.0).then(x.1.cmp(&y.1))
             });
@@ -2306,6 +2322,19 @@ fn moe_linear_cpu(
     }
 }
 
+fn alloc_cpu_f32(len: usize) -> Vec<f32> {
+    let mut v = CPU_ARENA
+        .with(|a| {
+            let mut pool = a.borrow_mut();
+            pool.iter()
+                .position(|b| b.capacity() >= len && b.capacity() <= len.saturating_mul(4).max(256))
+                .map(|idx| pool.swap_remove(idx))
+        })
+        .unwrap_or_default();
+    v.resize(len, 0.0);
+    v
+}
+
 fn dispatch_linear(
     x: &[f32],
     w_slot: &Tensor,
@@ -2325,6 +2354,49 @@ fn dispatch_linear(
             }
             Ok(nn::linear(x, rows, w, bias, in_f, out_f))
         }
+        Tensor::BF16(w) => {
+            if w.len() != out_f * in_f {
+                return Err(format!(
+                    "node '{name}': weight elements {} != {out_f} * {in_f}",
+                    w.len()
+                ));
+            }
+            let mut out = alloc_cpu_f32(rows * out_f);
+            nn::matmul_bf16(x, w, bias, rows, in_f, out_f, &mut out);
+            Ok(out)
+        }
+        Tensor::F16(w) => {
+            if w.len() != out_f * in_f {
+                return Err(format!(
+                    "node '{name}': weight elements {} != {out_f} * {in_f}",
+                    w.len()
+                ));
+            }
+            let mut out = alloc_cpu_f32(rows * out_f);
+            nn::matmul_rows(x, rows, in_f, out_f, bias, &mut out, &|j, p0, d| {
+                for (dst, &s) in d.iter_mut().zip(&w[j * in_f + p0..]) {
+                    *dst = crate::model::f16_to_f32(s);
+                }
+            });
+            Ok(out)
+        }
+        Tensor::Mat(m) => {
+            if m.rows != out_f || m.cols != in_f {
+                return Err(format!(
+                    "node '{name}': weight elements {} != {out_f} * {in_f}",
+                    m.rows * m.cols
+                ));
+            }
+            let mut out = alloc_cpu_f32(rows * out_f);
+            if m.packed().is_none() {
+                nn::matmul_bf16(x, m.data(), bias, rows, in_f, out_f, &mut out);
+            } else {
+                nn::matmul_rows(x, rows, in_f, out_f, bias, &mut out, &|j, p0, d| {
+                    m.decode_slice_f32(j, p0, d);
+                });
+            }
+            Ok(out)
+        }
         other => {
             let w_f32 = other.to_f32();
             if w_f32.len() != out_f * in_f {
@@ -2337,8 +2409,6 @@ fn dispatch_linear(
         }
     }
 }
-
-/// Keys `[lo, hi)` visible to the query at `pos` in `Op::Attention` (`lo >= hi`: none). Causal is
 /// top-left aligned like `nn::attention`; windows follow sprint-2 S2.2: causal sees `w` keys
 /// `pos - w < k <= pos`, non-causal sees `|pos - k| <= w / 2`.
 pub(crate) fn attention_key_range(
@@ -2900,8 +2970,20 @@ mod tests {
             soft_cap: None,
             write,
         };
-        let a = g.add("writer", attn(true), &[q, k, v, ks, vs, pos], vec![1, 4], DType::F32);
-        let b = g.add("reader", attn(false), &[q, q, q, ks, vs, pos], vec![1, 4], DType::F32);
+        let a = g.add(
+            "writer",
+            attn(true),
+            &[q, k, v, ks, vs, pos],
+            vec![1, 4],
+            DType::F32,
+        );
+        let b = g.add(
+            "reader",
+            attn(false),
+            &[q, q, q, ks, vs, pos],
+            vec![1, 4],
+            DType::F32,
+        );
         g.output(a);
         g.output(b);
         let mut state = StateStore::new();

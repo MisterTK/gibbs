@@ -32,7 +32,7 @@
     // HF T5Config: `gated-<act>` is a gated FF; "gated-gelu" means gelu_new (tanh).
     proj: "first(cfg.feed_forward_proj, 'relu')",
     gated: "contains(['gated-relu', 'gated-gelu', 'gated-gelu_new', 'gated-gelu_pytorch_tanh', 'gated-silu', 'gated-swish'], proj)",
-    act: "contains(['relu', 'gated-relu'], proj) ? 'Relu' : contains(['gated-gelu', 'gelu_new', 'gelu_pytorch_tanh', 'gated-gelu_new', 'gated-gelu_pytorch_tanh'], proj) ? 'GeluTanh' : proj == 'gelu' ? 'GeluErf' : 'Silu'",
+    act: "unary_act(proj)",
     tied: "first(cfg.tie_word_embeddings, true)",
     embed: "first_has('shared.weight', 'encoder.embed_tokens.weight', 'decoder.embed_tokens.weight')",
     // Relative positions have no hard limit; n_positions is the trained length.

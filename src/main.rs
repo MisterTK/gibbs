@@ -59,6 +59,46 @@ struct Cli {
     #[arg(long)]
     draft: Option<String>,
 
+    /// Speculative draft mode: auto | noise | suffix | model | off.
+    #[arg(long)]
+    draft_mode: Option<String>,
+
+    /// Maximum draft tokens per speculative step (0..=15).
+    #[arg(long)]
+    draft_max_k: Option<usize>,
+
+    /// Target speculative acceptance rate (0.10..=0.98) for KTuner.
+    #[arg(long)]
+    draft_target_accept: Option<f32>,
+
+    /// Verify compute cost weight (0.0..=1.0) in KTuner.
+    #[arg(long)]
+    draft_cost_weight: Option<f32>,
+
+    /// Minimum suffix n-gram match length (1..=4) for SuffixLattice.
+    #[arg(long)]
+    draft_suffix_min: Option<usize>,
+
+    /// Online learning rate for the forward-only `qlabs.sh/noise` block drafter.
+    #[arg(long)]
+    draft_noise_lr: Option<f32>,
+
+    /// Session compaction mode: auto | light | aggressive | off.
+    #[arg(long)]
+    compact_mode: Option<String>,
+
+    /// Context fraction (0.25..=0.98) that triggers automatic session compaction.
+    #[arg(long)]
+    compact_threshold: Option<f32>,
+
+    /// Target context fraction (0.15..=0.85) after automatic session compaction.
+    #[arg(long)]
+    compact_target: Option<f32>,
+
+    /// Number of recent turns kept verbatim during session compaction.
+    #[arg(long)]
+    compact_keep_turns: Option<usize>,
+
     #[arg(long)]
     image: Option<String>,
 
@@ -333,6 +373,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ),
             #[cfg(not(target_os = "macos"))]
             Device::Metal => return Err("--backend metal requires macOS".into()),
+            Device::Cuda => gibbs_engine::graph::cuda::device_name(),
+            Device::Rocm => gibbs_engine::graph::rocm::device_name(),
+            Device::Xla => gibbs_engine::graph::xla::device_name(),
+            Device::IntelXpu => gibbs_engine::graph::intel_xpu::device_name(),
+            Device::Extropic => gibbs_engine::graph::extropic::device_name(),
         },
     };
     // GPU-only tripwire: from here on, any CPU compute outside `--backend cpu` panics.
@@ -604,9 +649,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             telemetry.log_info(&format!("Compute backend: {}", model_exec.backend_label()));
             if let Some(d) = &cli.draft {
-                let da = hub.auto_download_and_cache(d, token.as_deref())?;
-                let dr = gibbs_engine::runtime::draft::load_drafter(&da, artifacts, placement)
-                    .map_err(|e| format!("Cannot load drafter '{d}': {e}"))?;
+                let dr = if matches!(d.as_str(), "noise" | "online-noise" | "suffix") {
+                    let mut k = gibbs_engine::tui::settings::load_settings().draft;
+                    k.mode = if d == "suffix" {
+                        gibbs_engine::runtime::noise_draft::DraftMode::Suffix
+                    } else {
+                        gibbs_engine::runtime::noise_draft::DraftMode::Noise
+                    };
+                    let live = Arc::new(gibbs_engine::runtime::noise_draft::LiveDraftKnobs::new(k));
+                    gibbs_engine::runtime::draft::online_drafter_for_target(artifacts, live)
+                        .map_err(|e| format!("Cannot initialize online drafter '{d}': {e}"))?
+                } else {
+                    let da = hub.auto_download_and_cache(d, token.as_deref())?;
+                    gibbs_engine::runtime::draft::load_drafter(&da, artifacts, placement)
+                        .map_err(|e| format!("Cannot load drafter '{d}': {e}"))?
+                };
                 telemetry.log_info(&format!("Speculative decoding drafter: {}", dr.label()));
                 drafter = Some(dr);
             }
@@ -630,6 +687,55 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Err("--draft: speculative decoding is disabled (GIBBS_SPEC=off)".into());
         }
         scheduler.set_drafter(drafter);
+    }
+    if cli.draft_mode.is_some()
+        || cli.draft_max_k.is_some()
+        || cli.draft_target_accept.is_some()
+        || cli.draft_cost_weight.is_some()
+        || cli.draft_suffix_min.is_some()
+        || cli.draft_noise_lr.is_some()
+    {
+        let mut knobs = scheduler.draft_knobs();
+        if let Some(m) = &cli.draft_mode {
+            knobs.mode = m.parse()?;
+        }
+        if let Some(k) = cli.draft_max_k {
+            knobs.max_k = k;
+        }
+        if let Some(a) = cli.draft_target_accept {
+            knobs.target_acceptance = a;
+        }
+        if let Some(c) = cli.draft_cost_weight {
+            knobs.cost_weight = c;
+        }
+        if let Some(s) = cli.draft_suffix_min {
+            knobs.suffix_min_match = s;
+        }
+        if let Some(lr) = cli.draft_noise_lr {
+            knobs.noise_lr = lr;
+        }
+        scheduler.set_draft_knobs(knobs);
+    }
+    if cli.compact_mode.is_some()
+        || cli.compact_threshold.is_some()
+        || cli.compact_target.is_some()
+        || cli.compact_keep_turns.is_some()
+    {
+        let mut s = gibbs_engine::tui::settings::load_settings();
+        if let Some(m) = &cli.compact_mode {
+            s.compact.mode = m.parse()?;
+        }
+        if let Some(th) = cli.compact_threshold {
+            s.compact.trigger_ratio = th;
+        }
+        if let Some(tg) = cli.compact_target {
+            s.compact.target_ratio = tg;
+        }
+        if let Some(kt) = cli.compact_keep_turns {
+            s.compact.keep_recent_turns = kt;
+        }
+        s.compact = s.compact.sanitized();
+        let _ = gibbs_engine::tui::settings::save_settings(&s);
     }
 
     if let (Some(prompt), Some(model)) = (&cli.prompt, scheduler.model()) {

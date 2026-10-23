@@ -215,7 +215,9 @@ mod tests {
 
     fn set(name: &str) -> Renamer {
         let reg = crate::arch::Registry::load(None).unwrap();
-        Renamer::from_pairs(&reg.name_set(name).unwrap()).unwrap()
+        Renamer::from_pairs(&reg.name_set(name).unwrap())
+            .unwrap()
+            .with_strip(reg.name_set_strip(name).unwrap())
     }
 
     /// `ldm` maps LDM UNet names to diffusers (layers_per_block 2, SD 1.x up_blocks.0 without
@@ -227,24 +229,67 @@ mod tests {
         for (d, ldm) in [
             ("conv_in.weight", "input_blocks.0.0.weight"),
             ("time_embedding.linear_1.bias", "time_embed.0.bias"),
-            ("time_embedding.cond_proj.weight", "time_embed.cond_proj.weight"),
+            (
+                "time_embedding.cond_proj.weight",
+                "time_embed.cond_proj.weight",
+            ),
             ("add_embedding.linear_2.weight", "label_emb.0.2.weight"),
-            ("down_blocks.0.resnets.1.conv1.weight", "input_blocks.2.0.in_layers.2.weight"),
-            ("down_blocks.1.resnets.0.conv_shortcut.bias", "input_blocks.4.0.skip_connection.bias"),
-            ("down_blocks.1.attentions.1.proj_in.weight", "input_blocks.5.1.proj_in.weight"),
-            ("down_blocks.2.downsamplers.0.conv.weight", "input_blocks.9.0.op.weight"),
-            ("mid_block.resnets.0.norm1.weight", "middle_block.0.in_layers.0.weight"),
-            ("mid_block.resnets.1.time_emb_proj.weight", "middle_block.2.emb_layers.1.weight"),
-            ("mid_block.attentions.0.transformer_blocks.0.attn2.to_k.weight", "middle_block.1.transformer_blocks.0.attn2.to_k.weight"),
-            ("up_blocks.0.resnets.2.norm2.bias", "output_blocks.2.0.out_layers.0.bias"),
-            ("up_blocks.0.upsamplers.0.conv.weight", "output_blocks.2.1.conv.weight"),
-            ("up_blocks.1.upsamplers.0.conv.bias", "output_blocks.5.2.conv.bias"),
-            ("up_blocks.3.attentions.2.proj_out.weight", "output_blocks.11.1.proj_out.weight"),
-            ("up_blocks.3.resnets.2.conv2.weight", "output_blocks.11.0.out_layers.3.weight"),
+            (
+                "down_blocks.0.resnets.1.conv1.weight",
+                "input_blocks.2.0.in_layers.2.weight",
+            ),
+            (
+                "down_blocks.1.resnets.0.conv_shortcut.bias",
+                "input_blocks.4.0.skip_connection.bias",
+            ),
+            (
+                "down_blocks.1.attentions.1.proj_in.weight",
+                "input_blocks.5.1.proj_in.weight",
+            ),
+            (
+                "down_blocks.2.downsamplers.0.conv.weight",
+                "input_blocks.9.0.op.weight",
+            ),
+            (
+                "mid_block.resnets.0.norm1.weight",
+                "middle_block.0.in_layers.0.weight",
+            ),
+            (
+                "mid_block.resnets.1.time_emb_proj.weight",
+                "middle_block.2.emb_layers.1.weight",
+            ),
+            (
+                "mid_block.attentions.0.transformer_blocks.0.attn2.to_k.weight",
+                "middle_block.1.transformer_blocks.0.attn2.to_k.weight",
+            ),
+            (
+                "up_blocks.0.resnets.2.norm2.bias",
+                "output_blocks.2.0.out_layers.0.bias",
+            ),
+            (
+                "up_blocks.0.upsamplers.0.conv.weight",
+                "output_blocks.2.1.conv.weight",
+            ),
+            (
+                "up_blocks.1.upsamplers.0.conv.bias",
+                "output_blocks.5.2.conv.bias",
+            ),
+            (
+                "up_blocks.3.attentions.2.proj_out.weight",
+                "output_blocks.11.1.proj_out.weight",
+            ),
+            (
+                "up_blocks.3.resnets.2.conv2.weight",
+                "output_blocks.11.0.out_layers.3.weight",
+            ),
             ("conv_norm_out.weight", "out.0.weight"),
             ("conv_out.bias", "out.2.bias"),
         ] {
-            assert_eq!(rn.canonical(&format!("model.diffusion_model.{ldm}")), d, "{ldm}");
+            assert_eq!(
+                rn.canonical(&format!("model.diffusion_model.{ldm}")),
+                d,
+                "{ldm}"
+            );
         }
     }
 
@@ -252,11 +297,20 @@ mod tests {
     fn openclip_set_maps_to_hf_clip() {
         let rn = set("openclip");
         for (o, h) in [
-            ("positional_embedding", "text_model.embeddings.position_embedding.weight"),
+            (
+                "positional_embedding",
+                "text_model.embeddings.position_embedding.weight",
+            ),
             ("ln_final.bias", "text_model.final_layer_norm.bias"),
             ("text_projection", "text_projection.weight"),
-            ("transformer.resblocks.11.attn.in_proj_weight", "text_model.encoder.layers.11.self_attn.in_proj.weight"),
-            ("transformer.resblocks.3.mlp.c_proj.bias", "text_model.encoder.layers.3.mlp.fc2.bias"),
+            (
+                "transformer.resblocks.11.attn.in_proj_weight",
+                "text_model.encoder.layers.11.self_attn.in_proj.weight",
+            ),
+            (
+                "transformer.resblocks.3.mlp.c_proj.bias",
+                "text_model.encoder.layers.3.mlp.fc2.bias",
+            ),
         ] {
             assert_eq!(rn.canonical(o), h);
         }

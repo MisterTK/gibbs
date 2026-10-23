@@ -95,7 +95,14 @@ pub(super) fn codec_bench_text(codec: (u8, usize, usize)) -> String {
 }
 
 /// One row of the Kernels table: the kind, then right-aligned numeric columns.
-fn kernel_line(kind: &str, steps: String, us: String, share: String, gbps: String, pct: String) -> String {
+fn kernel_line(
+    kind: &str,
+    steps: String,
+    us: String,
+    share: String,
+    gbps: String,
+    pct: String,
+) -> String {
     format!("{kind:<11}{steps:>5}{us:>6}{share:>6}{gbps:>6}{pct:>4}")
 }
 
@@ -578,6 +585,17 @@ impl TuiApp {
                 th.fg(Token::Gold),
             )));
         }
+        let (kv_hits, kv_misses) = self.kv_pool.radix_cache.metrics();
+        let turns = self.chat_history.len() / 2;
+        if turns > 0 || kv_hits > 0 {
+            lines.push(Line::from(Span::styled(
+                trunc(
+                    &format!("TURN {turns} · KV HIT {kv_hits} tok ({kv_misses} miss)"),
+                    w,
+                ),
+                th.fg(Token::Jade),
+            )));
+        }
         if self.focused(Comp::Tokens) {
             let last: Vec<String> = self
                 .spark
@@ -794,7 +812,14 @@ impl TuiApp {
         // Spec loads store weights as the checkpoint has them, or re-encoded per the policy (its
         // KL gate may fall back to bit-exact), or as `--quant`.
         let mut lines = vec![Line::from(Span::styled(
-            trunc(if serving { "weights as stored or re-encoded" } else { "no LLM loaded" }, iw),
+            trunc(
+                if serving {
+                    "weights as stored or re-encoded"
+                } else {
+                    "no LLM loaded"
+                },
+                iw,
+            ),
             dim,
         ))];
         let policy = match &self.quant_override {
@@ -919,7 +944,11 @@ impl TuiApp {
         if inner.width == 0 || inner.height == 0 {
             return;
         }
-        let (w, h, dim) = (inner.width as usize, inner.height as usize, th.fg(Token::Dim));
+        let (w, h, dim) = (
+            inner.width as usize,
+            inner.height as usize,
+            th.fg(Token::Dim),
+        );
         if g.samples == 0 {
             f.render_widget(
                 Paragraph::new(Span::styled(trunc("no Metal decode samples yet", w), dim)),

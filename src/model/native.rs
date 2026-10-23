@@ -95,6 +95,25 @@ pub trait NativeLm: Send + Sync {
         Ok(None)
     }
 
+    /// Device decode stream supporting both greedy (`temp <= 1e-4`) and stochastic (`temp > 1e-4`) sampling.
+    #[allow(clippy::too_many_arguments)]
+    fn stream_token(
+        &self,
+        last: u32,
+        start_pos: usize,
+        max_new: usize,
+        temp: f32,
+        _top_p: f32,
+        _recent: &[u32],
+        state: &mut SeqState,
+    ) -> Result<Option<u32>, String> {
+        if temp <= 1e-4 {
+            self.stream_greedy_token(last, start_pos, max_new, state)
+        } else {
+            Ok(None)
+        }
+    }
+
     /// Ends the state's device decode stream, if any.
     fn stream_end(&self, _state: &mut SeqState) -> Result<(), String> {
         Ok(())
@@ -134,5 +153,33 @@ pub trait NativeLm: Send + Sync {
     /// The drafter the checkpoint ships (e.g. multi-token-prediction heads).
     fn drafter(&self) -> Option<Arc<dyn Drafter>> {
         None
+    }
+
+    /// An online forward-only (`qlabs.sh/noise`) + suffix-lattice drafter attached to this model's
+    /// hidden-state taps and vocabulary.
+    fn online_drafter(
+        &self,
+        _knobs: Arc<crate::runtime::noise_draft::LiveDraftKnobs>,
+    ) -> Option<Arc<dyn Drafter>> {
+        None
+    }
+
+    /// Exports a physical KV/state snapshot after `token_len` committed tokens for [`RadixPrefixCache`].
+    fn export_kv_snapshot(
+        &self,
+        _state: &SeqState,
+        _token_len: usize,
+    ) -> Option<crate::kv::CachedKvSnapshot> {
+        None
+    }
+
+    /// Restores a physical KV/state prefix of `prefix_len` tokens from `snap` into `state`.
+    fn restore_kv_prefix(
+        &self,
+        _state: &mut SeqState,
+        _snap: &crate::kv::CachedKvSnapshot,
+        _prefix_len: usize,
+    ) -> bool {
+        false
     }
 }
