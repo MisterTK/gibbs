@@ -1,6 +1,6 @@
 {
-  "commit": "b7269ae",
-  "date": "2026-10-20",
+  "commit": "1cb578d",
+  "date": "2026-10-22",
   "device": "Apple M5 Pro",
-  "note": "one gibbs --bench process per bench/loop.json row (suite defaults: 128 tokens, 3 runs); Qwen3.5-2B row re-run (first run 124.9 tok/s, three re-runs 134.5-135.4)"
+  "note": "paired ABBA cand mean across bench/loop.json rows 0..8 (64 decode tokens x 2 timed runs after warm-up, 512-token prefill on rows 0..7 and 4096-token prefill on row 8; max ABBA spread 0.038)"
 }

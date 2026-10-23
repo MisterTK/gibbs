@@ -322,11 +322,13 @@ struct Row {
     key: String,
     label: String,
     tok_s: f64,
+    prefill_tok_s: Option<f64>,
     pct: f64,
     roofline_tok_s: f64,
     gpu_ms: Option<f64>,
     host_ms: Option<f64>,
     dispatches: Option<f64>,
+    rss_gb: Option<f64>,
     /// Bytes one decode step streams (`bytes_per_token`).
     bytes: f64,
     ceiling: f64,
@@ -452,11 +454,13 @@ fn bench() -> Bench {
                     key,
                     label,
                     tok_s: 0.0,
+                    prefill_tok_s: None,
                     pct: 0.0,
                     roofline_tok_s: 0.0,
                     gpu_ms: None,
                     host_ms: None,
                     dispatches: None,
+                    rss_gb: None,
                     bytes: 0.0,
                     ceiling: 0.0,
                     error: Some(err.to_string()),
@@ -466,11 +470,13 @@ fn bench() -> Bench {
                     key,
                     label,
                     tok_s: r["decode_tok_s"].as_f64().expect("decode_tok_s"),
+                    prefill_tok_s: r.get("prefill_tok_s").and_then(Value::as_f64),
                     pct: r["roofline_pct"].as_f64().expect("roofline_pct"),
                     roofline_tok_s: r["roofline_tok_s"].as_f64().expect("roofline_tok_s"),
                     gpu_ms: r.get("gpu_ms").and_then(Value::as_f64),
                     host_ms: r.get("host_ms").and_then(Value::as_f64),
                     dispatches: r.get("dispatches").and_then(Value::as_f64),
+                    rss_gb: r.get("rss_gb").and_then(Value::as_f64),
                     bytes: r["bytes_per_token"].as_f64().expect("bytes_per_token"),
                     ceiling: r["ceiling_gbps"].as_f64().expect("ceiling_gbps"),
                     error: None,
@@ -671,8 +677,8 @@ fn architecture_svg() -> String {
             288,
             128,
             "Loaders",
-            "hub · family builders",
-            "re-encode + KL gate",
+            "hub · arch/*.json5",
+            "re-encode + .blocks",
             Kind::Normal,
         ),
         (
@@ -688,24 +694,16 @@ fn architecture_svg() -> String {
             128,
             "Passes",
             "decompose · dtype-adapt",
-            "fusion · megakernel",
+            "e-graph · fuse",
             Kind::Normal,
         ),
         (
             960,
             128,
             "Metal executor",
-            "generated MSL GEMV",
-            "tuned · arena-planned",
+            "MPP GEMM · flash_attn",
+            "generated GEMV · arena",
             Kind::Focal,
-        ),
-        (
-            512,
-            272,
-            "Core ML → ANE",
-            "System 1 encoder",
-            "--backend ane",
-            Kind::Optional,
         ),
         (
             736,
@@ -754,7 +752,7 @@ fn architecture_svg() -> String {
     format!(
         r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 560" width="1200" height="560" role="img" aria-labelledby="gibbs-arch-title gibbs-arch-desc">
 <title id="gibbs-arch-title">Gibbs architecture</title>
-<desc id="gibbs-arch-desc">Weight files are loaded and re-encoded into one graph IR, optimization passes fuse it, and the Metal executor runs it by default; the CPU executor (parity oracle) and Core ML on the Neural Engine (System 1) are opt-in placements; HTTP, TUI and CLI requests reach the Metal executor through the scheduler.</desc>
+<desc id="gibbs-arch-desc">Weight files are loaded and re-encoded into one graph IR, optimization passes fuse it, and the Metal executor runs it by default; the CPU executor (parity oracle) is an opt-in placement; HTTP, TUI and CLI requests reach the Metal executor through the scheduler.</desc>
 <defs>
 <marker id="ar" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="{DIM}"/></marker>
 <marker id="ar-brass" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="{BRASS}"/></marker>
@@ -771,7 +769,6 @@ fn architecture_svg() -> String {
 <path d="M464 168 H512"/>
 <path d="M688 168 H736"/>
 <path d="M852 208 V272"/>
-<path d="M796 208 V224 Q796 232 788 232 H608 Q600 232 600 240 V272"/>
 <path d="M464 456 H512"/>
 <path d="M688 456 H1040 Q1048 456 1048 448 V208"/>
 </g>
@@ -793,24 +790,28 @@ fn architecture_svg() -> String {
 fn bench_block(b: &Bench) -> String {
     let mut s = String::from(
         "<!-- gibbs-bench:begin -->\n\
-         | Model | Decode tok/s | % of roofline | Roofline tok/s | GPU ms/token | Host ms/token | Dispatches/token |\n\
-         | :--- | ---: | ---: | ---: | ---: | ---: | ---: |\n",
+         | Model | Decode tok/s | Prefill tok/s | % of roofline | Roofline tok/s | GPU ms/token | Host ms/token | Dispatches/token | RSS GB |\n\
+         | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n",
     );
     for r in &b.ok {
+        let pp = r
+            .prefill_tok_s
+            .map_or_else(|| "—".into(), |v| format!("{v:.0}"));
         let gpu = r.gpu_ms.map_or_else(|| "—".into(), |v| format!("{v:.2}"));
         let host = r.host_ms.map_or_else(|| "—".into(), |v| format!("{v:.2}"));
         let disp = r
             .dispatches
             .map_or_else(|| "—".into(), |v| format!("{v:.0}"));
+        let rss = r.rss_gb.map_or_else(|| "—".into(), |v| format!("{v:.2}"));
         let _ = writeln!(
             s,
-            "| {} | {:.1} | {:.1}% | {:.0} | {gpu} | {host} | {disp} |",
+            "| {} | {:.1} | {pp} | {:.1}% | {:.0} | {gpu} | {host} | {disp} | {rss} |",
             r.label, r.tok_s, r.pct, r.roofline_tok_s
         );
     }
     let _ = writeln!(
         s,
-        "| **Geomean** | | **{:.1}%** | | | | |\n\n\
+        "| **Geomean** | | | **{:.1}%** | | | | | |\n\n\
          {}, Metal, measured streaming ceiling {:.1} GB/s. Binary built from `{}` ({}); `gibbs --bench bench/loop.json`: {} decode tokens, median of {} runs, `--reencode {}`; raw rows in [`autoresearch/bench-readme.jsonl`](autoresearch/bench-readme.jsonl). Roofline = ceiling ÷ bytes one decode step streams (`bytes_basis` in each row). {} of {} models reach the 90% roofline target; Gemma 4 E2B QAT decodes at {:.1} tok/s against its 150 tok/s target.",
         b.geomean,
         b.device,
@@ -839,10 +840,18 @@ fn bench_block(b: &Bench) -> String {
     s
 }
 
+#[derive(Clone)]
+struct SameRow {
+    key: String,
+    engine: String,
+    tok_s: f64,
+    pp_tok_s: Option<f64>,
+}
+
 /// Reference numbers from other engines (`autoresearch/bench-reference.json`).
 struct Reference {
-    /// Same machine and GGUF files: (suite key, tok/s).
-    same: Vec<(String, f64)>,
+    /// Same machine reference rows matched to suite rows.
+    same: Vec<SameRow>,
     same_build: String,
     same_tool: String,
     same_date: String,
@@ -872,18 +881,30 @@ fn reference(b: &Bench) -> Reference {
             .unwrap_or_else(|| panic!("{REFERENCE}: missing number {k}"))
     };
     let (sm, pb) = (&v["same_machine"], &v["published"]);
-    let same: Vec<(String, f64)> = sm["rows"]
+    let same: Vec<SameRow> = sm["rows"]
         .as_array()
         .expect("same_machine.rows")
         .iter()
-        .map(|r| (s(r, "key"), f(r, "tok_s")))
+        .filter_map(|r| {
+            let tok_s = r.get("tok_s").and_then(Value::as_f64)?;
+            let key = s(r, "key");
+            if !b.ok.iter().any(|row| row.key == key) {
+                return None;
+            }
+            let engine = r
+                .get("engine")
+                .and_then(Value::as_str)
+                .unwrap_or("llama.cpp")
+                .to_string();
+            let pp_tok_s = r.get("pp512_tok_s").and_then(Value::as_f64);
+            Some(SameRow {
+                key,
+                engine,
+                tok_s,
+                pp_tok_s,
+            })
+        })
         .collect();
-    for (k, _) in &same {
-        assert!(
-            b.ok.iter().any(|r| &r.key == k),
-            "{REFERENCE}: key {k} is not a measured suite row"
-        );
-    }
     Reference {
         same,
         same_build: s(sm, "build"),
@@ -913,14 +934,14 @@ fn reference(b: &Bench) -> Reference {
     }
 }
 
-/// Suite rows with a same-machine llama.cpp number: (row, llama.cpp tok/s).
-fn pairs<'a>(b: &'a Bench, r: &Reference) -> Vec<(&'a Row, f64)> {
+/// Suite rows with a same-machine reference number: (row, SameRow).
+fn pairs<'a>(b: &'a Bench, r: &'a Reference) -> Vec<(&'a Row, &'a SameRow)> {
     b.ok.iter()
         .filter_map(|row| {
             r.same
                 .iter()
-                .find(|(k, _)| *k == row.key)
-                .map(|(_, t)| (row, *t))
+                .find(|sr| sr.key == row.key)
+                .map(|sr| (row, sr))
         })
         .collect()
 }
@@ -935,7 +956,11 @@ fn by_bytes(b: &Bench) -> Vec<&Row> {
 fn compare_svg(b: &Bench, r: &Reference) -> String {
     const X0: usize = 430; // bar origin; 5 px per percent
     let px = |p: f64| (5.0 * p.clamp(0.0, 100.0)).round() as usize;
-    let pairs = pairs(b, r);
+    let pairs: Vec<(&Row, f64)> = pairs(b, r)
+        .into_iter()
+        .filter(|(_, sr)| sr.engine == "llama.cpp")
+        .map(|(row, sr)| (row, sr.tok_s))
+        .collect();
     let gibbs = by_bytes(b);
     let ya = 168;
     let ya_end = ya + 44 * pairs.len();
@@ -1073,9 +1098,9 @@ fn compare_block(b: &Bench, r: &Reference) -> String {
     let pairs = pairs(b, r);
     let mut s = format!(
         "<!-- gibbs-compare:begin -->\n\
-         **Same machine, same GGUF files.** llama.cpp: `{tool}`, {build}, {date}, recorded in [`{src}`]({src}) ({note}); not re-measured since. Gibbs: the table above (build `{commit}`, {bdate}).\n\n\
-         | Model | Gibbs tok/s | llama.cpp tok/s | Gibbs ÷ llama.cpp | Gibbs % of roofline | llama.cpp % of Gibbs roofline |\n\
-         | :--- | ---: | ---: | ---: | ---: | ---: |\n",
+         **Same machine, same GGUF / safetensors files.** llama.cpp: `{tool}`, {build}, {date} (plus `mlx_lm` on SmolLM2 safetensors), recorded in [`{src}`]({src}) ({note}). Gibbs: the table above (build `{commit}`, {bdate}).\n\n\
+         | Model | Ref engine | Gibbs decode tok/s | Ref decode tok/s | Gibbs ÷ Ref (decode) | Gibbs prefill tok/s | Ref prefill tok/s | Gibbs ÷ Ref (prefill) | Gibbs % of roofline | Ref % of Gibbs roofline |\n\
+         | :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n",
         tool = r.same_tool,
         build = r.same_build,
         date = r.same_date,
@@ -1084,11 +1109,28 @@ fn compare_block(b: &Bench, r: &Reference) -> String {
         commit = b.commit,
         bdate = b.date,
     );
-    for (row, l) in &pairs {
+    for (row, sr) in &pairs {
+        let l = sr.tok_s;
+        let g_pp = row
+            .prefill_tok_s
+            .map_or_else(|| "—".into(), |v| format!("{v:.0}"));
+        let r_pp = sr
+            .pp_tok_s
+            .map_or_else(|| "—".into(), |v| format!("{v:.0}"));
+        let pp_ratio = match (row.prefill_tok_s, sr.pp_tok_s) {
+            (Some(gp), Some(rp)) if rp > 0.0 => format!("{:.2}×", gp / rp),
+            _ => "—".into(),
+        };
+        let eng = if sr.engine == "mlx" {
+            "mlx_lm"
+        } else {
+            sr.engine.as_str()
+        };
         let _ = writeln!(
             s,
-            "| {} | {:.1} | {:.1} | {:.2}× | {:.1}% | {:.1}% |",
+            "| {} | {} | {:.1} | {:.1} | {:.2}× | {g_pp} | {r_pp} | {pp_ratio} | {:.1}% | {:.1}% |",
             row.label,
+            eng,
             row.tok_s,
             l,
             row.tok_s / l,
@@ -1103,10 +1145,14 @@ fn compare_block(b: &Bench, r: &Reference) -> String {
             .collect();
     let _ = write!(
         s,
-        "\nllama.cpp % of Gibbs roofline = llama.cpp tok/s ÷ Gibbs roofline tok/s (the bytes Gibbs streams per decode step), so both percentage columns share one scale."
+        "\nRef % of Gibbs roofline = Ref decode tok/s ÷ Gibbs roofline tok/s (the bytes Gibbs streams per decode step), so both percentage columns share one scale."
     );
     if !missing.is_empty() {
-        let _ = write!(s, " No llama.cpp number for: {}.", missing.join(", "));
+        let _ = write!(
+            s,
+            " No same-machine reference number for: {}.",
+            missing.join(", ")
+        );
     }
     let _ = write!(
         s,
@@ -1170,7 +1216,7 @@ fn compare_block(b: &Bench, r: &Reference) -> String {
         .expect("gibbs rows");
     let _ = write!(
         s,
-        "\nEffective GB/s = bytes per token × tok/s; llama.cpp's bytes are the GGUF file size, Gibbs's are the bytes one decode step streams. The file size includes the token-embedding table, of which a decode step reads one row, so the llama.cpp rates are slight upper bounds. On {gbmin:.1}–{gbmax:.1} GB per token, llama.cpp streams at {pmin:.0}–{pmax:.0}% of the {spec:.0} GB/s spec; its {fmt} run reaches {tg:.0} GB/s, {tc:.1}% of the {ceil:.1} GB/s ceiling Gibbs measures. The Gibbs suite streams {smin:.2}–{smax:.2} GB per token; its highest row is {bl} at {bp:.1}% of spec. There is no Gibbs run of {model}, so this table compares different models on one chip. The work aimed at the remaining per-token time is in [`plans/research-sprint-3.md`](plans/research-sprint-3.md).\n",
+        "\nEffective GB/s = bytes per token × tok/s; llama.cpp's bytes are the GGUF file size, Gibbs's are the bytes one decode step streams. The file size includes the token-embedding table, of which a decode step reads one row, so the llama.cpp rates are slight upper bounds. On {gbmin:.1}–{gbmax:.1} GB per token, llama.cpp streams at {pmin:.0}–{pmax:.0}% of the {spec:.0} GB/s spec; its {fmt} run reaches {tg:.0} GB/s, {tc:.1}% of the {ceil:.1} GB/s ceiling Gibbs measures. The Gibbs suite streams {smin:.2}–{smax:.2} GB per token; its highest row is {bl} at {bp:.1}% of spec. There is no Gibbs run of {model}, so this table compares different models on one chip. The phase-by-phase optimization log is in [`autoresearch/roofline-loop.tsv`](autoresearch/roofline-loop.tsv).\n",
         spec = r.pub_spec,
         fmt = top.0,
         tg = top.1 * top.2,
