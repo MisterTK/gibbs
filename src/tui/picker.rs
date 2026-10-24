@@ -513,6 +513,10 @@ impl Picker {
     /// request) the first time it is asked for; until then, and when it cannot be read, the
     /// estimate is size × bpw (the failure shows as `None`, like an unmeasured ceiling).
     fn predict(&self, q: &Entry) -> Option<(f64, bool, f64)> {
+        self.predict_variant(q, true)
+    }
+
+    fn predict_variant(&self, q: &Entry, spawn_fetch: bool) -> Option<(f64, bool, f64)> {
         use crate::model::variant::{host_eff, predict_with, reencode_policy, size_header};
         let ceiling = f64::from(self.ceiling_gbps);
         if ceiling <= 0.0 {
@@ -521,7 +525,7 @@ impl Picker {
         let state = {
             let mut m = self.headers.lock();
             let known = m.get(&q.id).cloned();
-            if known.is_none() {
+            if known.is_none() && spawn_fetch {
                 m.insert(q.id.clone(), None);
                 let (headers, hub, token, id, cached) = (
                     self.headers.clone(),
@@ -702,11 +706,44 @@ impl Picker {
             width,
         ));
 
-        // Stateless scroll: keep the selection on screen.
-        let offset = (self.selected + 1).saturating_sub(list_h);
+        // Stateless scroll: keep the selection and its inline quant sub-rows on screen.
+        const MAX_INLINE_QUANTS: usize = 4;
+        let selected_entry = self.rows.get(self.selected).map(|r| &r.entry);
+        let sub_cap = list_h.saturating_sub(2).min(MAX_INLINE_QUANTS);
+        let sub_count = selected_entry.map_or(0, |e| {
+            if e.quants.is_empty() {
+                0
+            } else {
+                e.quants.len().min(sub_cap)
+            }
+        });
+        let model_rows_h = if sub_count > 0 {
+            list_h.saturating_sub(1 + sub_count).max(1)
+        } else {
+            list_h.max(1)
+        };
+        let offset = (self.selected + 1).saturating_sub(model_rows_h);
         let visible =
-            &self.rows[offset.min(self.rows.len())..(offset + list_h).min(self.rows.len())];
+            &self.rows[offset.min(self.rows.len())..(offset + model_rows_h).min(self.rows.len())];
         let now = chrono::Utc::now();
+        let sub_rows: Vec<(usize, &Entry, [String; 6], bool)> =
+            match selected_entry.filter(|_| sub_count > 0) {
+                Some(e) => {
+                    let q_start = e
+                        .quant_idx
+                        .saturating_sub(sub_count / 2)
+                        .min(e.quants.len().saturating_sub(sub_count));
+                    (q_start..q_start + sub_count)
+                        .map(|qi| {
+                            let q = &e.quants[qi];
+                            let (q_cells, fits) =
+                                self.quant_subrow_cells(e, q, qi, e.quants.len(), now);
+                            (qi, q, q_cells, fits)
+                        })
+                        .collect()
+                }
+                None => Vec::new(),
+            };
         let cells: Vec<[String; 6]> = visible
             .iter()
             .map(|r| {
@@ -738,6 +775,7 @@ impl Picker {
         let col_w = |c: usize| {
             let data = cells
                 .iter()
+                .chain(sub_rows.iter().map(|(_, _, r, _)| r))
                 .map(|r| r[c].chars().count())
                 .max()
                 .unwrap_or(0);
@@ -816,6 +854,68 @@ impl Picker {
                 line = line.style(th.selected());
             }
             lines.push(line);
+            if offset + i == self.selected && !sub_rows.is_empty() {
+                let total_model_w = 2 + id_w;
+                let repo_prefix = format!("{}/", e.id);
+                for (sub_i, &(qi, q, ref q_cells, fits)) in sub_rows.iter().enumerate() {
+                    let branch = if sub_i + 1 == sub_rows.len() {
+                        "  └─ "
+                    } else {
+                        "  ├─ "
+                    };
+                    let is_active = qi == e.quant_idx;
+                    let is_best = qi == 0;
+                    let marker = match (is_active, is_best) {
+                        (true, true) => "▸★",
+                        (true, false) => "▸ ",
+                        (false, true) => " ★",
+                        (false, false) => "  ",
+                    };
+                    let q_tag = detect_quant_format(Path::new(&q.id))
+                        .map_or_else(|| "quant".to_string(), |f| f.name().to_string());
+                    let badge = format!("[{q_tag}] ");
+                    let raw_label = q.id.strip_prefix(&repo_prefix).unwrap_or(&q.id);
+                    let prefix_w =
+                        branch.chars().count() + marker.chars().count() + 1 + badge.chars().count();
+                    let active_style = accent.add_modifier(Modifier::BOLD);
+                    let mut sub_spans = if prefix_w <= total_model_w {
+                        let rem_w = total_model_w - prefix_w;
+                        let trunc = middle_truncate(raw_label, rem_w);
+                        let pad = rem_w.saturating_sub(trunc.chars().count());
+                        let label_padded = format!("{trunc}{}", " ".repeat(pad));
+                        let marker_style = if is_active {
+                            active_style
+                        } else if is_best {
+                            th.fg(Token::Gold)
+                        } else {
+                            dim
+                        };
+                        let label_style = if is_active { active_style } else { dim };
+                        vec![
+                            Span::styled(branch, dim),
+                            Span::styled(format!("{marker} {badge}"), marker_style),
+                            Span::styled(label_padded, label_style),
+                        ]
+                    } else {
+                        vec![Span::styled(
+                            truncate(&format!("{branch}{marker} {badge}"), total_model_w),
+                            if is_active { active_style } else { dim },
+                        )]
+                    };
+                    let status_style = if is_active {
+                        th.fg(if fits { Token::Gold } else { Token::Crimson })
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        th.fg(if fits { Token::Jade } else { Token::Crimson })
+                    };
+                    sub_spans.extend(columns(q_cells, &|c| match c {
+                        5 => status_style,
+                        _ if is_active => accent,
+                        _ => dim,
+                    }));
+                    lines.push(spread(sub_spans, Vec::new(), width));
+                }
+            }
         }
         if self.rows.is_empty() && list_h > 0 {
             let q = self.query.trim();
@@ -830,44 +930,7 @@ impl Picker {
             lines.push(Line::default());
         }
         let settings = crate::tui::settings::load_settings();
-        let selected_entry = self.rows.get(self.selected).map(|r| &r.entry);
         if let Some(e) = selected_entry.filter(|e| !e.quants.is_empty()) {
-            let mut quant_spans: Vec<Span> = Vec::new();
-            quant_spans.push(Span::styled(
-                "Quant: ",
-                th.fg(Token::Gold).add_modifier(Modifier::BOLD),
-            ));
-            for (i, q_entry) in e.quants.iter().enumerate() {
-                let q_fmt = detect_quant_format(Path::new(&q_entry.id));
-                let tag = q_fmt.map_or_else(
-                    || {
-                        q_entry
-                            .id
-                            .rsplit('/')
-                            .next()
-                            .unwrap_or(&q_entry.id)
-                            .to_string()
-                    },
-                    |q| q.name().to_string(),
-                );
-                let is_best = i == 0;
-                let is_active = i == e.quant_idx;
-
-                if i > 0 {
-                    quant_spans.push(Span::raw("  "));
-                }
-
-                // The list is ranked under the variant policy, so its first entry is the pick.
-                let tag = if is_best { format!("★{tag}") } else { tag };
-                if is_active {
-                    quant_spans.push(Span::styled(
-                        format!("[{tag}]"),
-                        th.fg(Token::Brass).add_modifier(Modifier::BOLD),
-                    ));
-                } else {
-                    quant_spans.push(Span::styled(tag, dim));
-                }
-            }
             let q_active = e.quants.get(e.quant_idx);
             let sz_gb = q_active
                 .and_then(|q| q.size)
@@ -889,18 +952,110 @@ impl Picker {
                 Some((t, false, pct)) => format!("~{:.0} tok/s ~{pct:.0}%", t.min(999.0)),
                 None => "? tok/s".to_string(),
             };
-            let pred_span = Span::styled(
-                format!(" · {pred_tok_s} {sz_gb:.1}GB [{fit_tag}]"),
-                th.fg(if fits { Token::Gold } else { Token::Crimson }),
+            let pred_text = format!(
+                " · {pred_tok_s} {sz_gb:.1}GB [{fit_tag}] ({}/{})",
+                e.quant_idx + 1,
+                e.quants.len()
             );
-            quant_spans.push(pred_span);
-            let right_hint = vec![Span::styled(
-                format!(
-                    "(★ best for {} · ←/→ choose · enter load)",
-                    settings.variant
-                ),
-                dim,
-            )];
+            let right_hint_str = format!(
+                "(★ best for {} · ←/→ choose · enter load)",
+                settings.variant
+            );
+            let formatted_tags: Vec<String> = e
+                .quants
+                .iter()
+                .enumerate()
+                .map(|(i, q_entry)| {
+                    let q_fmt = detect_quant_format(Path::new(&q_entry.id));
+                    let tag = q_fmt.map_or_else(
+                        || {
+                            q_entry
+                                .id
+                                .rsplit('/')
+                                .next()
+                                .unwrap_or(&q_entry.id)
+                                .to_string()
+                        },
+                        |q| q.name().to_string(),
+                    );
+                    let tag = if i == 0 { format!("★{tag}") } else { tag };
+                    if i == e.quant_idx {
+                        format!("[{tag}]")
+                    } else {
+                        tag
+                    }
+                })
+                .collect();
+            let active_idx = e.quant_idx.min(formatted_tags.len().saturating_sub(1));
+            let base_w = "Quant: ".chars().count() + pred_text.chars().count();
+            let hint_w = right_hint_str.chars().count();
+            let min_tags_w = formatted_tags[active_idx].chars().count()
+                + if active_idx > 0 { 3 } else { 0 }
+                + if active_idx + 1 < formatted_tags.len() {
+                    3
+                } else {
+                    0
+                };
+            let show_hint = base_w + min_tags_w + 1 + hint_w <= width;
+            let budget = width.saturating_sub(base_w + if show_hint { 1 + hint_w } else { 0 });
+            let window_width = |lo: usize, hi: usize| -> usize {
+                let left_ell = if lo > 0 { 3 } else { 0 };
+                let right_ell = if hi + 1 < formatted_tags.len() { 3 } else { 0 };
+                let tags_w: usize = formatted_tags[lo..=hi]
+                    .iter()
+                    .map(|t| t.chars().count())
+                    .sum::<usize>()
+                    + (hi - lo) * 2;
+                left_ell + tags_w + right_ell
+            };
+            let (mut lo, mut hi) = (active_idx, active_idx);
+            loop {
+                let mut grew = false;
+                if hi + 1 < formatted_tags.len() && window_width(lo, hi + 1) <= budget {
+                    hi += 1;
+                    grew = true;
+                }
+                if lo > 0 && window_width(lo - 1, hi) <= budget {
+                    lo -= 1;
+                    grew = true;
+                }
+                if !grew {
+                    break;
+                }
+            }
+            let mut quant_spans: Vec<Span> = Vec::new();
+            quant_spans.push(Span::styled(
+                "Quant: ",
+                th.fg(Token::Gold).add_modifier(Modifier::BOLD),
+            ));
+            if lo > 0 {
+                quant_spans.push(Span::styled("‹… ", dim));
+            }
+            for i in lo..=hi {
+                if i > lo {
+                    quant_spans.push(Span::raw("  "));
+                }
+                if i == active_idx {
+                    quant_spans.push(Span::styled(
+                        formatted_tags[i].clone(),
+                        th.fg(Token::Brass).add_modifier(Modifier::BOLD),
+                    ));
+                } else {
+                    quant_spans.push(Span::styled(formatted_tags[i].clone(), dim));
+                }
+            }
+            if hi + 1 < formatted_tags.len() {
+                quant_spans.push(Span::styled(" …›", dim));
+            }
+            quant_spans.push(Span::styled(
+                pred_text,
+                th.fg(if fits { Token::Gold } else { Token::Crimson }),
+            ));
+            let right_hint = if show_hint {
+                vec![Span::styled(right_hint_str, dim)]
+            } else {
+                Vec::new()
+            };
             lines.push(spread(quant_spans, right_hint, width));
         } else {
             lines.push(Line::default());
@@ -943,6 +1098,54 @@ impl Picker {
                 .map(|b| format!("~{}", fmt_bytes(b)))
                 .unwrap_or_default(),
         }
+    }
+
+    fn quant_subrow_cells(
+        &self,
+        parent: &Entry,
+        q: &Entry,
+        qi: usize,
+        total_quants: usize,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> ([String; 6], bool) {
+        let is_in_repo = q.id.starts_with(&format!("{}/", parent.id));
+        let est_bytes = q
+            .params
+            .or(parent.params)
+            .map_or(2_000_000_000, |p| (p as f64 * 0.6) as u64);
+        let fits = match q.size {
+            Some(_) => variant_fits(q, self.total_memory, self.free_disk),
+            None => self.total_memory.map_or(true, |m| est_bytes <= m),
+        };
+        let pred_tok_s = match self.predict_variant(q, qi == parent.quant_idx) {
+            Some((t, true, pct)) => format!("{:.0} tok/s {pct:.0}%", t.min(999.0)),
+            Some((t, false, pct)) => format!("~{:.0} tok/s ~{pct:.0}%", t.min(999.0)),
+            None => "? tok/s".to_string(),
+        };
+        let cells = [
+            q.params.or(parent.params).map(human).unwrap_or_default(),
+            self.size_cell(q),
+            q.likes
+                .or_else(|| is_in_repo.then_some(parent.likes).flatten())
+                .map(human)
+                .unwrap_or_default(),
+            q.downloads
+                .or_else(|| is_in_repo.then_some(parent.downloads).flatten())
+                .map(human)
+                .unwrap_or_default(),
+            q.updated
+                .as_deref()
+                .or_else(|| is_in_repo.then_some(parent.updated.as_deref()).flatten())
+                .map(|u| relative(u, now))
+                .unwrap_or_default(),
+            format!(
+                "{pred_tok_s} [{}] ({}/{})",
+                if fits { "fit" } else { "no-fit" },
+                qi + 1,
+                total_quants
+            ),
+        ];
+        (cells, fits)
     }
 
     fn key(&self) -> Key {
@@ -1226,6 +1429,24 @@ impl Picker {
                     if !e.cached {
                         (e.blocker, e.size) = (h.blocker.clone(), h.size);
                     }
+                    for q in &mut e.quants {
+                        if q.downloads.is_none() {
+                            q.downloads = h.downloads;
+                            q.likes = h.likes;
+                            q.updated = h.updated.clone();
+                        }
+                    }
+                    let prev_len = e.quants.len();
+                    for hq in &h.quants {
+                        if !e.quants.iter().any(|q| q.id == hq.id) {
+                            e.quants.push(hq.clone());
+                        }
+                    }
+                    if e.quants.len() > prev_len {
+                        sort_variants(&mut e.quants, self.total_memory, self.free_disk);
+                        e.quant_idx = e.quant_idx.min(e.quants.len().saturating_sub(1));
+                        e.via = e.quants.get(e.quant_idx).cloned().map(Box::new);
+                    }
                 }
                 None => all.push(h.clone()),
             }
@@ -1417,6 +1638,22 @@ fn truncate(s: &str, w: usize) -> String {
         String::new()
     } else {
         s.chars().take(w - 1).chain(std::iter::once('…')).collect()
+    }
+}
+
+fn middle_truncate(s: &str, max_w: usize) -> String {
+    let len = s.chars().count();
+    if len <= max_w {
+        s.to_string()
+    } else if max_w <= 1 {
+        truncate(s, max_w)
+    } else {
+        let head = (max_w - 1) / 2;
+        let tail = max_w - 1 - head;
+        let mut out: String = s.chars().take(head).collect();
+        out.push('…');
+        out.extend(s.chars().skip(len - tail));
+        out
     }
 }
 
@@ -1790,6 +2027,9 @@ fn parse_hub_rows(
                 .or_else(|| selection.err().filter(|_| !own_files));
             let packed_gguf = gguf_arch.is_some_and(crate::arch::dispatch::runs_spec_lm_gguf);
             let gguf_total = m["gguf"]["total"].as_u64().or(params);
+            let downloads = m["downloads"].as_u64();
+            let likes = m["likes"].as_u64();
+            let updated = m["lastModified"].as_str().map(String::from);
             let mut variants: Vec<Entry> = files
                 .iter()
                 .map(|f| f.path.as_str())
@@ -1807,9 +2047,9 @@ fn parse_hub_rows(
                     Some(Entry {
                         id: format!("{id}/{p}"),
                         params,
-                        downloads: None,
-                        likes: None,
-                        updated: None,
+                        downloads,
+                        likes,
+                        updated: updated.clone(),
                         size: gguf_total.map(|t| (t as f64 * bpw as f64 / 8.0) as u64),
                         gated: false,
                         cached: false,
@@ -1852,9 +2092,9 @@ fn parse_hub_rows(
             Some(Entry {
                 id,
                 params,
-                downloads: m["downloads"].as_u64(),
-                likes: m["likes"].as_u64(),
-                updated: m["lastModified"].as_str().map(String::from),
+                downloads,
+                likes,
+                updated,
                 size,
                 gated: !matches!(m["gated"], Value::Null | Value::Bool(false)),
                 cached: false,
@@ -2980,6 +3220,99 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("tok/s 90%"), "{text}");
+    }
+
+    #[test]
+    fn quant_subrows_and_windowed_bar_keep_fit_and_metadata_visible() {
+        use crate::model::variant::with_unmeasured_host;
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let bartowski_files: String = (0..32)
+            .map(|i| {
+                let tag = match i % 6 {
+                    0 => "Q4_K_M",
+                    1 => "Q4_0",
+                    2 => "Q5_K_M",
+                    3 => "Q6_K",
+                    4 => "Q8_0",
+                    _ => "BF16",
+                };
+                format!(r#"{{"rfilename":"Nanbeige4.2-3B-v{i}-{tag}.gguf"}}"#)
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let json = format!(
+            r#"[
+                {{"id":"iamimmanuelraj/Nanbeige4.2-3B-GGUF","pipeline_tag":"text-generation",
+                  "likes":14,"downloads":4200,"lastModified":"2025-06-15T00:00:00Z",
+                  "gguf":{{"total":3000000000,"architecture":"llama"}},
+                  "siblings":[{{"rfilename":"Nanbeige4.2-3B-TQ2_0.gguf"}}]}},
+                {{"id":"bartowski/Nanbeige4.2-3B-GGUF","pipeline_tag":"text-generation",
+                  "likes":39,"downloads":12000,"lastModified":"2025-07-28T00:00:00Z",
+                  "gguf":{{"total":3000000000,"architecture":"llama"}},
+                  "siblings":[{bartowski_files}]}}
+            ]"#
+        );
+        let pkgs = parse_hub_rows(&json, Some(48 << 30), Some(3_000_000_000)).unwrap();
+        let mut quants: Vec<Entry> = pkgs.into_iter().flat_map(|e| e.quants).collect();
+        assert_eq!(quants.len(), 33);
+        assert_eq!(quants[0].likes, Some(14));
+        assert_eq!(quants[1].likes, Some(39));
+        assert_eq!(quants[1].downloads, Some(12000));
+        sort_variants(&mut quants, Some(48 << 30), None);
+
+        let cache = tempfile::tempdir().unwrap();
+        let mut p = Picker::new(
+            HuggingFaceHub::with_cache_dir(cache.path().to_path_buf()),
+            None,
+            &[],
+            Some(48 << 30),
+        );
+        p.hub_results = vec![Entry {
+            id: "Nanbeige/Nanbeige4.2-3B-Thinking".into(),
+            params: Some(3_000_000_000),
+            size: Some(6_000_000_000),
+            likes: Some(500),
+            downloads: Some(85_000),
+            updated: Some("2025-05-01T00:00:00Z".into()),
+            via: quants.first().cloned().map(Box::new),
+            quants,
+            quant_idx: 0,
+            ..Default::default()
+        }];
+        p.refilter();
+        p.selected = 0;
+        p.set_ceiling_gbps(300.0);
+        p.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(p.rows[0].entry.quant_idx, 1);
+
+        let text = with_unmeasured_host(|| {
+            let mut t = Terminal::new(TestBackend::new(140, 24)).unwrap();
+            t.draw(|f| p.render(f, f.area(), "", None)).unwrap();
+            let buf = t.backend().buffer().clone();
+            (0..buf.area.height)
+                .map(|y| {
+                    (0..buf.area.width)
+                        .map(|x| buf[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        });
+        assert!(text.contains("├─"), "{text}");
+        assert!(text.contains("└─"), "{text}");
+        assert!(text.contains("bartowski"), "{text}");
+        assert!(text.contains("39"), "{text}");
+        assert!(text.contains("12K"), "{text}");
+        assert!(text.contains("2025-07-28"), "{text}");
+        let quant_line = text
+            .lines()
+            .find(|l| l.contains("Quant: "))
+            .expect("Quant: line present");
+        assert!(quant_line.contains("tok/s"), "{quant_line}");
+        assert!(quant_line.contains("[fit]"), "{quant_line}");
+        assert!(quant_line.contains("(2/33)"), "{quant_line}");
+        assert!(quant_line.contains("…›"), "{quant_line}");
     }
 
     /// LTX-Video rows follow the loader's file rule: v0.9.0 GGUFs and `LTXPipeline` repos load; later
