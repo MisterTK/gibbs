@@ -778,7 +778,7 @@ impl TuiApp {
                 Some(Ok(
                     "GIBBS ENGINE COMMAND & KEY REFERENCE:\n\
                      Keybindings:\n\
-                     · m / Esc    : Switch between Dashboard & Model Picker (there r / f cycle the re-encode / variant policy and reload the model)\n\
+                     · m / Esc    : Switch between Dashboard & Model Picker (there ^r / ^f cycle the re-encode / variant policy and reload the model)\n\
                      · ↑ / ↓      : Cycle prior prompt entries for retry or editing\n\
                      · F2         : System Prompt / Chat Template Selector\n\
                      · F4         : Policy & Speed Options modal (defaults = fastest for model)\n\
@@ -3322,15 +3322,27 @@ mod tests {
         let s = crate::tui::settings::load_settings();
         assert_eq!(s.variant.name(), "fastest-4bit");
 
-        // 3. Picker 'r' and 'f' keys
+        // 3. Picker '^r' and '^f' keys; plain 'r' and 'f' type into the search query
         app.handle_key(key(KeyCode::Char('m')));
         app.handle_key(key(KeyCode::Char('r')));
+        app.handle_key(key(KeyCode::Char('f')));
+        assert_eq!(app.picker.query, "rf");
+        assert_eq!(
+            crate::tui::settings::load_settings().reencode.name(),
+            "low-bit-native"
+        );
+        assert_eq!(
+            crate::tui::settings::load_settings().variant.name(),
+            "fastest-4bit"
+        );
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
         let s = crate::tui::settings::load_settings();
         // From the low-bit-native set above: one step on is bit-exact, saved and followed by the app.
         assert_eq!(s.reencode.name(), "bit-exact");
         assert_eq!(app.reencode_policy, s.reencode);
 
-        app.handle_key(key(KeyCode::Char('f')));
+        app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
         let s = crate::tui::settings::load_settings();
         assert_eq!(s.variant.name(), "best-quality");
         assert_eq!(app.variant_policy, s.variant);
@@ -3377,8 +3389,8 @@ mod tests {
         assert_eq!(sched.model_id(), "gibbs/tiny-5m");
 
         app.handle_key(key(KeyCode::Char('m')));
-        app.handle_key(key(KeyCode::Char('f')));
-        assert!(app.load.is_some(), "picker f reloads");
+        app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
+        assert!(app.load.is_some(), "picker ^f reloads");
         settle(&mut app);
     }
 

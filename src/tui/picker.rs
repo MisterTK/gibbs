@@ -2,11 +2,11 @@
 
 use super::theme::{theme, Token};
 use super::widgets::instrument;
-use crate::runtime::draft::{draft_target, is_draft_for};
 use crate::model::hub::{
     branch_models, detect_quant_format, is_metadata_file, list_repo_files, select_weight_files,
     split_revision, split_weight_file, HuggingFaceHub, RepoFile,
 };
+use crate::runtime::draft::{draft_target, is_draft_for};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::{
     layout::Rect,
@@ -121,7 +121,7 @@ pub struct Picker {
     hf_token: Option<String>,
     pinned: Vec<String>,
     total_memory: Option<u64>,
-    query: String,
+    pub(super) query: String,
     query_changed: Instant,
     sort: Sort,
     selected: usize,
@@ -316,13 +316,13 @@ impl Picker {
                     return PickerAction::None;
                 }
             }
-            KeyCode::Char('r') if !ctrl && self.query.is_empty() => {
+            KeyCode::Char('r') if ctrl => {
                 let mut s = crate::tui::settings::load_settings();
                 s.reencode = s.reencode.next();
                 let _ = crate::tui::settings::save_settings(&s);
                 return PickerAction::Reload("reencode");
             }
-            KeyCode::Char('f') if !ctrl && self.query.is_empty() => {
+            KeyCode::Char('f') if ctrl => {
                 let mut s = crate::tui::settings::load_settings();
                 s.variant = s.variant.next();
                 let _ = crate::tui::settings::save_settings(&s);
@@ -406,9 +406,15 @@ impl Picker {
             })
             .map(|e| (e.id.clone(), e.params));
         if let Some((id, base_params)) = need_quants {
+            let urgent = self.rows.get(self.selected).is_some_and(|r| {
+                r.entry
+                    .blocker
+                    .as_deref()
+                    .is_some_and(|b| b.starts_with("needs ~"))
+            });
             if !self.quants.contains_key(&id)
                 && !self.quanting.contains(&id)
-                && self.selection_changed.elapsed() >= DEBOUNCE
+                && (urgent || self.selection_changed.elapsed() >= DEBOUNCE)
             {
                 self.quanting.insert(id.clone());
                 let (tx, token, total, free) = (
@@ -571,28 +577,64 @@ pub fn repo_dir_path(cache_root: &Path, id: &str) -> std::path::PathBuf {
 /// Orders variant entries best first under the persisted variant policy (S3.6). Only file size and
 /// format are known for a listing, so this predicts from size × bpw; headers are read lazily for
 /// the variant on screen ([`Picker::predict`]).
-fn sort_variants(v: &mut [Entry], total_memory: Option<u64>) {
+fn variant_blocker(q: &Entry, total_memory: Option<u64>, free_disk: Option<u64>) -> Option<String> {
+    if let Some(b) = packed_memory_blocker(q.size, total_memory) {
+        return Some(b);
+    }
+    if !q.cached {
+        if let Some((size, free)) = q.size.zip(free_disk) {
+            if size > free {
+                return Some(format!(
+                    "needs ~{} of disk; {} free",
+                    fmt_bytes(size),
+                    fmt_bytes(free)
+                ));
+            }
+        }
+    }
+    None
+}
+
+fn variant_fits(q: &Entry, total_memory: Option<u64>, free_disk: Option<u64>) -> bool {
+    variant_blocker(q, total_memory, free_disk).is_none()
+}
+
+fn sort_variants(v: &mut [Entry], total_memory: Option<u64>, free_disk: Option<u64>) {
     use crate::model::variant::{rank_variants, reencode_policy, variant_policy, Variant};
+    for e in v.iter_mut() {
+        e.blocker = variant_blocker(e, total_memory, free_disk);
+    }
     let policy = reencode_policy();
     let mut ranked: Vec<Variant> = v
         .iter()
-        .map(|e| match detect_quant_format(Path::new(&e.id)) {
-            Some(f) => Variant::from_size(&e.id, f, e.size, policy, 1.0),
-            None => Variant {
-                name: e.id.clone(),
-                download_bytes: e.size.unwrap_or(u64::MAX),
-                resident_bytes: e.size.unwrap_or(u64::MAX),
-                tok_s: 0.0,
-                bpw: 0.0,
-            },
+        .map(|e| {
+            let resident = e.size.map_or(u64::MAX, |s| (s as f64 * 1.1) as u64);
+            match detect_quant_format(Path::new(&e.id)) {
+                Some(f) => {
+                    let mut var = Variant::from_size(&e.id, f, e.size, policy, 1.0);
+                    if e.size.is_some() {
+                        var.resident_bytes = resident;
+                    }
+                    var
+                }
+                None => Variant {
+                    name: e.id.clone(),
+                    download_bytes: e.size.unwrap_or(u64::MAX),
+                    resident_bytes: resident,
+                    tok_s: 0.0,
+                    bpw: 0.0,
+                },
+            }
         })
         .collect();
-    rank_variants(
-        variant_policy(),
-        total_memory.unwrap_or(u64::MAX),
-        &mut ranked,
-    );
-    v.sort_by_key(|e| ranked.iter().position(|r| r.name == e.id));
+    let ram = total_memory.map_or(u64::MAX, |m| (m as f64 / 0.7).ceil() as u64);
+    rank_variants(variant_policy(), ram, &mut ranked);
+    v.sort_by_key(|e| {
+        (
+            !variant_fits(e, total_memory, free_disk),
+            ranked.iter().position(|r| r.name == e.id),
+        )
+    });
 }
 impl Picker {
     /// `id` left the local cache: local-only rows vanish, hub rows lose `cached`.
@@ -831,10 +873,13 @@ impl Picker {
                 .and_then(|q| q.size)
                 .map(|s| s as f64 / 1e9)
                 .unwrap_or(e.params.map(|p| p as f64 * 0.6 / 1e9).unwrap_or(2.0));
-            let fits = self
-                .total_memory
-                .map(|m| (sz_gb * 1e9) as u64 <= m)
-                .unwrap_or(true);
+            let fits = match q_active.filter(|q| q.size.is_some()) {
+                Some(q) => variant_fits(q, self.total_memory, self.free_disk),
+                None => self
+                    .total_memory
+                    .map(|m| (sz_gb * 1e9) as u64 <= m)
+                    .unwrap_or(true),
+            };
             let fit_tag = if fits { "fit" } else { "no-fit" };
             // Predicted decode speed (S3.6) and its share of the roofline: from the weight header
             // once read, `~` while it is being read (size × bpw), `?` when it cannot be read or
@@ -866,7 +911,7 @@ impl Picker {
             .unwrap_or_default();
         let s = &settings;
         let policy_str = format!(
-            " · reencode: {} (r) · variant: {} (f)",
+            " · reencode: {} (^r) · variant: {} (^f)",
             s.reencode, s.variant
         );
         lines.push(spread(
@@ -924,22 +969,45 @@ impl Picker {
 
     fn enter(&mut self) -> PickerAction {
         match self.rows.get(self.selected) {
-            Some(row) => match &row.entry.blocker {
-                Some(b) => {
-                    self.note = Some((b.clone(), Token::Crimson));
-                    PickerAction::None
+            Some(row) => {
+                let chosen = row
+                    .entry
+                    .via
+                    .as_deref()
+                    .or_else(|| row.entry.quants.get(row.entry.quant_idx));
+                if let Some(v) = chosen {
+                    if row
+                        .entry
+                        .blocker
+                        .as_deref()
+                        .map_or(true, |b| b.starts_with("needs ~"))
+                    {
+                        return match variant_blocker(v, self.total_memory, self.free_disk) {
+                            Some(b) => {
+                                self.note = Some((b, Token::Crimson));
+                                PickerAction::None
+                            }
+                            None => PickerAction::Load(v.id.clone()),
+                        };
+                    }
                 }
-                None if row.entry.draft_for.is_some() => {
-                    PickerAction::AttachDraft(row.entry.id.clone())
+                match &row.entry.blocker {
+                    Some(b) => {
+                        self.note = Some((b.clone(), Token::Crimson));
+                        PickerAction::None
+                    }
+                    None if row.entry.draft_for.is_some() => {
+                        PickerAction::AttachDraft(row.entry.id.clone())
+                    }
+                    None => PickerAction::Load(
+                        row.entry
+                            .via
+                            .as_ref()
+                            .map_or(&row.entry.id, |v| &v.id)
+                            .clone(),
+                    ),
                 }
-                None => PickerAction::Load(
-                    row.entry
-                        .via
-                        .as_ref()
-                        .map_or(&row.entry.id, |v| &v.id)
-                        .clone(),
-                ),
-            },
+            }
             None => {
                 let q = self.query.trim();
                 if q.contains('/') {
@@ -1085,28 +1153,42 @@ fn scan_local_static(hub: &HuggingFaceHub, total_memory: Option<u64>) -> Vec<Ent
                         }
                     }
                 }
-                sort_variants(&mut quants, total_memory);
+                sort_variants(&mut quants, total_memory, None);
             }
             let via = quants.first().cloned().map(Box::new);
+            let packed_gguf = gguf_arch
+                .as_deref()
+                .is_some_and(crate::arch::dispatch::runs_spec_lm_gguf);
+            let variants_stay_packed = !quants.is_empty()
+                && gguf_arch
+                    .as_deref()
+                    .map_or(true, crate::arch::dispatch::runs_spec_lm_gguf);
+            let blocker = if variants_stay_packed {
+                if quants.iter().any(|q| variant_fits(q, total_memory, None)) {
+                    None
+                } else {
+                    quants
+                        .first()
+                        .and_then(|q| q.blocker.clone())
+                        .or_else(|| memory_blocker(params, total_memory))
+                }
+            } else if packed_gguf {
+                packed_memory_blocker(
+                    art.weights_path
+                        .as_deref()
+                        .and_then(|p| std::fs::metadata(p).ok())
+                        .map(|m| m.len()),
+                    total_memory,
+                )
+            } else {
+                memory_blocker(params, total_memory)
+            };
             local.push(Entry {
                 size: Some(dir_size(&repo_dir_path(&hub.cache_root, &id))),
                 id,
                 params,
                 cached: true,
-                blocker: match gguf_arch
-                    .as_deref()
-                    .is_some_and(crate::arch::dispatch::runs_spec_lm_gguf)
-                {
-                    true => packed_memory_blocker(
-                        art.weights_path
-                            .as_deref()
-                            .and_then(|p| std::fs::metadata(p).ok())
-                            .map(|m| m.len()),
-                        total_memory,
-                    ),
-                    false => memory_blocker(params, total_memory),
-                },
-                draft_for,
+                blocker,
                 via,
                 quants,
                 quant_idx: 0,
@@ -1155,41 +1237,76 @@ impl Picker {
             }
         }
         for e in all.iter_mut().filter(|e| !e.cached) {
-            if let (None, Some((size, free))) = (&e.blocker, e.size.zip(self.free_disk)) {
-                if size > free {
-                    e.blocker = Some(format!(
-                        "needs ~{} of disk; {} free",
-                        fmt_bytes(size),
-                        fmt_bytes(free)
-                    ));
+            for q in &mut e.quants {
+                q.blocker = variant_blocker(q, self.total_memory, self.free_disk);
+            }
+            let any_in_repo_fits = e
+                .quants
+                .iter()
+                .any(|q| variant_fits(q, self.total_memory, self.free_disk));
+            if e.quants.is_empty() {
+                if let (None, Some((size, free))) = (&e.blocker, e.size.zip(self.free_disk)) {
+                    if size > free {
+                        e.blocker = Some(format!(
+                            "needs ~{} of disk; {} free",
+                            fmt_bytes(size),
+                            fmt_bytes(free)
+                        ));
+                    }
                 }
             }
-            let too_big = e
-                .blocker
-                .as_deref()
-                .is_some_and(|b| b.starts_with("needs ~"));
-            if e.quants.is_empty() {
-                match self.quants.get(&e.id) {
-                    Some(variants) if too_big => {
-                        if let Some(first) = variants.first() {
-                            e.blocker = None;
-                            e.quants = variants.clone();
-                            e.quant_idx = 0;
-                            e.via = Some(Box::new(first.clone()));
-                        } else if let Some(b) = &mut e.blocker {
-                            b.push_str("; the hub lists no loadable quantized variant");
+            if e.quants.is_empty() || !any_in_repo_fits {
+                if let Some(variants) = self.quants.get(&e.id) {
+                    let mut refreshed = variants.clone();
+                    for q in &mut refreshed {
+                        q.blocker = variant_blocker(q, self.total_memory, self.free_disk);
+                    }
+                    if refreshed
+                        .iter()
+                        .any(|q| variant_fits(q, self.total_memory, self.free_disk))
+                    {
+                        e.quants = refreshed;
+                        e.quant_idx = 0;
+                    } else if e.quants.is_empty() && refreshed.is_empty() {
+                        if let Some(b) = &mut e.blocker {
+                            if b.starts_with("needs ~")
+                                && !b.ends_with("no loadable quantized variant")
+                            {
+                                b.push_str("; the hub lists no loadable quantized variant");
+                            }
                         }
                     }
-                    Some(variants) if !variants.is_empty() => {
-                        e.quants = variants.clone();
-                        e.quant_idx = 0;
-                        e.via = Some(Box::new(variants[0].clone()));
-                    }
-                    _ => {}
                 }
-            } else if e.via.is_none() && !e.quants.is_empty() {
-                let idx = e.quant_idx.min(e.quants.len() - 1);
-                e.via = Some(Box::new(e.quants[idx].clone()));
+            }
+            if !e.quants.is_empty() {
+                if let Some(first_fit) = e
+                    .quants
+                    .iter()
+                    .position(|q| variant_fits(q, self.total_memory, self.free_disk))
+                {
+                    let idx = e.quant_idx.min(e.quants.len() - 1);
+                    let active = if variant_fits(&e.quants[idx], self.total_memory, self.free_disk)
+                    {
+                        idx
+                    } else {
+                        first_fit
+                    };
+                    e.quant_idx = active;
+                    e.via = Some(Box::new(e.quants[active].clone()));
+                    if e.blocker
+                        .as_deref()
+                        .is_some_and(|b| b.starts_with("needs ~"))
+                    {
+                        e.blocker = None;
+                    }
+                } else {
+                    let idx = e.quant_idx.min(e.quants.len() - 1);
+                    e.quant_idx = idx;
+                    e.via = Some(Box::new(e.quants[idx].clone()));
+                    if e.blocker.is_none() {
+                        e.blocker = e.quants[idx].blocker.clone();
+                    }
+                }
             }
         }
         self.total = all.len();
@@ -1474,18 +1591,37 @@ fn quantized_variants(
         (Some(p), Some(b)) => p.saturating_mul(10) >= b.saturating_mul(9),
         _ => true,
     };
-    let mut candidates: Vec<Entry> = parse_hub_rows(&body, total, base_params)
+    let mut candidates: Vec<Entry> = Vec::new();
+    for mut e in parse_hub_rows(&body, total, base_params)
         .unwrap_or_default()
         .into_iter()
-        .filter(|e| {
-            e.blocker.is_none()
-                && whole(e)
-                && e.draft_for.is_none()
-                && !e.gated
-                && e.size.zip(free_disk).map_or(true, |(s, f)| s <= f)
-        })
-        .collect();
-    sort_variants(&mut candidates, total);
+        .filter(|e| whole(e) && e.draft_for.is_none() && !e.gated)
+    {
+        if !e.quants.is_empty()
+            && e.blocker
+                .as_deref()
+                .map_or(true, |b| b.starts_with("needs ~"))
+        {
+            candidates.extend(
+                e.quants
+                    .into_iter()
+                    .filter(|q| variant_fits(q, total, free_disk)),
+            );
+        } else if e.blocker.is_none() && variant_fits(&e, total, free_disk) {
+            candidates.push(e);
+        } else if e
+            .blocker
+            .as_deref()
+            .is_some_and(|b| b.starts_with("needs ~"))
+            && e.quants.is_empty()
+            && e.size.is_some()
+            && variant_fits(&e, total, free_disk)
+        {
+            e.blocker = None;
+            candidates.push(e);
+        }
+    }
+    sort_variants(&mut candidates, total, free_disk);
     candidates
 }
 
@@ -1593,13 +1729,18 @@ fn parse_hub_rows(
             let selection = select_weight_files(&files, None);
             // ponytail: hub `total` counts packed words inconsistently (some 4-bit repos
             // reports logical U32 counts, -mxfp4 raw words), so packed repos may be under-counted.
-            let ninfer = selection
-                .as_ref()
-                .is_ok_and(|s| s.first().is_some_and(|f| f.ends_with(crate::model::ninfer::EXT)));
+            let ninfer = selection.as_ref().is_ok_and(|s| {
+                s.first()
+                    .is_some_and(|f| f.ends_with(crate::model::ninfer::EXT))
+            });
             let params = m["safetensors"]["total"]
                 .as_u64()
                 .or_else(|| m["gguf"]["total"].as_u64())
-                .or_else(|| ninfer.then(|| crate::model::ninfer::hub_params(m)).flatten());
+                .or_else(|| {
+                    ninfer
+                        .then(|| crate::model::ninfer::hub_params(m))
+                        .flatten()
+                });
             // Packed quantized repos (EXL3, NVFP4, ...) count stored words, not weights. A derivative
             // has its base model's weight count; `base_params` is that count when the base is known.
             let packed = ["quantization", "quantization_config"]
@@ -1641,17 +1782,14 @@ fn parse_hub_rows(
             // GGUF `mmproj` repos (arch `clip`): projectors of a language-model repo.
             let gguf_projector = (m["gguf"]["architecture"] == "clip")
                 .then(|| crate::model::hub::MMPROJ_ONLY.to_string());
-            let blocker = gguf_draft
+            let non_mem_blocker = gguf_draft
                 .or(gguf_projector)
                 .or_else(|| pipeline_blocker(m).filter(|_| draft_for.is_none()))
                 .or_else(|| quant_blocker(m))
                 .or_else(|| split_gguf_blocker(m, &selection))
-                .or_else(|| selection.err().filter(|_| !own_files))
-                .or_else(|| match gguf_arch.is_some_and(crate::arch::dispatch::runs_spec_lm_gguf) {
-                    true => packed_memory_blocker(size, total_memory),
-                    false => memory_blocker(params, total_memory),
-                });
-            let gguf_total = m["gguf"]["total"].as_u64();
+                .or_else(|| selection.err().filter(|_| !own_files));
+            let packed_gguf = gguf_arch.is_some_and(crate::arch::dispatch::runs_spec_lm_gguf);
+            let gguf_total = m["gguf"]["total"].as_u64().or(params);
             let mut variants: Vec<Entry> = files
                 .iter()
                 .map(|f| f.path.as_str())
@@ -1683,8 +1821,34 @@ fn parse_hub_rows(
                     })
                 })
                 .collect();
-            sort_variants(&mut variants, total_memory);
+            sort_variants(&mut variants, total_memory, None);
             let via = variants.first().cloned().map(Box::new);
+            let variants_stay_packed = !variants.is_empty()
+                && gguf_arch.map_or(true, crate::arch::dispatch::runs_spec_lm_gguf);
+            let mut size = size;
+            let blocker = non_mem_blocker.or_else(|| {
+                if variants_stay_packed {
+                    if variants.iter().any(|q| variant_fits(q, total_memory, None)) {
+                        if size.is_none()
+                            || packed_memory_blocker(size, total_memory).is_some()
+                            || (!packed_gguf && memory_blocker(params, total_memory).is_some())
+                        {
+                            size = via.as_ref().and_then(|v| v.size).or(size);
+                        }
+                        None
+                    } else {
+                        variants
+                            .first()
+                            .and_then(|q| q.blocker.clone())
+                            .or_else(|| packed_memory_blocker(size, total_memory))
+                            .or_else(|| memory_blocker(params, total_memory))
+                    }
+                } else if packed_gguf {
+                    packed_memory_blocker(size, total_memory)
+                } else {
+                    memory_blocker(params, total_memory)
+                }
+            });
             Some(Entry {
                 id,
                 params,
@@ -1732,8 +1896,10 @@ fn image_supported(m: &Value) -> bool {
         .filter_map(Value::as_str)
         .collect();
     // Derivatives of a diffusion spec's `match.bases` (card `base_model`, [`crate::runtime::diffusion::load_image`]).
-    let spec_bases = crate::arch::registry()
-        .map_or_else(|_| Vec::new(), |r| r.derived_bases(crate::arch::Pipeline::Diffusion));
+    let spec_bases = crate::arch::registry().map_or_else(
+        |_| Vec::new(),
+        |r| r.derived_bases(crate::arch::Pipeline::Diffusion),
+    );
     let derived = |kind: &str| {
         tags.iter()
             .filter_map(|t| t.strip_prefix(kind))
@@ -1746,10 +1912,14 @@ fn image_supported(m: &Value) -> bool {
             .as_str()
             .is_some_and(diffusion_gguf_arch)
             && !tags.iter().any(|t| {
-                ["base_model:adapter:", "base_model:finetune:", "base_model:quantized:"]
-                    .iter()
-                    .filter_map(|k| t.strip_prefix(k))
-                    .any(|b| !spec_bases.iter().any(|s| s == b))
+                [
+                    "base_model:adapter:",
+                    "base_model:finetune:",
+                    "base_model:quantized:",
+                ]
+                .iter()
+                .filter_map(|k| t.strip_prefix(k))
+                .any(|b| !spec_bases.iter().any(|s| s == b))
             }))
         || [
             "base_model:adapter:",
@@ -1786,7 +1956,11 @@ fn video_verdict(m: &Value) -> Option<Result<(), String>> {
         .as_array()
         .into_iter()
         .flatten()
-        .find_map(|r| (r[0].as_str() == Some(c)).then(|| r[1].as_str().map(String::from)).flatten())
+        .find_map(|r| {
+            (r[0].as_str() == Some(c))
+                .then(|| r[1].as_str().map(String::from))
+                .flatten()
+        })
     {
         return Some(Err(why));
     }
@@ -1855,7 +2029,10 @@ fn pipeline_blocker(m: &Value) -> Option<String> {
     if let Some(verdict) = crate::model::classifier::hub_verdict(m) {
         return verdict.err();
     }
-    if let Some(a) = m["gguf"]["architecture"].as_str().filter(|a| diffusion_gguf_arch(a)) {
+    if let Some(a) = m["gguf"]["architecture"]
+        .as_str()
+        .filter(|a| diffusion_gguf_arch(a))
+    {
         return Some(format!(
             "{tag} model, GGUF architecture '{a}' derived from a base no image spec runs (e.g. image editing, which conditions on reference images and is not implemented); only text-to-image GGUFs of this architecture load"
         ));
@@ -1887,7 +2064,8 @@ fn pipeline_blocker(m: &Value) -> Option<String> {
     let decoder_task = matches!(
         tag,
         "translation" | "summarization" | "text2text-generation"
-    ) && model_type.is_some_and(|t| crate::arch::registry().is_ok_and(|r| r.runs_model_type(t)));
+    ) && model_type
+        .is_some_and(|t| crate::arch::registry().is_ok_and(|r| r.runs_model_type(t)));
     // GGUF-only repos carry no config; their GGUF architecture names the model.
     let gguf = m["gguf"]["architecture"]
         .as_str()
@@ -1932,7 +2110,6 @@ fn gguf_lm_archs() -> Vec<String> {
     crate::arch::registry().map_or_else(|_| Vec::new(), |r| r.causal_lm_gguf_archs())
 }
 
-
 /// Split GGUF sets (`-00001-of-00003.gguf`, read as one weight set by every GGUF loader) of an
 /// architecture no loader runs: the reason names it (typically huge MoE / DSA models).
 fn split_gguf_blocker(m: &Value, selection: &Result<Vec<String>, String>) -> Option<String> {
@@ -1945,15 +2122,15 @@ fn split_gguf_blocker(m: &Value, selection: &Result<Vec<String>, String>) -> Opt
         && sel[0].ends_with(".gguf")
         && !gguf_lm_archs().iter().any(|x| x == a)
         && !allowed)
-    .then(|| {
-        format!(
-            "split GGUF of {} architecture '{a}' (not supported; {} GGUFs load)",
-            crate::arch::compat()["picker"]["gguf_source"]
-                .as_str()
-                .expect("compat.picker.gguf_source"),
-            gguf_lm_archs().join(", ")
-        )
-    })
+        .then(|| {
+            format!(
+                "split GGUF of {} architecture '{a}' (not supported; {} GGUFs load)",
+                crate::arch::compat()["picker"]["gguf_source"]
+                    .as_str()
+                    .expect("compat.picker.gguf_source"),
+                gguf_lm_archs().join(", ")
+            )
+        })
 }
 
 /// Pre-quantized schemes the loader rejects ([`crate::model::prequant::scheme_blocker`], the same
@@ -2929,5 +3106,85 @@ mod tests {
             bnb(serde_json::json!({ "quant_method": "bitsandbytes", "load_in_8bit": true }))
                 .is_some()
         );
+    }
+
+    #[test]
+    fn fitting_quant_clears_parent_blocker_and_plain_r_f_search() {
+        let json = r#"[
+            {"id":"org/hybrid-20b","pipeline_tag":"text-generation",
+             "safetensors":{"total":20000000000,"parameters":{"BF16":20000000000}},
+             "config":{"model_type":"qwen3"},
+             "siblings":[{"rfilename":"config.json"},{"rfilename":"model.safetensors"},{"rfilename":"m-BF16.gguf"},{"rfilename":"m-Q4_K_M.gguf"}]},
+            {"id":"org/too-big-gguf","pipeline_tag":"text-generation",
+             "gguf":{"total":70000000000,"architecture":"qwen3"},
+             "siblings":[{"rfilename":"m-Q8_0.gguf"},{"rfilename":"m-BF16.gguf"}]}
+        ]"#;
+        let parsed = parse_hub_results(json, Some(16 << 30)).unwrap();
+        let hybrid = parsed.iter().find(|e| e.id == "org/hybrid-20b").unwrap();
+        assert_eq!(hybrid.blocker, None);
+        assert_eq!(
+            hybrid.via.as_ref().unwrap().id,
+            "org/hybrid-20b/m-Q4_K_M.gguf"
+        );
+        let huge = parsed.iter().find(|e| e.id == "org/too-big-gguf").unwrap();
+        assert!(huge
+            .blocker
+            .as_deref()
+            .is_some_and(|b| b.starts_with("needs ~")));
+
+        let cache = tempfile::tempdir().unwrap();
+        let mut p = Picker::new(
+            HuggingFaceHub::with_cache_dir(cache.path().to_path_buf()),
+            None,
+            &[],
+            Some(16 << 30),
+        );
+        p.free_disk = Some(14 << 30);
+        p.hub_results = parsed;
+        p.refilter();
+
+        let h_idx = p
+            .rows
+            .iter()
+            .position(|r| r.entry.id == "org/hybrid-20b")
+            .unwrap();
+        p.selected = h_idx;
+        assert_eq!(p.rows[h_idx].entry.blocker, None);
+        assert!(matches!(
+            p.enter(),
+            PickerAction::Load(id) if id == "org/hybrid-20b/m-Q4_K_M.gguf"
+        ));
+
+        let b_idx = p
+            .rows
+            .iter()
+            .position(|r| r.entry.id == "org/too-big-gguf")
+            .unwrap();
+        p.selected = b_idx;
+        assert!(p.rows[b_idx]
+            .entry
+            .blocker
+            .as_deref()
+            .is_some_and(|b| b.starts_with("needs ~")));
+        assert!(matches!(p.enter(), PickerAction::None));
+
+        p.set_query(String::new());
+        assert!(matches!(
+            p.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE)),
+            PickerAction::None
+        ));
+        assert!(matches!(
+            p.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE)),
+            PickerAction::None
+        ));
+        assert_eq!(p.query, "rf");
+        assert!(matches!(
+            p.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL)),
+            PickerAction::Reload("reencode")
+        ));
+        assert!(matches!(
+            p.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL)),
+            PickerAction::Reload("variant")
+        ));
     }
 }
