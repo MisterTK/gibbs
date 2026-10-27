@@ -251,6 +251,14 @@ pub fn system_device_name() -> Result<String, String> {
 pub fn system_has_unified_memory() -> Result<bool, String> {
     Ok(system_device()?.has_unified_memory())
 }
+
+pub fn system_max_working_set_bytes() -> Result<u64, String> {
+    Ok(system_device()?.recommended_max_working_set_size())
+}
+
+pub fn system_max_buffer_bytes() -> Result<u64, String> {
+    Ok(system_device()?.max_buffer_length())
+}
 use crate::hardware::{sysctl, QuantFormat};
 
 use super::tune::{self, GemvKernel, GemvVariant};

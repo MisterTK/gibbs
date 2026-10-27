@@ -11,6 +11,14 @@ fn test_hardware_probe_reports_detected_facts() {
             hw.total_memory_bytes.is_some_and(|b| b >= 1 << 30),
             "hw.memsize not read"
         );
+        assert!(
+            hw.gpu_max_working_set_bytes.is_some_and(|b| b >= 1 << 28),
+            "recommendedMaxWorkingSetSize not read"
+        );
+        assert!(
+            hw.gpu_max_buffer_bytes.is_some_and(|b| b >= 1 << 28),
+            "maxBufferLength not read"
+        );
     }
 }
 
