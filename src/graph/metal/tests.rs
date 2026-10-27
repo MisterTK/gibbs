@@ -4561,3 +4561,44 @@ fn multi_row_recurrent_ops_with_state_match_cpu() {
         assert!(rel_err(&states[0].0, &states[0].1) < 1e-6, "conv state");
     }
 }
+
+#[test]
+fn plan_windows_packs_deterministically_without_overlap_explosion() {
+    use super::plan_windows;
+
+    let page = 16_384usize;
+    let max_buf = 4 * page; // 65,536 B
+    let map_len = 9 * page; // 147,456 B
+    // Spans crossing multiple windows, including one straddling a 4-page boundary (50_000..70_000).
+    let spans = vec![
+        (110_000, 30_000),
+        (4_096, 20_000),
+        (50_000, 20_000),
+        (25_000, 20_000),
+        (72_000, 35_000),
+    ];
+    let mut rev = spans.clone();
+    rev.reverse();
+
+    let w1 = plan_windows(&spans, map_len, max_buf, page);
+    let w2 = plan_windows(&rev, map_len, max_buf, page);
+    assert_eq!(w1, w2, "window planning must be independent of HashMap iteration order");
+    assert_eq!(w1.len(), 3, "9 pages of spans with 4-page max_buf should need 3 windows: {w1:?}");
+
+    for &(base, end) in &w1 {
+        assert_eq!(base % page, 0);
+        assert!(end > base && end - base <= max_buf && end <= map_len);
+    }
+    for &(off, len) in &spans {
+        assert!(
+            w1.iter().any(|&(b, e)| b <= off && off + len <= e),
+            "span ({off}, {len}) not covered by any window in {w1:?}"
+        );
+    }
+    let total_mapped: usize = w1.iter().map(|&(b, e)| e - b).sum();
+    assert!(
+        total_mapped <= map_len + (w1.len() - 1) * page,
+        "total mapped bytes {total_mapped} exceeded map_len {map_len} + 1 page per boundary"
+    );
+}
+

@@ -1664,6 +1664,61 @@ pub struct Session {
     kv_f16: bool,
 }
 
+/// Plans deterministic, page-aligned `(base, end)` zero-copy windows of at most `max_buf` bytes
+/// covering `spans` (`(offset, byte_len)`) within a mapping of `map_len` bytes.
+pub(crate) fn plan_windows(
+    spans: &[(usize, usize)],
+    map_len: usize,
+    max_buf: usize,
+    page: usize,
+) -> Vec<(usize, usize)> {
+    let page = page.max(1);
+    let max_buf = (max_buf / page * page).max(page);
+    let mut sorted: Vec<(usize, usize)> = spans
+        .iter()
+        .copied()
+        .filter(|&(off, len)| {
+            len > 0
+                && off.checked_add(len).is_some_and(|end| {
+                    end <= map_len && end - (off / page) * page <= max_buf
+                })
+        })
+        .collect();
+    sorted.sort_unstable_by_key(|&(off, len)| (off, len));
+    let mut windows = Vec::new();
+    let mut cur: Option<(usize, usize)> = None;
+    for (off, len) in sorted {
+        let t_end = off + len;
+        match cur {
+            None => {
+                let base = if t_end <= max_buf {
+                    0
+                } else {
+                    (off / page) * page
+                };
+                cur = Some((base, t_end));
+            }
+            Some((base, end)) if t_end <= base + max_buf => {
+                cur = Some((base, end.max(t_end)));
+            }
+            Some((base, end)) => {
+                let win_end = (end.div_ceil(page) * page).min(map_len).min(base + max_buf);
+                if win_end > base {
+                    windows.push((base, win_end));
+                }
+                cur = Some(((off / page) * page, t_end));
+            }
+        }
+    }
+    if let Some((base, end)) = cur {
+        let win_end = (end.div_ceil(page) * page).min(map_len).min(base + max_buf);
+        if win_end > base {
+            windows.push((base, win_end));
+        }
+    }
+    windows
+}
+
 impl Session {
     /// Uploads every weight once. Preserves packed formats without f32 expansion.
     pub fn new(rt: Arc<Runtime>, weights: &Weights) -> Result<Self, String> {
@@ -1683,8 +1738,71 @@ impl Session {
                 .map(|v| v.name.as_str())
                 .collect()
         });
-        let mut map_buffers: HashMap<*const u8, Buffer> = HashMap::new();
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(4096) as usize;
+        let max_buf = ((rt.device.max_buffer_length() as usize) / page * page).max(page);
+        let mut map_spans: HashMap<
+            *const u8,
+            (
+                usize,
+                Arc<crate::model::loaders::gguf::GgufData>,
+                Vec<(usize, usize)>,
+            ),
+        > = HashMap::new();
+        for (name, t) in weights.iter() {
+            if let Some(ref active) = active_names {
+                if !active.contains(name) {
+                    continue;
+                }
+            }
+            if let Tensor::Mat(m) = t {
+                if let Some(p) = m.packed() {
+                    let map_ptr = p.map.as_ptr();
+                    if (map_ptr as usize) % page != 0 {
+                        continue;
+                    }
+                    let fmt = match WeightFormat::of_quant(p.format) {
+                        WeightFormat::F32 | WeightFormat::Q2_K => None,
+                        WeightFormat::Gen(f) if codec::planar(f).is_some() => None,
+                        wfmt => Some(wfmt),
+                    };
+                    if let Some(fmt) = fmt {
+                        let map_len = match *p.map {
+                            crate::model::loaders::gguf::GgufData::Map(_) => {
+                                p.map.len().div_ceil(page) * page
+                            }
+                            crate::model::loaders::gguf::GgufData::Buf(_) => p.map.len(),
+                        };
+                        let byte_len = weight_format_bytes(fmt, m.rows * m.cols);
+                        map_spans
+                            .entry(map_ptr)
+                            .or_insert_with(|| (map_len, p.map.clone(), Vec::new()))
+                            .2
+                            .push((p.off, byte_len));
+                    }
+                }
+            }
+        }
+        let mut map_buffers: HashMap<*const u8, Vec<(usize, usize, Buffer)>> = HashMap::new();
         let mut maps = Vec::new();
+        for (map_ptr, (map_len, map_arc, spans)) in map_spans {
+            let mut chunks = Vec::new();
+            for (base, end) in plan_windows(&spans, map_len, max_buf, page) {
+                let ptr = unsafe { map_ptr.add(base) } as *const c_void;
+                let buf = rt.device.new_buffer_with_bytes_no_copy(
+                    ptr,
+                    (end - base) as u64,
+                    MTLResourceOptions::StorageModeShared,
+                    None,
+                );
+                if !buf.contents().is_null() {
+                    chunks.push((base, end, buf));
+                }
+            }
+            if !chunks.is_empty() {
+                maps.push(map_arc);
+                map_buffers.insert(map_ptr, chunks);
+            }
+        }
         let mut bufs = HashMap::new();
         for (name, t) in weights.iter() {
             if let Some(ref active) = active_names {
@@ -1695,7 +1813,6 @@ impl Session {
             if let Tensor::Mat(m) = t {
                 if let Some(p) = m.packed() {
                     let map_ptr = p.map.as_ptr();
-                    let map_len = p.map.len();
                     let num_elements = m.rows * m.cols;
                     let fmt = match WeightFormat::of_quant(p.format) {
                         WeightFormat::F32 | WeightFormat::Q2_K => None,
@@ -1703,22 +1820,15 @@ impl Session {
                         wfmt => Some(wfmt),
                     };
                     if let Some(fmt) = fmt {
-                        if !map_buffers.contains_key(&map_ptr) {
-                            let buf = rt.device.new_buffer_with_bytes_no_copy(
-                                map_ptr as *const c_void,
-                                map_len as u64,
-                                MTLResourceOptions::StorageModeShared,
-                                None,
-                            );
-                            if !buf.contents().is_null() {
-                                map_buffers.insert(map_ptr, buf);
-                                maps.push(p.map.clone());
-                            }
-                        }
-                        if let Some(map_buf) = map_buffers.get(&map_ptr) {
+                        let byte_len = weight_format_bytes(fmt, num_elements);
+                        let t_end = p.off + byte_len;
+                        if let Some((base, _, map_buf)) = map_buffers
+                            .get(&map_ptr)
+                            .and_then(|c| c.iter().find(|&&(b, e, _)| b <= p.off && t_end <= e))
+                        {
                             bufs.insert(
                                 name.to_string(),
-                                (map_buf.clone(), p.off, num_elements, fmt),
+                                (map_buf.clone(), p.off - base, num_elements, fmt),
                             );
                             continue;
                         }
